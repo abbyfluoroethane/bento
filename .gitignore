@@ -1,0 +1,5 @@
+bin/
+web/node_modules/
+# web/dist is NOT ignored: the built dashboard assets are embedded into
+# the binary with go:embed (SPEC 14.1).
+/bentod

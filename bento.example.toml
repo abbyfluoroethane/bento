@@ -1,0 +1,93 @@
+# Bento example configuration.
+# Copy to /etc/bento/bento.toml and edit. See SPEC.md for the meaning of
+# each setting. Commented values show the defaults.
+
+# The domain the operator owns. Instances publish at $NAME.<base_domain>.
+# Required.
+base_domain = "bento.foid.space"
+
+# libvirt connection URI (SPEC 4).
+#libvirt_uri = "qemu:///system"
+
+# Content-addressed image store (SPEC 5.1). Never move this directory
+# after the first instance exists.
+#image_dir = "/var/lib/bento/images"
+
+# Instance overlay disks live here. Back up this directory together with
+# the image directory (SPEC 12.1).
+#storage_dir = "/var/lib/bento/storage"
+
+# SQLite database path (SPEC 12.1). Use `bentod dump-db` for backups,
+# never a direct file copy.
+#db_path = "/var/lib/bento/bento.db"
+
+# Memory overcommit ratio (SPEC 5.3). 1.0 means no overcommit. Give the
+# host swap or zram before raising this.
+#overcommit_ratio = 1.0
+
+# How long a released instance name is held before another user may take
+# it (SPEC 7.2). The previous owner may retake it at once.
+#name_cooldown = "24h"
+
+# How many instances start at once during the host reboot restore
+# (SPEC 11.2).
+#restore_batch_size = 4
+
+# Private IPv4 range carved into one /24 per user (SPEC 6.2). Must be /24
+# or wider.
+#private_range = "10.100.0.0/16"
+
+# The SSH frontend host key and the key the frontend presents to the
+# guests live here (SPEC 10). Both are generated on first use.
+#key_dir = "/var/lib/bento/keys"
+
+# Resolvers written into every instance's network configuration
+# (SPEC 6.2). Empty selects the built-in defaults (1.1.1.1, 9.9.9.9).
+#dns = ["1.1.1.1", "9.9.9.9"]
+
+# User names with access to the operator-only dashboard controls, such
+# as the database download (SPEC 12.1).
+operators = []
+
+[listen]
+# Control plane (dashboard and API), reached through the HTTP proxy.
+#http = "127.0.0.1:8080"
+# HTTP proxy TLS listener.
+#https = ":443"
+# SSH frontend.
+#ssh = ":22"
+# Extra proxy port range (SPEC 9.1). Always private.
+#proxy_port_min = 3000
+#proxy_port_max = 9999
+
+# The shape of a `new` without flags (SPEC 15). An empty image selects
+# the first [[images]] entry below.
+[defaults]
+#image = "debian-13"
+#vcpu = 2
+#memory_mib = 2048
+#disk_gib = 20
+
+[acme]
+# ACME account contact for the wildcard certificate (SPEC 8).
+email = "operator@example.org"
+# Cloudflare DNS API token for the DNS-01 challenge. Limit the token to
+# the _acme-challenge records if possible.
+cloudflare_token = ""
+# Override the ACME directory, e.g. for the Let's Encrypt staging
+# environment during development. Empty means production.
+#directory = ""
+
+[oidc]
+# OIDC provider for the dashboard (SPEC 13). Pocket ID is suitable.
+issuer = "https://id.example.org"
+client_id = "bento"
+client_secret = ""
+
+# Operator image allowlist (SPEC 5.1). `bentod fetch-images` downloads,
+# verifies, and stores each entry by checksum. Omit pinned_checksum to
+# trust on first use.
+[[images]]
+name = "debian-13"
+url = "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
+#pinned_checksum = "sha256-..."
