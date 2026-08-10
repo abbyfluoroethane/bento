@@ -1,0 +1,5 @@
+# Dependencies are restored with `npm install`.
+node_modules/
+
+# dist/ is deliberately NOT ignored: the built assets are committed so the
+# Go build (go:embed in embed.go) never needs a Node runtime.
