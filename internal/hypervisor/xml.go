@@ -4,6 +4,7 @@ import (
 	"encoding/xml"
 	"fmt"
 	"net"
+	"runtime"
 	"strings"
 	"text/template"
 )
@@ -36,6 +37,31 @@ type DomainSpec struct {
 	// KSM defaults to true. False adds
 	// <memoryBacking><nosharepages/></memoryBacking> (SPEC 5.4).
 	KSM bool
+
+	// Arch is the guest architecture in libvirt's spelling, such as
+	// x86_64 or aarch64. Empty selects the host architecture. Bento
+	// only runs guests of the host's own architecture: the domains are
+	// type='kvm' (SPEC section 5), and KVM offers nothing else.
+	Arch string
+}
+
+// Architectures Bento knows how to render domain XML for.
+const (
+	ArchAMD64 = "x86_64"
+	ArchARM64 = "aarch64"
+)
+
+// HostArch returns the running host's architecture in libvirt's
+// spelling. It is what an empty DomainSpec.Arch resolves to.
+func HostArch() string {
+	switch runtime.GOARCH {
+	case "amd64":
+		return ArchAMD64
+	case "arm64":
+		return ArchARM64
+	default:
+		return runtime.GOARCH
+	}
 }
 
 // Validate rejects a spec that cannot produce valid domain XML.
@@ -57,8 +83,41 @@ func (s DomainSpec) Validate() error {
 	if _, err := net.ParseMAC(s.MAC); err != nil {
 		return fmt.Errorf("domain spec: mac %q: %w", s.MAC, err)
 	}
+	switch s.Arch {
+	case "", ArchAMD64, ArchARM64:
+	default:
+		return fmt.Errorf("domain spec: arch %q is not one of %s, %s", s.Arch, ArchAMD64, ArchARM64)
+	}
 	return nil
 }
+
+// resolve fills in the values the host decides, so the template never
+// has to reach outside its data.
+func (s DomainSpec) resolve() DomainSpec {
+	if s.Arch == "" {
+		s.Arch = HostArch()
+	}
+	return s
+}
+
+// ARM64 reports whether the guest is aarch64. The template branches on
+// it wherever the two architectures disagree.
+func (s DomainSpec) ARM64() bool { return s.Arch == ArchARM64 }
+
+// Machine is the libvirt machine type. Both are the only sensible
+// modern choice for their architecture, and both get UEFI from the
+// firmware='efi' autoselection.
+func (s DomainSpec) Machine() string {
+	if s.ARM64() {
+		return "virt"
+	}
+	return "q35"
+}
+
+// HostPassthrough reports whether the CPU model is host-passthrough
+// rather than host-model. Nested asks for it (SPEC 5.5); aarch64 gets
+// it regardless, because KVM on aarch64 implements no other model.
+func (s DomainSpec) HostPassthrough() bool { return s.Nested || s.ARM64() }
 
 // escapeXML escapes a value for interpolation into XML text or a
 // single- or double-quoted attribute. Every string that reaches the
@@ -83,21 +142,25 @@ var domainTemplate = template.Must(template.New("domain").Funcs(template.FuncMap
   <memory unit='MiB'>{{.MemoryMiB}}</memory>
   <vcpu placement='static'>{{.VCPU}}</vcpu>
   <os firmware='efi'>
-    <type arch='x86_64' machine='q35'>hvm</type>
+    <type arch='{{esc .Arch}}' machine='{{.Machine}}'>hvm</type>
   </os>
 {{- if not .KSM}}
   <memoryBacking>
     <nosharepages/>
   </memoryBacking>
 {{- end}}
-{{- if .Nested}}
+{{- if .HostPassthrough}}
   <cpu mode='host-passthrough'/>
 {{- else}}
   <cpu mode='host-model'/>
 {{- end}}
   <features>
     <acpi/>
+{{- if .ARM64}}
+    <gic version='3'/>
+{{- else}}
     <apic/>
+{{- end}}
   </features>
   <on_poweroff>destroy</on_poweroff>
   <on_reboot>restart</on_reboot>
@@ -112,9 +175,18 @@ var domainTemplate = template.Must(template.New("domain").Funcs(template.FuncMap
     <disk type='file' device='cdrom'>
       <driver name='qemu' type='raw'/>
       <source file='{{esc .ISOPath}}'/>
+{{- if .ARM64}}
+      <target dev='sda' bus='scsi'/>
+{{- else}}
       <target dev='sda' bus='sata'/>
+{{- end}}
       <readonly/>
     </disk>
+{{- if .ARM64}}
+    <!-- The aarch64 virt machine has no SATA controller, so the seed
+         CD-ROM of SPEC 5.2 hangs off virtio-scsi instead. -->
+    <controller type='scsi' index='0' model='virtio-scsi'/>
+{{- end}}
 {{- end}}
     <interface type='network'>
       <mac address='{{esc .MAC}}'/>
@@ -142,6 +214,7 @@ func DomainXML(spec DomainSpec) (string, error) {
 	if err := spec.Validate(); err != nil {
 		return "", err
 	}
+	spec = spec.resolve()
 	var b strings.Builder
 	if err := domainTemplate.Execute(&b, spec); err != nil {
 		return "", fmt.Errorf("render domain xml: %w", err)

@@ -11,6 +11,9 @@ import (
 
 var update = flag.Bool("update", false, "rewrite golden files")
 
+// baseSpec pins the architecture so the golden files are the same on
+// every machine the test suite runs on. The host-derived default has
+// its own test below.
 func baseSpec() DomainSpec {
 	return DomainSpec{
 		Name:      "bento-web",
@@ -21,6 +24,7 @@ func baseSpec() DomainSpec {
 		Network:   "bento-user-1",
 		MAC:       "52:54:00:ab:cd:ef",
 		KSM:       true,
+		Arch:      ArchAMD64,
 	}
 }
 
@@ -34,6 +38,11 @@ func TestDomainXMLGolden(t *testing.T) {
 		{name: "nested", golden: "nested.xml", mutate: func(s *DomainSpec) { s.Nested = true }},
 		{name: "no ksm", golden: "noksm.xml", mutate: func(s *DomainSpec) { s.KSM = false }},
 		{name: "with iso", golden: "iso.xml", mutate: func(s *DomainSpec) {
+			s.ISOPath = "/var/lib/bento/instances/6d1e0f1c-seed.iso"
+		}},
+		{name: "arm64", golden: "arm64.xml", mutate: func(s *DomainSpec) { s.Arch = ArchARM64 }},
+		{name: "arm64 with iso", golden: "arm64-iso.xml", mutate: func(s *DomainSpec) {
+			s.Arch = ArchARM64
 			s.ISOPath = "/var/lib/bento/instances/6d1e0f1c-seed.iso"
 		}},
 	}
@@ -119,6 +128,54 @@ func TestDomainXMLNestedAndKSMVariants(t *testing.T) {
 	}
 	if !strings.Contains(got, "<nosharepages/>") {
 		t.Error("ksm=false must emit <nosharepages/> (SPEC 5.4)")
+	}
+}
+
+func TestDomainXMLArch(t *testing.T) {
+	// An empty Arch is the host's own: Bento runs type='kvm' domains
+	// (SPEC section 5), so the guest architecture is never a choice.
+	spec := baseSpec()
+	spec.Arch = ""
+	got, err := DomainXML(spec)
+	if err != nil {
+		t.Fatalf("DomainXML: %v", err)
+	}
+	if want := `arch='` + HostArch() + `'`; !strings.Contains(got, want) {
+		t.Errorf("empty arch must resolve to the host's %s\n%s", want, got)
+	}
+
+	arm := baseSpec()
+	arm.Arch = ArchARM64
+	arm.ISOPath = "/var/lib/bento/instances/6d1e0f1c-seed.iso"
+	got, err = DomainXML(arm)
+	if err != nil {
+		t.Fatalf("DomainXML aarch64: %v", err)
+	}
+	for _, want := range []string{
+		`<type arch='aarch64' machine='virt'>hvm</type>`,
+		// KVM on aarch64 implements host-passthrough and nothing else.
+		`<cpu mode='host-passthrough'/>`,
+		`<gic version='3'/>`,
+		// The virt machine has no SATA controller (SPEC 5.2).
+		`<target dev='sda' bus='scsi'/>`,
+		`<controller type='scsi' index='0' model='virtio-scsi'/>`,
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("aarch64 XML missing %s\n%s", want, got)
+		}
+	}
+	for _, banned := range []string{`<apic/>`, `bus='sata'`, `machine='q35'`} {
+		if strings.Contains(got, banned) {
+			t.Errorf("aarch64 XML must not contain %s\n%s", banned, got)
+		}
+	}
+}
+
+func TestDomainSpecValidateArch(t *testing.T) {
+	spec := baseSpec()
+	spec.Arch = "riscv64"
+	if err := spec.Validate(); err == nil {
+		t.Error("an architecture Bento has no template branch for must not validate")
 	}
 }
 
