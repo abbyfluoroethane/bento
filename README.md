@@ -9,7 +9,9 @@ wildcard-TLS proxy) and `ssh NAME@<your-domain>` (through an SSH
 frontend). One binary, `bentod`, runs everything.
 
 The full system specification is [SPEC.md](SPEC.md). It is authoritative;
-read it before changing anything.
+read it before changing anything. [DEPLOYING.md](DEPLOYING.md) is the
+runbook for bringing a host up, with the traps the quickstart below
+leaves out.
 
 ## Operator quickstart
 
