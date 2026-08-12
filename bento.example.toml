@@ -4,7 +4,7 @@
 
 # The domain the operator owns. Instances publish at $NAME.<base_domain>.
 # Required.
-base_domain = "bento.foid.space"
+base_domain = "bento.example.org"
 
 # libvirt connection URI (SPEC 4).
 #libvirt_uri = "qemu:///system"
@@ -51,7 +51,9 @@ operators = []
 
 [listen]
 # Control plane (dashboard and API), reached through the HTTP proxy.
-#http = "127.0.0.1:8080"
+# Keep this port outside the proxy port range below: the proxy binds
+# every port of that range.
+#http = "127.0.0.1:10080"
 # HTTP proxy TLS listener.
 #https = ":443"
 # SSH frontend.
@@ -59,6 +61,12 @@ operators = []
 # Extra proxy port range (SPEC 9.1). Always private.
 #proxy_port_min = 3000
 #proxy_port_max = 9999
+# How the proxy listeners get their certificate. "acme" is SPEC 8: the
+# proxy obtains the wildcard certificate itself over DNS-01. "off"
+# serves plain HTTP, for a host where something else already owns port
+# 443 and terminates TLS in front of Bento — set `https` to a private
+# address as well, because these listeners have no TLS of their own.
+#tls = "acme"
 
 # The shape of a `new` without flags (SPEC 15). An empty image selects
 # the first [[images]] entry below.
@@ -68,6 +76,7 @@ operators = []
 #memory_mib = 2048
 #disk_gib = 20
 
+# Not used when listen.tls is "off".
 [acme]
 # ACME account contact for the wildcard certificate (SPEC 8).
 email = "operator@example.org"
