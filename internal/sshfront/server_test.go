@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -116,6 +117,17 @@ func TestPublicKeyHandler(t *testing.T) {
 				r := reg.(Registration)
 				if r.Fingerprint != gossh.FingerprintSHA256(tt.key) || r.PublicKey == "" {
 					t.Errorf("registration %+v misses the presented key", r)
+				}
+				// The key is stored as one line with no control
+				// characters: it ends up in a guest's authorized_keys
+				// through the cloud-init seed, which rejects anything
+				// else, so a trailing newline here makes every instance
+				// this user creates fail (SPEC 4.2, 5.2).
+				if r.PublicKey != strings.TrimSpace(r.PublicKey) {
+					t.Errorf("stored key %q is not trimmed", r.PublicKey)
+				}
+				if strings.ContainsAny(r.PublicKey, "\r\n") {
+					t.Errorf("stored key %q contains a line break", r.PublicKey)
 				}
 			}
 		})
