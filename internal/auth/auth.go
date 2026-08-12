@@ -13,6 +13,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
+	"log/slog"
 	"time"
 
 	"github.com/abbyfluoroethane/bento/internal/types"
@@ -77,6 +78,7 @@ type Service struct {
 	now        func() time.Time
 	sessionTTL time.Duration
 	loginPath  string
+	log        *slog.Logger
 }
 
 // Option configures a Service.
@@ -85,6 +87,20 @@ type Option func(*Service)
 // WithSessionStore replaces the default in-memory session store.
 func WithSessionStore(st SessionStore) Option {
 	return func(s *Service) { s.sessions = st }
+}
+
+// WithLogger records why a login was refused. Every rejection in the
+// callback is invisible to the operator otherwise: the reason goes to
+// the browser and nowhere else, and the reasons are exactly what an
+// operator needs — a subject with no users row is the normal state of a
+// user who has registered over SSH but has not been linked yet
+// (SPEC 13). The default discards.
+func WithLogger(l *slog.Logger) Option {
+	return func(s *Service) {
+		if l != nil {
+			s.log = l
+		}
+	}
 }
 
 // WithClock injects the time source, for tests.
@@ -129,6 +145,7 @@ func New(baseDomain string, users UserStore, access AccessStore, tokens TokenSto
 		now:        time.Now,
 		sessionTTL: DefaultSessionTTL,
 		loginPath:  "/login",
+		log:        slog.New(slog.DiscardHandler),
 	}
 	for _, opt := range opts {
 		opt(s)

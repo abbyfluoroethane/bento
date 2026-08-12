@@ -180,42 +180,57 @@ func (s *Service) CallbackHandler() http.Handler {
 			return
 		}
 		if e := r.URL.Query().Get("error"); e != "" {
+			s.log.Warn("login refused by the provider", "error", e)
 			http.Error(w, "login failed at the provider: "+e, http.StatusForbidden)
 			return
 		}
 		stateCookie, err := r.Cookie(stateCookieName)
 		if err != nil || stateCookie.Value == "" {
+			s.log.Warn("login rejected: no state cookie on the callback",
+				"hint", "the flow cookies are SameSite=Lax and expire in 10 minutes")
 			http.Error(w, "missing login state; start again at /login", http.StatusBadRequest)
 			return
 		}
 		if r.URL.Query().Get("state") != stateCookie.Value {
+			s.log.Warn("login rejected: state mismatch")
 			http.Error(w, "state mismatch", http.StatusBadRequest)
 			return
 		}
 		rawIDToken, err := s.oauth.Exchange(r.Context(), r.URL.Query().Get("code"))
 		if err != nil {
+			s.log.Error("login rejected: code exchange failed", "error", err)
 			http.Error(w, "code exchange failed", http.StatusBadGateway)
 			return
 		}
 		claims, err := s.verifier.Verify(r.Context(), rawIDToken)
 		if err != nil {
+			s.log.Error("login rejected: ID token did not verify", "error", err)
 			http.Error(w, "invalid ID token", http.StatusUnauthorized)
 			return
 		}
 		nonceCookie, err := r.Cookie(nonceCookieName)
 		if err != nil || nonceCookie.Value == "" || claims.Nonce != nonceCookie.Value {
+			s.log.Warn("login rejected: nonce mismatch", "cookie_present", err == nil)
 			http.Error(w, "nonce mismatch", http.StatusBadRequest)
 			return
 		}
 		user, ok, err := s.users.UserByOIDCSubject(claims.Subject)
 		if err != nil {
+			s.log.Error("login rejected: user lookup failed", "error", err)
 			http.Error(w, "user lookup failed", http.StatusInternalServerError)
 			return
 		}
 		if !ok {
+			// The operator has to copy this subject into the users row
+			// by hand (SPEC 13), and the provider is the only other
+			// place it can be read from, so name it here.
+			s.log.Warn("login rejected: no users row carries this OIDC subject",
+				"subject", claims.Subject, "email", claims.Email,
+				"hint", "set oidc_subject on the user's row to this value")
 			http.Error(w, "no Bento account for this login; register by connecting with ssh", http.StatusForbidden)
 			return
 		}
+		s.log.Info("dashboard login", "user", user.Name, "subject", claims.Subject)
 		sess, err := s.newSession(user.ID)
 		if err != nil {
 			http.Error(w, "session creation failed", http.StatusInternalServerError)
