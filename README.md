@@ -37,7 +37,7 @@ with `ExecStart=/usr/local/bin/bentod <cmd>`, `Restart=on-failure`,
 `After=libvirtd.service` is enough):
 
 ```
-bentod serve    # control plane: database, policy, restore, dashboard (port 8080)
+bentod serve    # control plane: database, policy, restore, dashboard (port 10080)
 bentod proxy    # HTTPS proxy: port 443 and ports 3000-9999
 bentod sshd     # SSH frontend and CLI: port 22
 ```
