@@ -27,11 +27,13 @@ func TestParseDefaults(t *testing.T) {
 		{"NameCooldown", cfg.NameCooldown.Std(), 24 * time.Hour},
 		{"RestoreBatchSize", cfg.RestoreBatchSize, 4},
 		{"PrivateRange", cfg.PrivateRange, "10.100.0.0/16"},
-		{"Listen.HTTP", cfg.Listen.HTTP, "127.0.0.1:8080"},
+		{"Listen.HTTP", cfg.Listen.HTTP, "127.0.0.1:10080"},
 		{"Listen.HTTPS", cfg.Listen.HTTPS, ":443"},
 		{"Listen.SSH", cfg.Listen.SSH, ":22"},
 		{"Listen.ProxyPortMin", cfg.Listen.ProxyPortMin, 3000},
 		{"Listen.ProxyPortMax", cfg.Listen.ProxyPortMax, 9999},
+		// SPEC 8 is the default: the proxy owns its certificate.
+		{"Listen.TLS", cfg.Listen.TLS, TLSACME},
 	}
 	for _, tt := range tests {
 		if tt.got != tt.want {
@@ -136,6 +138,11 @@ func TestParseErrors(t *testing.T) {
 			wantErr: "restore_batch_size",
 		},
 		{
+			name:    "unknown tls mode",
+			src:     "base_domain = \"b.example\"\n[listen]\ntls = \"selfsigned\"",
+			wantErr: "listen tls",
+		},
+		{
 			name:    "bad private range",
 			src:     "base_domain = \"b.example\"\nprivate_range = \"not-a-cidr\"",
 			wantErr: "private_range",
@@ -216,5 +223,33 @@ func TestExampleConfigParses(t *testing.T) {
 	}
 	if _, err := Parse(data); err != nil {
 		t.Fatalf("bento.example.toml does not parse: %v", err)
+	}
+}
+
+// TestParseTLSOff covers the deployment where another proxy already
+// owns port 443 of the host and forwards to Bento.
+func TestParseTLSOff(t *testing.T) {
+	cfg, err := Parse([]byte("base_domain = \"b.example\"\n[listen]\ntls = \"off\"\nhttps = \"127.0.0.1:10443\""))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	if cfg.Listen.TLS != TLSOff {
+		t.Errorf("Listen.TLS = %q, want %q", cfg.Listen.TLS, TLSOff)
+	}
+	if cfg.Listen.HTTPS != "127.0.0.1:10443" {
+		t.Errorf("Listen.HTTPS = %q", cfg.Listen.HTTPS)
+	}
+}
+
+// TestParseControlPlaneInsideProxyRange guards the default pair: the
+// proxy binds every port of its range on all interfaces, so a control
+// plane inside that range means one of the two processes never starts.
+func TestParseControlPlaneInsideProxyRange(t *testing.T) {
+	_, err := Parse([]byte("base_domain = \"b.example\"\n[listen]\nhttp = \"127.0.0.1:8080\""))
+	if err == nil {
+		t.Fatal("a control plane port inside the proxy range was accepted")
+	}
+	if !strings.Contains(err.Error(), "falls inside the proxy port range") {
+		t.Errorf("error = %v", err)
 	}
 }
