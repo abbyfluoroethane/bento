@@ -1,0 +1,49 @@
+<domain type='kvm'>
+  <name>bento-web</name>
+  <uuid>6d1e0f1c-9a3b-4f6e-8a2d-3c5b7e9f1a2b</uuid>
+  <memory unit='MiB'>2048</memory>
+  <vcpu placement='static'>2</vcpu>
+  <os firmware='efi'>
+    <type arch='aarch64' machine='virt'>hvm</type>
+  </os>
+  <cpu mode='host-passthrough'/>
+  <features>
+    <acpi/>
+    <gic version='3'/>
+  </features>
+  <on_poweroff>destroy</on_poweroff>
+  <on_reboot>restart</on_reboot>
+  <on_crash>destroy</on_crash>
+  <devices>
+    <disk type='file' device='disk'>
+      <driver name='qemu' type='qcow2'/>
+      <source file='/var/lib/bento/instances/6d1e0f1c.qcow2'/>
+      <target dev='vda' bus='virtio'/>
+    </disk>
+    <disk type='file' device='cdrom'>
+      <driver name='qemu' type='raw'/>
+      <source file='/var/lib/bento/instances/6d1e0f1c-seed.iso'/>
+      <target dev='sda' bus='scsi'/>
+      <readonly/>
+    </disk>
+    <!-- The aarch64 virt machine has no SATA controller, so the seed
+         CD-ROM of SPEC 5.2 hangs off virtio-scsi instead. -->
+    <controller type='scsi' index='0' model='virtio-scsi'/>
+    <interface type='network'>
+      <mac address='52:54:00:ab:cd:ef'/>
+      <source network='bento-user-1'/>
+      <model type='virtio'/>
+    </interface>
+    <console type='pty'>
+      <target type='virtio' port='0'/>
+    </console>
+    <channel type='unix'>
+      <source mode='bind'/>
+      <target type='virtio' name='org.qemu.guest_agent.0'/>
+    </channel>
+    <rng model='virtio'>
+      <backend model='random'>/dev/urandom</backend>
+    </rng>
+    <memballoon model='virtio' freePageReporting='on'/>
+  </devices>
+</domain>
