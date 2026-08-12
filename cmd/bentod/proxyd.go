@@ -7,6 +7,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/abbyfluoroethane/bento/internal/config"
 	"github.com/abbyfluoroethane/bento/internal/proxy"
 	"github.com/abbyfluoroethane/bento/internal/tlscert"
 )
@@ -32,23 +34,34 @@ func runProxy(configPath string, _ []string) error {
 	}
 	defer a.close()
 
-	if a.cfg.ACME.CloudflareToken == "" {
-		return errors.New("acme.cloudflare_token is required: the wildcard certificate needs the DNS-01 challenge (SPEC 8)")
-	}
-	tlsm, err := tlscert.New(tlscert.Config{
-		BaseDomain: a.cfg.BaseDomain,
-		Email:      a.cfg.ACME.Email,
-		Provider:   tlscert.Cloudflare(a.cfg.ACME.CloudflareToken),
-		StorageDir: filepath.Join(filepath.Dir(a.cfg.DBPath), "acme"),
-		CA:         a.cfg.ACME.Directory,
-	})
-	if err != nil {
-		return err
-	}
-	defer tlsm.Close()
-	a.log.Info("obtaining the wildcard certificate", "domains", tlsm.Domains())
-	if err := tlsm.ManageSync(ctx); err != nil {
-		return fmt.Errorf("certificate: %w", err)
+	// SPEC 8 has the proxy own the wildcard certificate. listen.tls =
+	// "off" hands that job to whatever already terminates TLS on port
+	// 443 of this host and forwards here; the listeners then speak
+	// plain HTTP and must stay off the public internet.
+	var tlsConf *tls.Config
+	if a.cfg.Listen.TLS == config.TLSOff {
+		a.log.Warn("serving plain HTTP: listen.tls is off",
+			"note", "something else must terminate TLS in front of Bento; bind these listeners privately")
+	} else {
+		if a.cfg.ACME.CloudflareToken == "" {
+			return errors.New("acme.cloudflare_token is required: the wildcard certificate needs the DNS-01 challenge (SPEC 8). Set listen.tls = \"off\" when another proxy terminates TLS")
+		}
+		tlsm, err := tlscert.New(tlscert.Config{
+			BaseDomain: a.cfg.BaseDomain,
+			Email:      a.cfg.ACME.Email,
+			Provider:   tlscert.Cloudflare(a.cfg.ACME.CloudflareToken),
+			StorageDir: filepath.Join(filepath.Dir(a.cfg.DBPath), "acme"),
+			CA:         a.cfg.ACME.Directory,
+		})
+		if err != nil {
+			return err
+		}
+		defer tlsm.Close()
+		a.log.Info("obtaining the wildcard certificate", "domains", tlsm.Domains())
+		if err := tlsm.ManageSync(ctx); err != nil {
+			return fmt.Errorf("certificate: %w", err)
+		}
+		tlsConf = tlsm.TLSConfig()
 	}
 
 	control, err := url.Parse(controlURL(a.cfg.Listen.HTTP))
@@ -70,8 +83,9 @@ func runProxy(configPath string, _ []string) error {
 	}
 	ports := p.Ports()
 	a.log.Info("proxy listening", "bind", bindHost(a.cfg.Listen.HTTPS),
+		"tls", a.cfg.Listen.TLS,
 		"main_port", ports[0],
 		"high_ports", fmt.Sprintf("%d-%d", ports[1], ports[len(ports)-1]),
 		"control", control.String())
-	return p.Serve(ctx, bindHost(a.cfg.Listen.HTTPS), tlsm.TLSConfig(), nil)
+	return p.Serve(ctx, bindHost(a.cfg.Listen.HTTPS), tlsConf, nil)
 }
