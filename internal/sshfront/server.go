@@ -16,6 +16,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"strings"
 	"time"
 
 	gliderssh "github.com/gliderlabs/ssh"
@@ -205,7 +206,11 @@ func (s *Server) publicKeyHandler(ctx gliderssh.Context, key gliderssh.PublicKey
 			return false
 		}
 		ctx.SetValue(registrationKey{}, Registration{
-			PublicKey:   string(gossh.MarshalAuthorizedKey(key)),
+			// MarshalAuthorizedKey ends the line with a newline. The
+			// stored key goes into a guest's authorized_keys through
+			// the cloud-init seed, which rejects a control character
+			// in a key (SPEC 4.2), so the line is stored without one.
+			PublicKey:   strings.TrimSpace(string(gossh.MarshalAuthorizedKey(key))),
 			Fingerprint: fingerprint,
 		})
 		return true
