@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/abbyfluoroethane/bento/internal/network"
 	"github.com/abbyfluoroethane/bento/internal/types"
 )
 
@@ -42,7 +43,7 @@ func TestBuildRuleset(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rs, err := buildRuleset(e.st, e.plan)
+	rs, err := buildRuleset(e.st, e.plan, network.PortRange{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -74,7 +75,7 @@ func TestBuildRulesetOffInstanceKeepsSSH(t *testing.T) {
 	b := e.backendFor("")
 	inst := createInstance(t, e, b, amber, "web") // visibility off by default
 
-	rs, err := buildRuleset(e.st, e.plan)
+	rs, err := buildRuleset(e.st, e.plan, network.PortRange{})
 	if err != nil {
 		t.Fatal(err)
 	}

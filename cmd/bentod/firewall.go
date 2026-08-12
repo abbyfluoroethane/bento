@@ -22,6 +22,10 @@ type firewall struct {
 	plan    network.Plan
 	applier network.Applier
 	log     *slog.Logger
+	// highPorts is the proxy's extra port range (SPEC 9.1). The proxy
+	// forwards port N to port N on the guest, so the guest-side rules
+	// must cover the same range the proxy listens on.
+	highPorts network.PortRange
 
 	mu   sync.Mutex
 	last string
@@ -32,7 +36,7 @@ type firewall struct {
 func (f *firewall) reload(ctx context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	ruleset, err := buildRuleset(f.st, f.plan)
+	ruleset, err := buildRuleset(f.st, f.plan, f.highPorts)
 	if err != nil {
 		return err
 	}
@@ -59,7 +63,10 @@ func (f *firewall) reload(ctx context.Context) error {
 // reach it. An instance the proxy may forward to (visibility private or
 // public) additionally publishes its default HTTP port and the
 // 3000-9999 proxy range of SPEC 9.1.
-func buildRuleset(st *store.Store, plan network.Plan) (network.Ruleset, error) {
+func buildRuleset(st *store.Store, plan network.Plan, highPorts network.PortRange) (network.Ruleset, error) {
+	if highPorts.From == 0 && highPorts.To == 0 {
+		highPorts = network.PortRange{From: proxy.HighPortMin, To: proxy.HighPortMax}
+	}
 	var zero network.Ruleset
 	users, err := st.Users()
 	if err != nil {
@@ -82,7 +89,7 @@ func buildRuleset(st *store.Store, plan network.Plan) (network.Ruleset, error) {
 				port = 80 // SPEC 9.1: the default target port
 			}
 			pub.HTTPPorts = []int{port}
-			pub.PortRanges = []network.PortRange{{From: proxy.HighPortMin, To: proxy.HighPortMax}}
+			pub.PortRanges = []network.PortRange{highPorts}
 		}
 		byOwner[inst.OwnerID] = append(byOwner[inst.OwnerID], pub)
 	}

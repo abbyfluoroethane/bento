@@ -74,7 +74,13 @@ func runServe(configPath string, _ []string) error {
 	}
 
 	// Per-user libvirt networks and the nftables table (SPEC 6.2, 6.3).
-	fw := &firewall{st: a.st, plan: a.plan, applier: network.NFTApplier{}, log: a.log}
+	fw := &firewall{
+		st:        a.st,
+		plan:      a.plan,
+		applier:   network.NFTApplier{},
+		log:       a.log,
+		highPorts: network.PortRange{From: a.cfg.Listen.ProxyPortMin, To: a.cfg.Listen.ProxyPortMax},
+	}
 	if err := ensureUserNetworks(ctx, a, hyp); err != nil {
 		return err
 	}

@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -21,6 +22,17 @@ import (
 )
 
 const testBase = "bento.example.org"
+
+// newTestProxy builds a Proxy on the SPEC defaults for the tests that
+// only need its port arithmetic.
+func newTestProxy(t *testing.T, src InstanceSource) *Proxy {
+	t.Helper()
+	p, err := New(testBase, src, nil, nil)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return p
+}
 
 type fakeSource struct {
 	instances map[string]types.Instance
@@ -564,12 +576,23 @@ func TestRequestHost(t *testing.T) {
 }
 
 func TestListenerPort(t *testing.T) {
+	p := newTestProxy(t, &fakeSource{})
 	r := httptest.NewRequest(http.MethodGet, "https://x/", nil)
-	if got := listenerPort(r); got != DefaultPort {
+	if got := p.listenerPort(r); got != DefaultPort {
 		t.Errorf("no local addr: got %d, want %d", got, DefaultPort)
 	}
-	if got := listenerPort(request("x", 4242)); got != 4242 {
+	if got := p.listenerPort(request("x", 4242)); got != 4242 {
 		t.Errorf("got %d, want 4242", got)
+	}
+
+	// A moved main port is what a request with no local address falls
+	// back to, not the SPEC default.
+	moved, err := New(testBase, &fakeSource{}, nil, nil, WithPorts(10443, 0, 0))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if got := moved.listenerPort(r); got != 10443 {
+		t.Errorf("moved main port: got %d, want 10443", got)
 	}
 }
 
@@ -590,7 +613,7 @@ func TestNewValidation(t *testing.T) {
 }
 
 func TestPorts(t *testing.T) {
-	ports := Ports()
+	ports := newTestProxy(t, &fakeSource{}).Ports()
 	if len(ports) != 7001 {
 		t.Fatalf("len(Ports()) = %d, want 7001", len(ports))
 	}
@@ -599,6 +622,34 @@ func TestPorts(t *testing.T) {
 	}
 	if ports[1] != HighPortMin || ports[len(ports)-1] != HighPortMax {
 		t.Errorf("range = %d..%d, want %d..%d", ports[1], ports[len(ports)-1], HighPortMin, HighPortMax)
+	}
+}
+
+func TestWithPorts(t *testing.T) {
+	p, err := New(testBase, &fakeSource{}, nil, nil, WithPorts(10443, 3000, 3002))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if got, want := p.Ports(), []int{10443, 3000, 3001, 3002}; !slices.Equal(got, want) {
+		t.Errorf("Ports() = %v, want %v", got, want)
+	}
+
+	// A zero leaves that setting at its default.
+	p, err = New(testBase, &fakeSource{}, nil, nil, WithPorts(0, 3000, 3001))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if p.Ports()[0] != DefaultPort {
+		t.Errorf("main port = %d, want the default %d", p.Ports()[0], DefaultPort)
+	}
+
+	// A main port inside the high range would make one listener answer
+	// under two sets of rules.
+	if _, err := New(testBase, &fakeSource{}, nil, nil, WithPorts(3500, 3000, 9999)); err == nil {
+		t.Error("main port inside the high range accepted")
+	}
+	if _, err := New(testBase, &fakeSource{}, nil, nil, WithPorts(0, 9999, 3000)); err == nil {
+		t.Error("inverted high range accepted")
 	}
 }
 
@@ -612,7 +663,7 @@ func TestListenAll(t *testing.T) {
 			addrs = append(addrs, addr)
 			return newFakeListener(addr), nil
 		}
-		listeners, err := listenAll("0.0.0.0", Ports(), listen)
+		listeners, err := listenAll("0.0.0.0", newTestProxy(t, &fakeSource{}).Ports(), listen)
 		if err != nil {
 			t.Fatalf("listenAll: %v", err)
 		}

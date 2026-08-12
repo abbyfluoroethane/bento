@@ -10,6 +10,7 @@ import (
 	"net/netip"
 	"net/url"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/abbyfluoroethane/bento/internal/cloudinit"
@@ -162,4 +163,20 @@ func bindHost(listen string) string {
 		return strings.TrimPrefix(listen, ":")
 	}
 	return host
+}
+
+// mainPort extracts the proxy's main port from the listen address. An
+// address with no usable port leaves the SPEC 9 default of 443 in
+// place. The port moves when something else terminates TLS in front of
+// Bento and forwards to it privately.
+func mainPort(listen string) int {
+	_, portStr, err := net.SplitHostPort(listen)
+	if err != nil {
+		return 0
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return 0
+	}
+	return port
 }
