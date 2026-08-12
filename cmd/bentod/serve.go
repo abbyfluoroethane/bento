@@ -219,7 +219,7 @@ func converge(ctx context.Context, a *app, networks networkEnsurer, fw *firewall
 // controlPlaneHandler assembles the one HTTP handler of the control
 // plane: OIDC login, the JSON API, and the dashboard (SPEC 13, 14).
 func controlPlaneHandler(ctx context.Context, a *app, mgr *lifecycle.Manager, fw *firewall, frontendPub string, hostID int64) (http.Handler, error) {
-	authOpts := []auth.Option{}
+	authOpts := []auth.Option{auth.WithLogger(a.log)}
 	if a.cfg.OIDC.Issuer != "" {
 		redirect := "https://" + a.cfg.BaseDomain + "/callback"
 		pc, err := auth.NewProviderClient(ctx, a.cfg.OIDC.Issuer, a.cfg.OIDC.ClientID, a.cfg.OIDC.ClientSecret, redirect)
