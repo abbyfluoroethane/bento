@@ -63,12 +63,15 @@ func runProxy(configPath string, _ []string) error {
 	}
 	src := proxySource{a.st}
 	p, err := proxy.New(a.cfg.BaseDomain, src, sessions, controlProxy,
-		proxy.WithLastSeen(src)) // SPEC 12: an HTTP request updates last_seen_at
+		proxy.WithLastSeen(src), // SPEC 12: an HTTP request updates last_seen_at
+		proxy.WithPorts(mainPort(a.cfg.Listen.HTTPS), a.cfg.Listen.ProxyPortMin, a.cfg.Listen.ProxyPortMax))
 	if err != nil {
 		return err
 	}
-	a.log.Info("proxy listening", "https", a.cfg.Listen.HTTPS,
-		"high_ports", fmt.Sprintf("%d-%d", proxy.HighPortMin, proxy.HighPortMax),
+	ports := p.Ports()
+	a.log.Info("proxy listening", "bind", bindHost(a.cfg.Listen.HTTPS),
+		"main_port", ports[0],
+		"high_ports", fmt.Sprintf("%d-%d", ports[1], ports[len(ports)-1]),
 		"control", control.String())
 	return p.Serve(ctx, bindHost(a.cfg.Listen.HTTPS), tlsm.TLSConfig(), nil)
 }

@@ -12,6 +12,7 @@ package proxy
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -25,6 +26,8 @@ import (
 
 // DefaultPort is the main HTTPS port. A request on this port goes to the
 // instance's default HTTP port, set with the `port` command (SPEC 9.1).
+// An operator who terminates TLS in front of Bento moves the listener
+// with WithPorts; the routing rules follow the port, not the number.
 const DefaultPort = 443
 
 // HighPortMin and HighPortMax bound the extra listener range. A request on
@@ -91,6 +94,13 @@ type Proxy struct {
 	loginURL   string
 	transport  http.RoundTripper
 	lastSeen   LastSeenRecorder
+
+	// mainPort carries the base domain and an instance's default HTTP
+	// port; highMin through highMax are the always-private extra
+	// listeners (SPEC 9.1). WithPorts overrides the SPEC defaults.
+	mainPort int
+	highMin  int
+	highMax  int
 }
 
 // Option configures a Proxy.
@@ -115,6 +125,30 @@ func WithLastSeen(rec LastSeenRecorder) Option {
 	return func(p *Proxy) { p.lastSeen = rec }
 }
 
+// WithPorts moves the listeners off the SPEC 9.1 defaults. main is the
+// port that carries the base domain and an instance's default HTTP
+// port; highMin through highMax are the always-private extra ports. A
+// non-positive value leaves that setting at its default.
+//
+// The main port moves when something else terminates TLS in front of
+// Bento and forwards to it on a private port. Everything the proxy
+// decides from the listener port — the control plane on the base
+// domain, `public` applying only to the default port — follows main
+// (SPEC 9.2).
+func WithPorts(main, highMin, highMax int) Option {
+	return func(p *Proxy) {
+		if main > 0 {
+			p.mainPort = main
+		}
+		if highMin > 0 {
+			p.highMin = highMin
+		}
+		if highMax > 0 {
+			p.highMax = highMax
+		}
+	}
+}
+
 // New builds a Proxy. Requests for baseDomain itself go to control (the
 // dashboard and the OIDC login flow); requests for <name>.<baseDomain>
 // resolve through instances.
@@ -133,9 +167,18 @@ func New(baseDomain string, instances InstanceSource, sessions SessionChecker, c
 		control:    control,
 		loginURL:   "https://" + baseDomain + "/login",
 		transport:  defaultTransport(),
+		mainPort:   DefaultPort,
+		highMin:    HighPortMin,
+		highMax:    HighPortMax,
 	}
 	for _, opt := range opts {
 		opt(p)
+	}
+	if p.highMin > p.highMax {
+		return nil, fmt.Errorf("proxy: high port range %d-%d is empty", p.highMin, p.highMax)
+	}
+	if p.mainPort >= p.highMin && p.mainPort <= p.highMax {
+		return nil, fmt.Errorf("proxy: main port %d falls inside the high port range %d-%d", p.mainPort, p.highMin, p.highMax)
 	}
 	return p, nil
 }
@@ -156,12 +199,12 @@ func defaultTransport() http.RoundTripper {
 // uniform 404.
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	host := requestHost(r)
-	port := listenerPort(r)
+	port := p.listenerPort(r)
 
 	if host == p.baseDomain {
 		// The control plane answers only on the main port. The high
 		// ports bind nothing for the base domain.
-		if port == DefaultPort && p.control != nil {
+		if port == p.mainPort && p.control != nil {
 			p.control.ServeHTTP(w, r)
 			return
 		}
@@ -193,7 +236,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// against the owner and the shares of the instance on every request
 	// (SPEC 13): an authenticated user without access gets the same 404
 	// as a name that does not exist.
-	private := inst.Visibility == types.VisibilityPrivate || port != DefaultPort
+	private := inst.Visibility == types.VisibilityPrivate || port != p.mainPort
 	if private {
 		switch p.access(r, inst.UUID) {
 		case AccessGranted:
@@ -207,7 +250,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	targetPort := port
-	if port == DefaultPort {
+	if port == p.mainPort {
 		targetPort = inst.HTTPPort
 		if targetPort == 0 {
 			targetPort = defaultHTTPPort
@@ -279,19 +322,21 @@ func requestHost(r *http.Request) string {
 }
 
 // listenerPort reads the local port the request arrived on. net/http sets
-// LocalAddrContextKey on every request; DefaultPort covers the fallback.
-func listenerPort(r *http.Request) int {
+// LocalAddrContextKey on every request; the main port covers the
+// fallback, so a request with no local address routes as if it arrived
+// on the port that carries the base domain.
+func (p *Proxy) listenerPort(r *http.Request) int {
 	addr, ok := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
 	if !ok {
-		return DefaultPort
+		return p.mainPort
 	}
 	_, portStr, err := net.SplitHostPort(addr.String())
 	if err != nil {
-		return DefaultPort
+		return p.mainPort
 	}
 	port, err := strconv.Atoi(portStr)
 	if err != nil {
-		return DefaultPort
+		return p.mainPort
 	}
 	return port
 }

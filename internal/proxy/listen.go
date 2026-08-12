@@ -10,13 +10,14 @@ import (
 	"time"
 )
 
-// Ports returns every port the proxy listens on: 443 and 3000-9999
-// (SPEC 9, 9.1).
-func Ports() []int {
-	ports := make([]int, 0, 1+HighPortMax-HighPortMin+1)
-	ports = append(ports, DefaultPort)
-	for p := HighPortMin; p <= HighPortMax; p++ {
-		ports = append(ports, p)
+// Ports returns every port the proxy listens on: the main port followed
+// by the high port range (SPEC 9, 9.1). The defaults are 443 and
+// 3000-9999; WithPorts moves them.
+func (p *Proxy) Ports() []int {
+	ports := make([]int, 0, 1+p.highMax-p.highMin+1)
+	ports = append(ports, p.mainPort)
+	for port := p.highMin; port <= p.highMax; port++ {
+		ports = append(ports, port)
 	}
 	return ports
 }
@@ -33,7 +34,7 @@ func (p *Proxy) Serve(ctx context.Context, bindHost string, tlsConf *tls.Config,
 	if listen == nil {
 		listen = net.Listen
 	}
-	listeners, err := listenAll(bindHost, Ports(), listen)
+	listeners, err := listenAll(bindHost, p.Ports(), listen)
 	if err != nil {
 		return err
 	}
