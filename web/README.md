@@ -12,13 +12,11 @@ npm install
 npm run build     # tsc --noEmit && vite build → dist/
 ```
 
-Assets are built here (Node build step) and embedded into `bentod` via
-`embed.go` in this directory (`go:embed all:dist`), served by
-`internal/dashboard`. The build output directory (`web/dist`) is
-committed, not gitignored, so the Go build never needs a Node runtime.
-The `bento_noweb` Go build tag compiles without the assets for
-environments that have no build; the real build always embeds real
-assets.
+Assets are built here (Node build step) and embedded into `bentod` with
+`rust-embed`, served by `crates/dashboard`. The build output directory
+(`web/dist`) is committed, not gitignored, so the Rust build never needs
+a Node runtime. A build with no assets serves a placeholder that says how
+to produce them; the real build always embeds real assets.
 
 ## Design tokens
 

@@ -58,38 +58,50 @@ listed in `operators` in the config get the database download.
 
 ## Development quickstart
 
-Go 1.26; Node only if you touch the dashboard.
+Rust nightly (see `rust-toolchain.toml`); Node only if you touch the
+dashboard. The build needs a C compiler for the bundled SQLite, but not
+cmake or clang: every TLS user is pinned to the `ring` crypto provider,
+never `aws-lc-rs`.
 
 ```
-make build       # bin/bentod (dashboard assets embedded from web/dist)
-make check       # go vet ./... && go test ./...
+make build       # target/release/bentod (dashboard assets embedded from web/dist)
+make check       # cargo clippy -D warnings && cargo test --workspace
 make dashboard   # rebuild web/dist after changing web/src (npm ci && npm run build)
 ```
 
 Everything host-touching (libvirt RPC, qemu-img, xorriso, nft, /dev/kvm)
-sits behind small interfaces with in-memory fakes, so the full test
-suite runs on any OS, including macOS.
+sits behind small traits with in-memory fakes, so the full test suite
+runs anywhere. Each crate declares the narrow trait it needs rather than
+depending on the data layer; `bentod` is the one place that knows every
+concrete type.
 
-- `cmd/bentod` — subcommand dispatch and the wiring of all packages.
-- `internal/types` — shared domain types (SPEC 11-12).
-- `internal/config` — TOML operator configuration; see `bento.example.toml`.
-- `internal/store` — SQLite schema and persistence (SPEC 12).
-- `internal/hypervisor`, `internal/images`, `internal/cloudinit`,
-  `internal/network`, `internal/lifecycle` — host-side machinery
+- `bentod` — subcommand dispatch and the wiring of all crates.
+- `crates/types` — shared domain types (SPEC 11-12).
+- `crates/config` — TOML operator configuration; see `bento.example.toml`.
+- `crates/store` — SQLite schema and persistence (SPEC 12).
+- `crates/hypervisor`, `crates/images`, `crates/cloudinit`,
+  `crates/network`, `crates/lifecycle` — host-side machinery
   (SPEC 5, 6, 11).
-- `internal/sshfront`, `internal/cli` — SSH frontend and command line
+- `crates/sshfront`, `crates/cli` — SSH frontend and command line
   interface (SPEC 10, 15).
-- `internal/proxy`, `internal/tlscert` — HTTP proxy and wildcard TLS
+- `crates/proxy`, `crates/tlscert` — HTTP proxy and wildcard TLS
   (SPEC 8, 9).
-- `internal/auth`, `internal/api`, `internal/dashboard`, `web/` —
-  identity, API, and dashboard (SPEC 13, 14).
+- `crates/auth`, `crates/api`, `crates/dashboard`, `web/` — identity,
+  API, and dashboard (SPEC 13, 14).
+
+`crates/hypervisor` speaks the libvirt XDR RPC protocol directly over the
+unix socket rather than binding a C library, so the binary stays
+dependency-light. It implements only the procedures the control plane
+calls.
 
 ## Status
 
-Built to SPEC v0.9. Every package has unit tests against fakes and the
+Built to SPEC v0.9. Every crate has unit tests against fakes and the
 whole suite passes, but the system has **not** been run against a live
-libvirtd yet — the libvirt RPC calls, the nftables ruleset, the ACME
-issuance, and real guest boots are exercised only through their fakes.
+libvirtd yet — the nftables ruleset, the ACME issuance, and real guest
+boots are exercised only through their fakes. The one exception is the
+libvirt wire protocol: its codec is checked against the host's real
+daemon by a read-only test, which is `#[ignore]`d by default.
 Known gaps and deviations:
 
 - `console` (serial console attach) is not wired; it returns a clear

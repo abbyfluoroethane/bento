@@ -1,6 +1,0 @@
-<network>
-  <name>bento-user-3</name>
-  <forward mode="open"></forward>
-  <bridge name="bento3" stp="off" delay="0"></bridge>
-  <ip address="10.77.3.1" netmask="255.255.255.0"></ip>
-</network>

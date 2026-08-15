@@ -53,6 +53,19 @@ must list arm64 images**; an amd64 cloud image will not boot. The domain
 XML adapts itself (machine `virt`, GICv3, host-passthrough, the seed
 CD-ROM on virtio-scsi), so nothing else needs configuring.
 
+### Building the binary
+
+Rust nightly, pinned by `rust-toolchain.toml`; `rustup` picks it up on
+its own. `make build` produces `target/release/bentod` with the
+dashboard assets embedded, so the deployed artifact is one file and
+needs no Node runtime.
+
+The build needs a C compiler for the bundled SQLite. It deliberately
+does **not** need cmake or clang: every TLS user is pinned to the `ring`
+crypto provider, because `aws-lc-rs` cannot build without them. If a
+dependency bump ever drags `aws-lc-rs` back in, the build breaks on a
+host like this one — `cargo tree -i aws-lc-rs` names the culprit.
+
 ## 2. Ports
 
 Bento binds three things:
@@ -270,10 +283,11 @@ it up together with the image and storage directories (SPEC 12.1).
 Things that currently need a direct database write, because no command
 exists:
 
-- granting quota (`store.SetQuota` has no caller)
+- granting quota (`Store::set_quota` has no caller)
 - setting `oidc_subject` on an existing user
 
-Neither host ships `sqlite3` by default, so this means a small program
-against `internal/store` or a Python `sqlite3` one-liner. Stop
+Both are a `sqlite3` one-liner against the database. Install `sqlite3`
+first if the host lacks it — a host without it needs a throwaway program
+instead, which is a great deal more work for one `UPDATE`. Stop
 `bentod serve` first, or rely on the WAL busy timeout for a single small
 write.
