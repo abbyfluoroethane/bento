@@ -1,5 +1,5 @@
 use std::collections::HashSet;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 
 use async_trait::async_trait;
 
@@ -15,7 +15,10 @@ const LAST_INSTANCE: u32 = 254;
 /// The DNS servers written into cloud-init network configuration when
 /// the operator does not override them. No resolver runs on the user
 /// bridges, so instances use public resolvers.
-pub const DEFAULT_DNS: [Ipv4Addr; 2] = [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(9, 9, 9, 9)];
+pub const DEFAULT_DNS: [IpAddr; 2] = [
+    IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+    IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
+];
 
 /// Carves the operator-configured private range into per-user `/24`
 /// subnets (SPEC 6.2). The mapping from subnet index to CIDR is
@@ -165,14 +168,14 @@ pub struct GuestNetwork {
     /// The `.1` address of the user subnet.
     pub gateway: Ipv4Addr,
     /// The resolver list for the guest.
-    pub dns: Vec<Ipv4Addr>,
+    pub dns: Vec<IpAddr>,
 }
 
 impl GuestNetwork {
     /// Returns the guest network values for an instance address inside a
     /// user `/24`. `None` selects [`DEFAULT_DNS`]; `Some(&[])` keeps an
     /// explicitly empty resolver list.
-    pub fn new(subnet: Ipv4Prefix, address: Ipv4Addr, dns: Option<&[Ipv4Addr]>) -> Result<Self> {
+    pub fn new(subnet: Ipv4Prefix, address: Ipv4Addr, dns: Option<&[IpAddr]>) -> Result<Self> {
         require_slash_24(subnet)?;
         if !contains(subnet, address) {
             return Err(invalid(format!(

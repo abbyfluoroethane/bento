@@ -90,7 +90,7 @@ async fn authenticate(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    match state.0.auth.user_from_request(&request).await {
+    match state.0.auth.user_from_headers(request.headers()).await {
         Ok(user) => {
             request.extensions_mut().insert(user);
             next.run(request).await

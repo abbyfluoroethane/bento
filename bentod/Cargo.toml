@@ -10,3 +10,39 @@ name = "bentod"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = { workspace = true }
+async-trait = { workspace = true }
+axum = { workspace = true }
+bytes = { workspace = true }
+bento-api = { workspace = true }
+bento-auth = { workspace = true }
+bento-cli = { workspace = true }
+bento-cloudinit = { workspace = true }
+bento-config = { workspace = true }
+bento-dashboard = { workspace = true }
+bento-hypervisor = { workspace = true }
+bento-images = { workspace = true }
+bento-lifecycle = { workspace = true }
+bento-network = { workspace = true }
+bento-proxy = { workspace = true }
+bento-sshfront = { workspace = true }
+bento-store = { workspace = true }
+bento-tlscert = { workspace = true }
+bento-types = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+reqwest = { workspace = true }
+rand = { workspace = true }
+russh = { workspace = true }
+rustls = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true, features = ["io-util"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

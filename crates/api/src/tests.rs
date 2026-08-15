@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use axum::http::Method;
+use axum::http::{HeaderMap, Method};
 use bento_types::{DesiredState, Image, State as InstanceState};
 use tower::ServiceExt;
 
@@ -399,7 +399,7 @@ struct FakeAuth(Mutex<Option<User>>);
 
 #[async_trait]
 impl Authenticator for FakeAuth {
-    async fn user_from_request(&self, _request: &Request<Body>) -> Result<User, BoxError> {
+    async fn user_from_headers(&self, _headers: &HeaderMap) -> Result<User, BoxError> {
         self.0
             .lock()
             .unwrap()

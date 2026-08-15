@@ -22,7 +22,10 @@ pub struct ParseError {
 
 impl ParseError {
     fn new(kind: &'static str, value: &str) -> Self {
-        Self { kind, value: value.to_string() }
+        Self {
+            kind,
+            value: value.to_string(),
+        }
     }
 }
 

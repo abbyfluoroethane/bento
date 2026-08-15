@@ -3,8 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderMap, StatusCode};
 use bento_store::Usage;
 use bento_types::{Instance, Quota, Share, SshKey, User, Visibility};
 
@@ -147,7 +146,7 @@ pub trait Lifecycle: Send + Sync + 'static {
 /// unauthenticated and the API answers HTTP 401 (SPEC 13).
 #[async_trait]
 pub trait Authenticator: Send + Sync + 'static {
-    async fn user_from_request(&self, request: &Request<Body>) -> Result<User, BoxError>;
+    async fn user_from_headers(&self, headers: &HeaderMap) -> Result<User, BoxError>;
 }
 
 /// The operator-only route predicate supplied by the binary.

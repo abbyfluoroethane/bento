@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::future::Future;
-use std::net::Ipv4Addr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -170,7 +170,7 @@ pub struct Config {
     pub storage_dir: PathBuf,
     pub name_cooldown: Duration,
     pub batch_size: usize,
-    pub dns: Vec<Ipv4Addr>,
+    pub dns: Vec<IpAddr>,
     pub logger: Option<Arc<dyn LifecycleLogger>>,
     pub nested_enabled: Option<NestedProbe>,
     pub poll_interval: Duration,
@@ -196,7 +196,7 @@ pub struct Manager {
     pub(crate) storage_dir: PathBuf,
     pub(crate) cooldown: Duration,
     pub(crate) batch_size: usize,
-    pub(crate) dns: Vec<Ipv4Addr>,
+    pub(crate) dns: Vec<IpAddr>,
     pub(crate) log: Arc<dyn LifecycleLogger>,
     pub(crate) nested: NestedProbe,
     pub(crate) poll_every: Duration,
