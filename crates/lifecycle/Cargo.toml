@@ -6,3 +6,16 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait.workspace = true
+bento-cloudinit.workspace = true
+bento-hypervisor.workspace = true
+bento-network.workspace = true
+bento-types.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
