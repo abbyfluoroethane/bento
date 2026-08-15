@@ -6,3 +6,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
+bento-hypervisor = { workspace = true }
+bento-store = { workspace = true }
+bento-types = { workspace = true }
+russh = { workspace = true }
+time = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
