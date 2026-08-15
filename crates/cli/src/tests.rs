@@ -1035,3 +1035,47 @@ async fn help_on_no_args() {
     assert_eq!(code, 0);
     assert!(output.contains("ssh bento.example.org <command>"));
 }
+
+/// The help screen used to be one preformatted string built with `\`
+/// line continuations, which silently ate the indent of every line: it
+/// compiled to text flush against the left margin, with the descriptions of
+/// the three long entries stranded on their own unindented lines. Only the
+/// header was asserted, so nothing caught it. This rebuilds the expected
+/// layout from the table and compares it, so any drift shows up as a diff.
+#[tokio::test]
+async fn help_lines_up_in_one_column() {
+    let (_, _, cli) = fixture();
+    let (_, output, _) = run(&cli, user(1, "alice"), "", &[]).await;
+
+    let indent = super::HELP_INDENT;
+    let width = super::HELP_USAGE_WIDTH;
+    let mut expected = String::new();
+    for (usage, description) in super::HELP_COMMANDS {
+        if usage.len() <= width {
+            expected.push_str(&format!("{indent}{usage:<width$}{description}\n"));
+        } else {
+            expected.push_str(&format!("{indent}{usage}\n"));
+            expected.push_str(&format!("{indent}{:<width$}{description}\n", ""));
+        }
+    }
+
+    let body = output.split_once("\n\n").expect("header and body").1;
+    assert_eq!(body, expected);
+
+    // The alignment the layout exists for: descriptions share one column,
+    // and the entries too wide for it still have theirs.
+    let column = indent.len() + width;
+    for line in body.lines() {
+        assert!(line.starts_with(indent), "line lost its indent: {line:?}");
+        let Some(description) = line.get(column..).filter(|rest| !rest.is_empty()) else {
+            continue;
+        };
+        if line[..column].trim().len() <= width {
+            assert!(
+                !description.starts_with(' '),
+                "description is not flush at column {column}: {line:?}"
+            );
+        }
+    }
+    assert!(body.contains("create an instance"));
+}

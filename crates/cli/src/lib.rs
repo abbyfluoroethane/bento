@@ -85,6 +85,50 @@ impl Options {
     }
 }
 
+/// The help screen, as pairs of usage and description.
+///
+/// This is a table rather than one preformatted string because the obvious
+/// way to write that string silently loses the layout: a `\` at the end of a
+/// line inside a Rust literal swallows the newline *and* the whole indent of
+/// the next line, so hand-aligned help text compiles to text flush against
+/// the left margin. Alignment computed from the data cannot drift that way.
+const HELP_COMMANDS: [(&str, &str); 16] = [
+    ("ls", "list your instances"),
+    (
+        "new <name> [--image --memory --cpu --disk --nested --no-ksm]",
+        "create an instance",
+    ),
+    ("rm <name> [--force]", "delete an instance"),
+    ("start <name>", "start a stopped instance"),
+    ("stop <name>", "stop a running instance"),
+    ("restart <name>", "restart an instance"),
+    ("rename <old> <new>", "rename an instance"),
+    ("cp <source> <target>", "copy a stopped instance"),
+    (
+        "resize <name> [--memory --cpu --disk --nested|--no-nested]",
+        "change instance resources",
+    ),
+    ("console <name>", "attach to the serial console"),
+    ("port <name> <port>", "set the default HTTP port"),
+    (
+        "visibility <name> <off|private|public>",
+        "set who can reach the instance URL",
+    ),
+    (
+        "share [--revoke] <name> [<user>]",
+        "grant, revoke, or list access",
+    ),
+    ("images", "list images and versions in use"),
+    ("ssh-key [add|list|remove]", "manage your SSH keys"),
+    ("whoami", "show your account and quota"),
+];
+
+/// Indent of every command line on the help screen.
+const HELP_INDENT: &str = "  ";
+
+/// Width of the usage column, so descriptions line up at one column.
+const HELP_USAGE_WIDTH: usize = 35;
+
 /// Executes commands for one authenticated user at a time.
 pub struct Cli {
     store: Arc<dyn Store>,
@@ -158,27 +202,19 @@ impl Cli {
         };
         let _ = write!(
             writer,
-            "bento — usage: ssh {host} <command> [arguments]\n\n\
-  ls                                 list your instances\n\
-  new <name> [--image --memory --cpu --disk --nested --no-ksm]\n\
-                                     create an instance\n\
-  rm <name> [--force]                delete an instance\n\
-  start <name>                       start a stopped instance\n\
-  stop <name>                        stop a running instance\n\
-  restart <name>                     restart an instance\n\
-  rename <old> <new>                 rename an instance\n\
-  cp <source> <target>               copy a stopped instance\n\
-  resize <name> [--memory --cpu --disk --nested|--no-nested]\n\
-                                     change instance resources\n\
-  console <name>                     attach to the serial console\n\
-  port <name> <port>                 set the default HTTP port\n\
-  visibility <name> <off|private|public>\n\
-                                     set who can reach the instance URL\n\
-  share [--revoke] <name> [<user>]   grant, revoke, or list access\n\
-  images                             list images and versions in use\n\
-  ssh-key [add|list|remove]          manage your SSH keys\n\
-  whoami                             show your account and quota\n"
+            "bento — usage: ssh {host} <command> [arguments]\n\n"
         );
+        let width = HELP_USAGE_WIDTH;
+        for (usage, description) in HELP_COMMANDS {
+            if usage.len() <= width {
+                let _ = writeln!(writer, "{HELP_INDENT}{usage:<width$}{description}");
+            } else {
+                // Too wide for the column, so the description goes on its own
+                // line, kept at the same column as every other one.
+                let _ = writeln!(writer, "{HELP_INDENT}{usage}");
+                let _ = writeln!(writer, "{HELP_INDENT}{:<width$}{description}", "");
+            }
+        }
     }
 
     async fn resolve(&self, env: &mut Env<'_>, name: &str) -> Option<Instance> {
