@@ -6,3 +6,16 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+async-trait = { workspace = true }
+bento-types = { workspace = true }
+futures = { workspace = true }
+hex = { workspace = true }
+http = { workspace = true }
+reqwest = { workspace = true }
+rustls = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
