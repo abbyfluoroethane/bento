@@ -511,3 +511,83 @@ async fn api_and_cli_changes_reload_firewall() {
             .contains(&instance.address)
     );
 }
+
+/// The interpreter is an async function that takes blocking handles, so
+/// `CliRunner` drives it with `block_on` on a blocking thread. That
+/// establishes a runtime context for the whole call, and anything on the
+/// interpreter's side of the streams that reaches for the runtime again —
+/// `SyncIoBridge` did, on every write — panics with "Cannot start a runtime
+/// from within a runtime" and the session ends without producing a byte.
+///
+/// The unit tests of the interpreter cannot catch that: they pass plain
+/// `Vec<u8>` handles, which never touch a runtime. It takes the real adapter
+/// on a real runtime, which is what this does.
+#[tokio::test]
+async fn cli_runner_writes_output_from_inside_the_runtime() {
+    use bento_sshfront::CLIRunner as _;
+
+    let env = Env::new().await;
+    let user = env.add_user("riley").await;
+    let lifecycle = Arc::new(CliBackend(Backend {
+        manager: env.manager.clone(),
+        store: env.store.clone(),
+        host_id: env.host_id,
+        frontend_key: String::new(),
+        firewall: None,
+    }));
+    let cli = crate::adapters::CliRunner(Arc::new(bento_cli::Cli::new(
+        Arc::new(env.store.clone()),
+        lifecycle,
+        bento_cli::Options {
+            domain: "bento.example.org".into(),
+            ..Default::default()
+        },
+    )));
+
+    let (client_in, server_in) = tokio::io::duplex(4096);
+    let (server_out, mut client_out) = tokio::io::duplex(4096);
+    let (server_err, _client_err) = tokio::io::duplex(4096);
+    drop(client_in);
+
+    let code = cli
+        .run(
+            user,
+            vec!["help".into()],
+            Box::pin(server_in),
+            Box::pin(server_out),
+            Box::pin(server_err),
+        )
+        .await;
+
+    let mut output = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut client_out, &mut output)
+        .await
+        .unwrap();
+    assert_eq!(code, 0);
+    assert!(
+        !output.is_empty(),
+        "the help text never reached the ssh stream"
+    );
+}
+
+/// End of stream on the read half is the client closing stdin, which has to
+/// read as end-of-file rather than an error or a hang: `confirm` prompts read
+/// a line from it.
+#[test]
+fn channel_reader_reports_eof_when_the_sender_is_gone() {
+    use std::io::Read as _;
+
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let mut reader = crate::adapters::ChannelReader {
+        rx,
+        chunk: Vec::new(),
+        offset: 0,
+    };
+    tx.send(b"yes\n".to_vec()).unwrap();
+    drop(tx);
+
+    let mut got = Vec::new();
+    reader.read_to_end(&mut got).unwrap();
+    assert_eq!(got, b"yes\n");
+    assert_eq!(reader.read(&mut [0u8; 4]).unwrap(), 0);
+}

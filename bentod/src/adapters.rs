@@ -26,7 +26,6 @@ use bento_types::{
 use http::{Request, StatusCode};
 use time::OffsetDateTime;
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_util::io::SyncIoBridge;
 
 use crate::firewall::Firewall;
 
@@ -787,7 +786,73 @@ pub(crate) fn user_network(plan: Plan, subnet: &str) -> anyhow::Result<UserNetwo
 
 /// Bridges the async SSH channel streams to the blocking stream interface of
 /// the command interpreter without buffering an interactive session.
+///
+/// The streams are moved across channels rather than wrapped in a
+/// [`tokio_util::io::SyncIoBridge`], which cannot be used here. The
+/// interpreter is an async function that takes *blocking* handles, so it has
+/// to be driven with `block_on` on a blocking thread, and that establishes a
+/// runtime context for the whole call. `SyncIoBridge` calls `block_on`
+/// internally on every read and write, so each one nests inside that context
+/// and panics with "Cannot start a runtime from within a runtime" — the
+/// session dies before a byte reaches the client.
+///
+/// So nothing on the interpreter's side of the channel may touch the runtime:
+/// the writer is an unbounded [`tokio::sync::mpsc`] sender, whose `send` is
+/// an ordinary non-blocking call, and the reader is a [`std::sync::mpsc`]
+/// receiver, whose `recv` blocks the thread without consulting any runtime.
+/// The pump tasks on the other end do the awaiting.
 pub(crate) struct CliRunner(pub(crate) Arc<bento_cli::Cli>);
+
+/// The blocking write half: hands each write to the pump task that owns the
+/// async stream. `send` neither blocks nor enters the runtime.
+struct ChannelWriter(tokio::sync::mpsc::UnboundedSender<Vec<u8>>);
+
+impl io::Write for ChannelWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .send(buf.to_vec())
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "ssh stream closed"))?;
+        Ok(buf.len())
+    }
+
+    /// The pump writes each chunk as it arrives, so there is nothing held
+    /// back here to flush.
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The blocking read half. `recv` parks this thread until the pump task
+/// delivers the next chunk, which is what makes `confirm` and the key
+/// prompts interactive rather than reading end-of-file immediately.
+pub(crate) struct ChannelReader {
+    pub(crate) rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    pub(crate) chunk: Vec<u8>,
+    pub(crate) offset: usize,
+}
+
+impl io::Read for ChannelReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        while self.offset >= self.chunk.len() {
+            match self.rx.recv() {
+                Ok(chunk) => {
+                    self.chunk = chunk;
+                    self.offset = 0;
+                }
+                // The sender is gone: the client closed stdin. Report the
+                // end of the stream rather than an error.
+                Err(_) => return Ok(0),
+            }
+        }
+        let n = buf.len().min(self.chunk.len() - self.offset);
+        buf[..n].copy_from_slice(&self.chunk[self.offset..self.offset + n]);
+        self.offset += n;
+        Ok(n)
+    }
+}
 
 #[async_trait]
 impl bento_sshfront::CLIRunner for CliRunner {
@@ -799,16 +864,67 @@ impl bento_sshfront::CLIRunner for CliRunner {
         stdout: Pin<Box<dyn AsyncWrite + Send>>,
         stderr: Pin<Box<dyn AsyncWrite + Send>>,
     ) -> i32 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (out_tx, mut out_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (err_tx, mut err_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let (in_tx, in_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+
+        // Forward stdin until the client closes it or the interpreter exits
+        // and drops the receiver. The channel is unbounded so this never
+        // blocks a runtime worker; SSH's own window limits the read-ahead.
+        let stdin_pump = tokio::spawn(async move {
+            let mut stdin = stdin;
+            let mut buf = [0u8; 8192];
+            while let Ok(n) = stdin.read(&mut buf).await {
+                if n == 0 || in_tx.send(buf[..n].to_vec()).is_err() {
+                    break;
+                }
+            }
+        });
+
+        let out_pump = tokio::spawn(async move {
+            let mut stdout = stdout;
+            while let Some(chunk) = out_rx.recv().await {
+                if stdout.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+            let _ = stdout.flush().await;
+        });
+        let err_pump = tokio::spawn(async move {
+            let mut stderr = stderr;
+            while let Some(chunk) = err_rx.recv().await {
+                if stderr.write_all(&chunk).await.is_err() {
+                    break;
+                }
+            }
+            let _ = stderr.flush().await;
+        });
+
         let cli = self.0.clone();
         let handle = tokio::runtime::Handle::current();
-        tokio::task::spawn_blocking(move || {
-            let mut stdin = SyncIoBridge::new(stdin);
-            let mut stdout = SyncIoBridge::new(stdout);
-            let mut stderr = SyncIoBridge::new(stderr);
+        let code = tokio::task::spawn_blocking(move || {
+            let mut stdin = ChannelReader {
+                rx: in_rx,
+                chunk: Vec::new(),
+                offset: 0,
+            };
+            let mut stdout = ChannelWriter(out_tx);
+            let mut stderr = ChannelWriter(err_tx);
             handle.block_on(cli.run(user, &args, &mut stdin, &mut stdout, &mut stderr))
+            // The senders drop here, which ends both output pumps.
         })
         .await
-        .unwrap_or(1)
+        .unwrap_or(1);
+
+        // Drain what the interpreter wrote before returning: the caller
+        // closes the SSH channel on this return, and anything still sitting
+        // in a pump would be lost with it.
+        let _ = out_pump.await;
+        let _ = err_pump.await;
+        stdin_pump.abort();
+        code
     }
 }
 
