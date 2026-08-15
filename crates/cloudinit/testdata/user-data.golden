@@ -1,0 +1,15 @@
+#cloud-config
+hostname: "web-1"
+users:
+  - name: "alice"
+    shell: /bin/bash
+    lock_passwd: true
+    sudo: "ALL=(ALL) NOPASSWD:ALL"
+    ssh_authorized_keys:
+      - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIB6C5rzYtZQoYXsQ2N4YFJmXW4L0Yw1v9uW3o2n8m4Qq alice@laptop"
+      - "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQCk7example alice@desktop"
+package_update: true
+packages:
+  - qemu-guest-agent
+runcmd:
+  - [systemctl, enable, --now, qemu-guest-agent]
