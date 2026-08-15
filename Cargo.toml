@@ -1,0 +1,98 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/types",
+    "crates/config",
+    "crates/store",
+    "crates/hypervisor",
+    "crates/images",
+    "crates/cloudinit",
+    "crates/network",
+    "crates/lifecycle",
+    "crates/tlscert",
+    "crates/proxy",
+    "crates/auth",
+    "crates/api",
+    "crates/dashboard",
+    "crates/sshfront",
+    "crates/cli",
+    "bentod",
+]
+
+[workspace.package]
+version = "0.9.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/abbyfluoroethane/bento"
+
+# One crate per package of the Go tree, in the same dependency order
+# (SPEC 16). Nothing here depends on anything below it.
+[workspace.dependencies]
+bento-types = { path = "crates/types" }
+bento-config = { path = "crates/config" }
+bento-store = { path = "crates/store" }
+bento-hypervisor = { path = "crates/hypervisor" }
+bento-images = { path = "crates/images" }
+bento-cloudinit = { path = "crates/cloudinit" }
+bento-network = { path = "crates/network" }
+bento-lifecycle = { path = "crates/lifecycle" }
+bento-tlscert = { path = "crates/tlscert" }
+bento-proxy = { path = "crates/proxy" }
+bento-auth = { path = "crates/auth" }
+bento-api = { path = "crates/api" }
+bento-dashboard = { path = "crates/dashboard" }
+bento-sshfront = { path = "crates/sshfront" }
+bento-cli = { path = "crates/cli" }
+
+# Every TLS user is pinned to the `ring` crypto provider. The host has no
+# cmake and no clang, which aws-lc-rs needs to build; ring builds with cc
+# alone. A dependency that quietly pulls aws-lc-rs back in breaks the
+# build on this host, so keep default-features off wherever the choice
+# is a feature.
+anyhow = "1.0.104"
+async-trait = "0.1.92"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "form"] }
+base64 = "0.23.1"
+bytes = "1.12.1"
+futures = "0.3.34"
+hex = "0.4.3"
+http = "1.5.0"
+http-body-util = "0.1.5"
+hyper = { version = "1.11.0", features = ["http1", "client", "server"] }
+hyper-util = { version = "0.1.20", features = ["tokio", "client", "client-legacy", "server", "http1"] }
+instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls"] }
+jsonwebtoken = { version = "11.0.0", default-features = false, features = ["use_pem", "rust_crypto"] }
+mime_guess = "2.0.5"
+percent-encoding = "2.3.2"
+rand = "0.10.2"
+rcgen = { version = "0.14.9", default-features = false, features = ["ring", "pem"] }
+# `rustls-no-provider`, not `rustls`: the latter pulls aws-lc-rs in. With
+# rustls itself built with exactly the `ring` provider feature and no
+# other, rustls installs ring as the process default on first use.
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no-provider", "json", "stream", "charset", "http2"] }
+rusqlite = { version = "0.40.2", features = ["bundled", "backup"] }
+russh = { version = "0.62.6", default-features = false, features = ["ring", "flate2", "rsa"] }
+rust-embed = { version = "8.12.0", features = ["mime-guess"] }
+rustls = { version = "0.23.43", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pemfile = "2.2.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+thiserror = "2.0.20"
+time = { version = "0.3.55", features = ["formatting", "parsing", "macros", "serde"] }
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12", "logging"] }
+tokio-util = { version = "0.7.19", features = ["io"] }
+toml = "1.1.4"
+tower = "0.5.3"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
+url = "2.5.8"
+uuid = { version = "1.24.1", features = ["v4"] }
+
+# Test-only.
+tempfile = "3.27.0"
+
+[profile.release]
+lto = "thin"
+strip = "symbols"
