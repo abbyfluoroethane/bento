@@ -6,3 +6,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+bento-config = { workspace = true }
+async-trait = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
