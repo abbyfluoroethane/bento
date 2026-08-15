@@ -53,6 +53,12 @@ must list arm64 images**; an amd64 cloud image will not boot. The domain
 XML adapts itself (machine `virt`, GICv3, host-passthrough, the seed
 CD-ROM on virtio-scsi), so nothing else needs configuring.
 
+The `[[images]]` entry in `bento.example.toml` is the **amd64** Debian
+image, because that is the common case. On aarch64 swap the URL for the
+`arm64` one of the same build before running `fetch-images` — nothing
+checks the architecture of a fetched image, so the mistake surfaces as
+an instance that boots to nothing.
+
 ### Building the binary
 
 Rust nightly, pinned by `rust-toolchain.toml`; `rustup` picks it up on
@@ -122,15 +128,29 @@ Copy `bento.example.toml` to `/etc/bento/bento.toml`. The minimum is
 TLS elsewhere, see below — the `[acme]` Cloudflare token.
 
 ```
-mkdir -p /etc/bento /var/lib/bento
+mkdir -p /etc/bento /var/lib/bento/storage
 install -m 0600 bento.example.toml /etc/bento/bento.toml
 $EDITOR /etc/bento/bento.toml
 bentod fetch-images
 ```
 
+**Create `storage_dir` yourself.** Bento checks that the storage and
+image directories exist and are writable but does not create them, so a
+plain `mkdir /var/lib/bento` leaves `serve` refusing to start:
+
+```
+bentod serve: host requirements not met (SPEC 4.2):
+  storage directory: No such file or directory (os error 2)
+```
+
+The image directory is easy to miss as a trap because `fetch-images`
+creates it on the way past; nothing does the same for storage.
+
 `fetch-images` downloads, verifies, and stores each allowlist entry by
 checksum. Instances cannot be created until it has run: the allowlist
 row alone is not enough, the image needs a fetched version.
+`bentod images` lists what is stored, with the current checksum of each
+allowlist entry and how many instances still run an older one.
 
 ## 5. Behind an existing TLS terminator
 
@@ -201,7 +221,31 @@ WantedBy=multi-user.target
 ```
 
 The `proxy` and `sshd` units are the same with the subcommand changed
-and `After=bentod-serve.service` added.
+and `After=bentod-serve.service` added — but the proxy needs one more
+line:
+
+```ini
+LimitNOFILE=65536
+```
+
+**Without it the proxy dies partway through binding the high range**:
+
+```
+bentod proxy: proxy: bind port 4011: Too many open files (os error 24)
+```
+
+The range is one listening descriptor per port — about 7000 of them —
+and systemd hands a service a soft `RLIMIT_NOFILE` of 1024 even where
+the hard limit is 524288. The failing port number moves around, which
+makes this look like the "some other process holds a port" failure from
+section 2; the `Too many open files` text is what tells the two apart.
+Check the limit a unit will actually get with
+`systemctl show bentod-proxy -p LimitNOFILESoft`.
+
+This one is new in the Rust build and is worth knowing if you deployed
+the Go one: the Go runtime raised its own soft limit to the hard limit
+at startup, so the range bound cleanly on a stock unit and no such line
+was ever needed. Rust does not do this, so the limit has to be set.
 
 ```
 systemctl enable --now bentod-serve bentod-proxy bentod-sshd
@@ -211,6 +255,13 @@ systemctl enable --now bentod-serve bentod-proxy bentod-sshd
 > to `bentod sshd` starts the registration flow (SPEC 13), so running it
 > on a public address means anyone can create an account. Leave the unit
 > stopped until you have decided that is what you want.
+>
+> There is **no configuration switch for this**. `bentod sshd` always
+> installs the registrar, so the choice is the unit being run or not, or
+> a private `listen.ssh` such as `127.0.0.1:22` that keeps the frontend
+> reachable only through an SSH tunnel. The frontend library takes an
+> optional registrar and rejects unknown keys without one, so the switch
+> is a small change if it is wanted.
 
 Verify:
 
