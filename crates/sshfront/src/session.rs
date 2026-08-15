@@ -18,6 +18,116 @@ use crate::{DEFAULT_DIAL_INTERVAL, DEFAULT_START_TIMEOUT};
 type SessionInput = Pin<Box<dyn AsyncRead + Send>>;
 type SessionOutput = Pin<Box<dyn AsyncWrite + Send>>;
 
+/// Translates bare newlines to CRLF on the way to the channel.
+///
+/// A client that asked for a PTY puts its own terminal into raw mode, and
+/// there a bare `\n` moves down one row without returning the carriage: the
+/// output arrives as a staircase running off the right of the screen. A stock
+/// sshd never has to think about this because the kernel pty's `ONLCR` does
+/// the translation; this frontend writes to the channel itself, so it has to.
+///
+/// Everything sshfront prints spells out `\r\n` already. The command
+/// interpreter is the exception on purpose: it is transport-agnostic and
+/// writes plain `\n`, which is what a redirect to a file should get. So the
+/// translation belongs here, and only when a PTY was actually requested.
+struct CrlfWriter {
+    inner: SessionOutput,
+    /// Translated bytes not yet accepted by the channel.
+    pending: Vec<u8>,
+    offset: usize,
+    /// Whether the last byte written was a carriage return, so that a CRLF
+    /// the interpreter already wrote is not turned into CR CR LF.
+    after_cr: bool,
+}
+
+impl CrlfWriter {
+    fn new(inner: SessionOutput) -> Self {
+        Self {
+            inner,
+            pending: Vec::new(),
+            offset: 0,
+            after_cr: false,
+        }
+    }
+
+    /// Pushes buffered bytes into the channel until it takes them all.
+    fn poll_drain(&mut self, cx: &mut std::task::Context<'_>) -> std::task::Poll<io::Result<()>> {
+        use std::task::Poll;
+        while self.offset < self.pending.len() {
+            match self
+                .inner
+                .as_mut()
+                .poll_write(cx, &self.pending[self.offset..])
+            {
+                Poll::Ready(Ok(0)) => {
+                    return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
+                }
+                Poll::Ready(Ok(written)) => self.offset += written,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+        self.pending.clear();
+        self.offset = 0;
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+impl AsyncWrite for CrlfWriter {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        use std::task::Poll;
+        // Anything left from a previous call goes first, to keep the order.
+        if let Poll::Ready(Err(error)) = self.poll_drain(cx) {
+            return Poll::Ready(Err(error));
+        }
+        if !self.pending.is_empty() {
+            return Poll::Pending;
+        }
+        if buf.is_empty() {
+            return Poll::Ready(Ok(0));
+        }
+        for &byte in buf {
+            if byte == b'\n' && !self.after_cr {
+                self.pending.push(b'\r');
+            }
+            self.after_cr = byte == b'\r';
+            self.pending.push(byte);
+        }
+        // The whole input is buffered, so it counts as written whether or not
+        // the channel takes it now; `poll_flush` and the next call drain it.
+        if let Poll::Ready(Err(error)) = self.poll_drain(cx) {
+            return Poll::Ready(Err(error));
+        }
+        Poll::Ready(Ok(buf.len()))
+    }
+
+    fn poll_flush(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        use std::task::Poll;
+        match self.poll_drain(cx) {
+            Poll::Ready(Ok(())) => self.inner.as_mut().poll_flush(cx),
+            other => other,
+        }
+    }
+
+    fn poll_shutdown(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        use std::task::Poll;
+        match self.poll_drain(cx) {
+            Poll::Ready(Ok(())) => self.inner.as_mut().poll_shutdown(cx),
+            other => other,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum Authenticated {
     User(User),
@@ -193,12 +303,23 @@ async fn dispatch(server: &Server, authenticated: Authenticated, session: Box<dy
             } else {
                 let SessionParts {
                     command,
+                    pty,
                     stdin,
                     stdout,
                     stderr,
                     exit,
                     ..
                 } = parts;
+                // With a PTY the client's terminal is in raw mode, where the
+                // interpreter's bare newlines would staircase down the screen.
+                let (stdout, stderr): (SessionOutput, SessionOutput) = if pty.is_some() {
+                    (
+                        Box::pin(CrlfWriter::new(stdout)),
+                        Box::pin(CrlfWriter::new(stderr)),
+                    )
+                } else {
+                    (stdout, stderr)
+                };
                 let code = server.cli.run(user, command, stdin, stdout, stderr).await;
                 exit.exit(exit_code(code)).await;
             }
@@ -1365,5 +1486,54 @@ mod tests {
             super::split_command("new 'my vm' --image=debian\\ stable"),
             ["new", "my vm", "--image=debian stable"]
         );
+    }
+
+    /// A client that asks for a PTY puts its terminal in raw mode, where a
+    /// bare `\n` drops a row without returning the carriage and the help
+    /// screen walks off the right of the screen. The interpreter writes plain
+    /// `\n` by design, so the frontend translates — but only with a PTY, so
+    /// that `ssh host help > file` still gets ordinary newlines.
+    #[tokio::test]
+    async fn pty_sessions_get_crlf_from_the_interpreter() {
+        for (pty, expected) in [(true, "cli ran\r\n"), (false, "cli ran\n")] {
+            let cli = Arc::new(FakeCli::default());
+            let server = test_server(
+                Arc::new(FakeInstances::default()),
+                Arc::new(FakeStarter::default()),
+                cli.clone(),
+            );
+            let fake = fake_session("riley", "", pty).await;
+            dispatch(&server, Authenticated::User(user("riley")), fake.term).await;
+            assert_eq!(
+                fake.stdout.text(),
+                expected,
+                "pty={pty} did not get the right line endings"
+            );
+        }
+    }
+
+    /// Translation must not touch a CRLF the interpreter wrote itself, or the
+    /// terminal gets a blank line between every row.
+    #[tokio::test]
+    async fn crlf_writer_leaves_existing_crlf_alone() {
+        let sink = SharedWriter::default();
+        let mut writer = super::CrlfWriter::new(Box::pin(sink.clone()));
+        writer.write_all(b"a\r\nb\nc\r\n").await.unwrap();
+        writer.flush().await.unwrap();
+        assert_eq!(sink.text(), "a\r\nb\r\nc\r\n");
+    }
+
+    /// A newline split across two writes must still come out as CRLF: the
+    /// interpreter's formatter writes in whatever chunks it likes.
+    #[tokio::test]
+    async fn crlf_writer_translates_across_write_boundaries() {
+        let sink = SharedWriter::default();
+        let mut writer = super::CrlfWriter::new(Box::pin(sink.clone()));
+        writer.write_all(b"row").await.unwrap();
+        writer.write_all(b"\n").await.unwrap();
+        writer.write_all(b"\r").await.unwrap();
+        writer.write_all(b"\n").await.unwrap();
+        writer.flush().await.unwrap();
+        assert_eq!(sink.text(), "row\r\n\r\n");
     }
 }
