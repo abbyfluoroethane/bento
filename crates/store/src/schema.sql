@@ -106,6 +106,22 @@ CREATE TABLE IF NOT EXISTS released_names (
     released_at       TEXT    NOT NULL
 );
 
+-- Pending SSH key links (SPEC 13). An unknown key presented to the SSH
+-- frontend creates one of these and nothing else; no account exists until
+-- a browser session confirms the fingerprint. Only the hash of the link
+-- token is stored, as for tokens.hash.
+CREATE TABLE IF NOT EXISTS pairings (
+    id             INTEGER PRIMARY KEY,
+    token_hash     TEXT    NOT NULL UNIQUE,
+    public_key     TEXT    NOT NULL,
+    fingerprint    TEXT    NOT NULL,
+    comment        TEXT    NOT NULL DEFAULT '',
+    created_at     TEXT    NOT NULL,
+    expires_at     TEXT    NOT NULL,
+    -- Set when the link is used. A pairing is single-use.
+    linked_user_id INTEGER REFERENCES users(id) ON DELETE CASCADE
+);
+
 CREATE TABLE IF NOT EXISTS tokens (
     id         INTEGER PRIMARY KEY,
     user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,

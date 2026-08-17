@@ -28,10 +28,57 @@ impl Store {
         oidc_subject: Option<String>,
         private_range: Ipv4Prefix,
     ) -> Result<User> {
-        let name = name.into();
-        let email = email.into();
+        self.register(
+            name.into(),
+            email.into(),
+            oidc_subject,
+            private_range,
+            false,
+        )
+        .await
+    }
+
+    /// Registers a user under `preferred`, or under the first free
+    /// `preferred-2`, `preferred-3`, ... when that name is taken.
+    ///
+    /// OIDC provisioning needs this (SPEC 13): the account name is derived
+    /// from claims the provider chose, so two identities can perfectly well
+    /// arrive wanting the same one, and there is no human in the loop to ask.
+    /// The search shares the insert's transaction, which is `BEGIN
+    /// IMMEDIATE`, so the name cannot be taken between the check and the
+    /// write.
+    pub async fn register_user_with_available_name(
+        &self,
+        preferred: impl Into<String>,
+        email: impl Into<String>,
+        oidc_subject: Option<String>,
+        private_range: Ipv4Prefix,
+    ) -> Result<User> {
+        self.register(
+            preferred.into(),
+            email.into(),
+            oidc_subject,
+            private_range,
+            true,
+        )
+        .await
+    }
+
+    async fn register(
+        &self,
+        name: String,
+        email: String,
+        oidc_subject: Option<String>,
+        private_range: Ipv4Prefix,
+        dedupe_name: bool,
+    ) -> Result<User> {
         let now = self.clock();
         self.with_tx(move |tx| {
+            let name = if dedupe_name {
+                available_name(tx, &name)?
+            } else {
+                name
+            };
             let mut statement = tx.prepare("SELECT subnet FROM users")?;
             let subnet_rows = statement.query_map([], |row| row.get::<_, String>(0))?;
             let mut used = HashSet::new();
@@ -192,6 +239,30 @@ fn scan_user(row: &rusqlite::Row<'_>) -> rusqlite::Result<User> {
     })
 }
 
+/// The number of `name-N` variants tried before giving up. A deployment
+/// with a hundred identities all claiming one name has a naming problem
+/// the store cannot solve.
+const NAME_VARIANTS: u32 = 100;
+
+fn available_name(tx: &rusqlite::Transaction<'_>, preferred: &str) -> Result<String> {
+    let mut taken = tx.prepare("SELECT 1 FROM users WHERE name = ?")?;
+    for suffix in 1..=NAME_VARIANTS {
+        let candidate = if suffix == 1 {
+            preferred.to_owned()
+        } else {
+            format!("{preferred}-{suffix}")
+        };
+        if taken
+            .query_row([&candidate], |_| Ok(()))
+            .optional()?
+            .is_none()
+        {
+            return Ok(candidate);
+        }
+    }
+    Err(Error::NameTaken)
+}
+
 fn next_free_subnet(range: Ipv4Prefix, used: &HashSet<Ipv4Addr>) -> Result<String> {
     if range.bits > 24 {
         return Err(Error::InvalidPrivateRange(format!(
@@ -298,6 +369,27 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(error, Error::SubnetsExhausted));
+    }
+
+    #[tokio::test]
+    async fn register_user_with_available_name_suffixes_a_taken_name() {
+        let store = new_test_store().await;
+        let mut names = Vec::new();
+        for _ in 0..3 {
+            let user = store
+                .register_user_with_available_name("riley", "riley@example.org", None, test_range())
+                .await
+                .unwrap();
+            names.push(user.name);
+        }
+        assert_eq!(names, ["riley", "riley-2", "riley-3"]);
+        // The plain form still refuses to collide rather than renaming.
+        assert!(
+            store
+                .register_user("riley", "riley@example.org", None, test_range())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

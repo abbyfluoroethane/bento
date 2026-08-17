@@ -16,6 +16,7 @@ mod hosts;
 mod images;
 mod instances;
 mod names;
+mod pairings;
 mod shares;
 mod sshkeys;
 mod tokens;

@@ -269,6 +269,28 @@ pub struct ReleasedName {
     pub released_at: OffsetDateTime,
 }
 
+/// A pending request to link one SSH public key to an account (SPEC 13).
+///
+/// The SSH frontend creates one of these when it meets a key it does not
+/// know, and creates nothing else: an unknown key allocates no account,
+/// no subnet, and no network until a browser session confirms it. Only
+/// the hash of the link token is stored, as for [`Token::hash`]; the
+/// token itself exists once, in the URL handed to the user.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Pairing {
+    pub id: i64,
+    pub token_hash: String,
+    pub public_key: String,
+    pub fingerprint: String,
+    pub comment: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    #[serde(with = "time::serde::rfc3339")]
+    pub expires_at: OffsetDateTime,
+    /// Set once the key has been linked. A pairing is single-use.
+    pub linked_user_id: Option<i64>,
+}
+
 /// Programmatic access. Only the hash of the token is stored (SPEC 13).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Token {
