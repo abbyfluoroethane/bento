@@ -12,7 +12,9 @@ use russh::{Channel, ChannelId, ChannelMsg, Disconnect, Pty};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-use crate::server::{GuestClient, Registration, Server};
+use tokio::time::Instant;
+
+use crate::server::{GuestClient, KeyLinker, PairingRequest, PendingLink, Server};
 use crate::{DEFAULT_DIAL_INTERVAL, DEFAULT_START_TIMEOUT};
 
 type SessionInput = Pin<Box<dyn AsyncRead + Send>>;
@@ -131,7 +133,7 @@ impl AsyncWrite for CrlfWriter {
 #[derive(Clone, Debug)]
 pub(crate) enum Authenticated {
     User(User),
-    Registration(Registration),
+    Unlinked(PairingRequest),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -293,7 +295,8 @@ pub(crate) async fn process_channel(
 /// Routes one session. An accessible instance name is forwarded; every other
 /// known-user session runs the CLI. This uniform fallback both accommodates a
 /// stock client's unavoidable local login name and reveals nothing about
-/// which instance names exist. Unknown keys always run registration (SPEC 13).
+/// which instance names exist. An unknown key is always offered a link,
+/// whatever the user name says (SPEC 13).
 async fn dispatch(server: &Server, authenticated: Authenticated, session: Box<dyn TermSession>) {
     let parts = session.into_parts();
     match authenticated {
@@ -324,8 +327,8 @@ async fn dispatch(server: &Server, authenticated: Authenticated, session: Box<dy
                 exit.exit(exit_code(code)).await;
             }
         }
-        Authenticated::Registration(registration) => {
-            register(server, registration, parts).await;
+        Authenticated::Unlinked(request) => {
+            offer_link(server, request, parts).await;
         }
     }
 }
@@ -658,186 +661,137 @@ async fn join_error(
     session.exit.exit(1).await;
 }
 
-/// Runs the SPEC 13 flow for an unknown key: record the key, then ask for a
-/// name and email address. The Registrar allocates the subnet and network.
-async fn register(server: &Server, mut registration: Registration, mut session: SessionParts) {
-    let echo = session.pty.is_some();
-    let _ = session
-        .stdout
-        .write_all(
-            format!(
-                "bento: this key is not registered ({})\r\n",
-                registration.fingerprint
-            )
-            .as_bytes(),
-        )
-        .await;
-    let _ = session
-        .stdout
-        .write_all(b"bento: answer two questions to create an account\r\n")
-        .await;
+/// How often the waiting session asks whether the link has been used.
+const LINK_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
-    let name = match prompt_valid(
-        &mut session.stdin,
-        &mut session.stdout,
-        "account name: ",
-        echo,
-        validate_account_name,
-    )
-    .await
-    {
-        Ok(name) => name,
-        Err(_) => {
-            session.exit.exit(1).await;
-            return;
-        }
-    };
-    let email = match prompt_valid(
-        &mut session.stdin,
-        &mut session.stdout,
-        "email: ",
-        echo,
-        validate_email,
-    )
-    .await
-    {
-        Ok(email) => email,
-        Err(_) => {
-            session.exit.exit(1).await;
-            return;
-        }
-    };
-
-    registration.name = name;
-    registration.email = email;
-    let Some(registrar) = &server.registrar else {
+/// Runs the SPEC 13 flow for an unknown key: mint a link, print it, and
+/// wait for a browser to confirm the fingerprint.
+///
+/// Nothing is created for this key until that confirmation. The session
+/// waits rather than hanging up because the alternative is a user who has
+/// clicked the link and has no idea whether it worked; the fingerprint is
+/// printed for them to compare against the one on the page.
+async fn offer_link(server: &Server, request: PairingRequest, mut session: SessionParts) {
+    let Some(linker) = &server.linker else {
         session.exit.exit(1).await;
         return;
     };
-    match registrar.register(registration).await {
-        Ok(user) => {
+    let fingerprint = request.fingerprint.clone();
+    let link = match linker.begin(request).await {
+        Ok(link) => link,
+        Err(error) => {
+            let _ = session
+                .stderr
+                .write_all(format!("bento: could not start a link: {error}\r\n").as_bytes())
+                .await;
+            session.exit.exit(1).await;
+            return;
+        }
+    };
+
+    let announcement = format!(
+        "bento: this key is not linked to an account\r\n\
+         bento:   {fingerprint}\r\n\
+         bento: open this within {}, sign in, and confirm that fingerprint:\r\n\
+         bento:   {}\r\n\
+         bento: waiting...\r\n",
+        display_duration(link.valid_for),
+        link.url,
+    );
+    if session
+        .stdout
+        .write_all(announcement.as_bytes())
+        .await
+        .is_err()
+    {
+        session.exit.exit(1).await;
+        return;
+    }
+
+    match wait_for_link(linker.as_ref(), &link, &mut session.stdin).await {
+        LinkOutcome::Linked(user) => {
             let _ = session
                 .stdout
                 .write_all(
                     format!(
-                        "bento: registered {}, subnet {}\r\n",
+                        "bento: linked to {}, subnet {}\r\n\
+                         bento: reconnect for the command line; run \"help\" for the \
+                         command list\r\n",
                         user.name, user.subnet
                     )
                     .as_bytes(),
                 )
                 .await;
-            let _ = session
-                .stdout
-                .write_all(
-                    b"bento: reconnect for the command line; run \"help\" for the command list\r\n",
-                )
-                .await;
             session.exit.exit(0).await;
         }
-        Err(error) => {
+        LinkOutcome::Expired => {
+            let _ = session
+                .stdout
+                .write_all(b"bento: the link expired; connect again for a new one\r\n")
+                .await;
+            session.exit.exit(1).await;
+        }
+        LinkOutcome::Cancelled => {
+            session.exit.exit(1).await;
+        }
+        LinkOutcome::Failed(error) => {
             let _ = session
                 .stderr
-                .write_all(format!("bento: registration failed: {error}\r\n").as_bytes())
+                .write_all(format!("bento: waiting for the link failed: {error}\r\n").as_bytes())
                 .await;
             session.exit.exit(1).await;
         }
     }
 }
 
-const REGISTRATION_ATTEMPTS: usize = 5;
+enum LinkOutcome {
+    Linked(Box<User>),
+    Expired,
+    Cancelled,
+    Failed(String),
+}
 
-async fn prompt_valid(
-    input: &mut SessionInput,
-    output: &mut SessionOutput,
-    prompt: &str,
-    echo: bool,
-    validate: fn(&str) -> Result<(), &'static str>,
-) -> io::Result<String> {
-    for _ in 0..REGISTRATION_ATTEMPTS {
-        output.write_all(prompt.as_bytes()).await?;
-        let line = read_line(input, output, echo).await?;
-        let line = line.trim().to_owned();
-        if let Err(message) = validate(&line) {
-            output
-                .write_all(format!("bento: {message}\r\n").as_bytes())
-                .await?;
+/// Polls until the link is confirmed, runs out of time, or the user gives
+/// up. Under a PTY the client's terminal is in raw mode, so control-C
+/// arrives as a byte on stdin rather than a signal; reading it is what
+/// keeps the session from ignoring an interrupt for the whole window.
+async fn wait_for_link(
+    linker: &dyn KeyLinker,
+    link: &PendingLink,
+    stdin: &mut SessionInput,
+) -> LinkOutcome {
+    let deadline = Instant::now() + link.valid_for;
+    let mut byte = [0_u8; 1];
+    // A session with no keyboard behind it -- `ssh host < /dev/null`, or any
+    // client that half-closes -- reads end-of-file at once. That is not the
+    // user giving up, and reading a closed stream in a loop would spin, so
+    // the watch is simply dropped and the wait runs on the timer alone.
+    let mut watch_stdin = true;
+    loop {
+        match linker.linked_user(link.id).await {
+            Ok(Some(user)) => return LinkOutcome::Linked(Box::new(user)),
+            Ok(None) => {}
+            Err(error) => return LinkOutcome::Failed(error.to_string()),
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return LinkOutcome::Expired;
+        }
+        let pause = LINK_POLL_INTERVAL.min(deadline - now);
+        if !watch_stdin {
+            tokio::time::sleep(pause).await;
             continue;
         }
-        return Ok(line);
-    }
-    Err(io::Error::new(
-        io::ErrorKind::InvalidInput,
-        "too many attempts",
-    ))
-}
-
-fn validate_account_name(value: &str) -> Result<(), &'static str> {
-    let valid = (1..=32).contains(&value.len())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        && value
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_alphanumeric)
-        && value
-            .as_bytes()
-            .last()
-            .is_some_and(u8::is_ascii_alphanumeric);
-    if valid {
-        Ok(())
-    } else {
-        Err("an account name uses lowercase letters, digits, and inner hyphens")
-    }
-}
-
-fn validate_email(value: &str) -> Result<(), &'static str> {
-    if value
-        .split_once('@')
-        .is_some_and(|(local, domain)| !local.is_empty() && !domain.is_empty())
-    {
-        Ok(())
-    } else {
-        Err("that does not look like an email address")
-    }
-}
-
-/// Reads one line byte by byte, handling PTY echo, backspace, and cancellation
-/// with control-C or control-D.
-async fn read_line(
-    input: &mut SessionInput,
-    output: &mut SessionOutput,
-    echo: bool,
-) -> io::Result<String> {
-    let mut buffer = Vec::new();
-    let mut byte = [0_u8; 1];
-    loop {
-        match input.read(&mut byte).await {
-            Ok(0) if !buffer.is_empty() => return Ok(String::from_utf8_lossy(&buffer).into_owned()),
-            Ok(0) => return Err(io::Error::from(io::ErrorKind::UnexpectedEof)),
-            Ok(_) => match byte[0] {
-                b'\r' | b'\n' => {
-                    if echo {
-                        output.write_all(b"\r\n").await?;
-                    }
-                    return Ok(String::from_utf8_lossy(&buffer).into_owned());
-                }
-                0x7f | 0x08 => {
-                    if buffer.pop().is_some() && echo {
-                        output.write_all(b"\x08 \x08").await?;
-                    }
-                }
-                0x03 | 0x04 => {
-                    return Err(io::Error::new(io::ErrorKind::Interrupted, "cancelled"));
-                }
-                value => {
-                    buffer.push(value);
-                    if echo {
-                        output.write_all(&byte).await?;
-                    }
-                }
+        tokio::select! {
+            () = tokio::time::sleep(pause) => {}
+            // `AsyncReadExt::read` is cancel-safe, so losing this branch to
+            // the timer drops nothing.
+            read = stdin.read(&mut byte) => match read {
+                Ok(0) | Err(_) => watch_stdin = false,
+                Ok(_) if matches!(byte[0], 0x03 | 0x04) => return LinkOutcome::Cancelled,
+                // Anything else is a stray keystroke, not an answer.
+                Ok(_) => {}
             },
-            Err(error) => return Err(error),
         }
     }
 }
@@ -923,11 +877,11 @@ mod tests {
 
     use super::{
         Authenticated, PtyRequest, SessionExit, SessionParts, TermSession, Window, dispatch,
-        read_line, wait_ssh,
+        wait_ssh,
     };
     use crate::server::{
-        BoxError, BoxedIo, CLIRunner, Dialer, InstanceStore, KeyStore, Registrar, Registration,
-        Server, Starter,
+        BoxError, BoxedIo, CLIRunner, Dialer, InstanceStore, KeyLinker, KeyStore, PairingRequest,
+        PendingLink, Server, Starter,
     };
 
     #[derive(Default)]
@@ -1019,20 +973,55 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct FakeRegistrar {
-        got: Mutex<Option<Registration>>,
+    struct FakeLinker {
+        got: Mutex<Option<PairingRequest>>,
+        /// Set to make `linked_user` report a confirmation.
         user: Mutex<Option<User>>,
-        error: Mutex<Option<String>>,
+        /// Polls to answer `None` before `user` is reported.
+        pending_polls: Mutex<usize>,
+        polls: AtomicUsize,
+        valid_for: Mutex<Duration>,
+        begin_error: Mutex<Option<String>>,
+        poll_error: Mutex<Option<String>>,
+    }
+
+    impl FakeLinker {
+        fn new() -> Arc<Self> {
+            let linker = Arc::new(Self::default());
+            *linker.valid_for.lock().unwrap() = Duration::from_secs(180);
+            linker
+        }
+
+        fn confirms_after(self: &Arc<Self>, polls: usize, user: User) {
+            *self.pending_polls.lock().unwrap() = polls;
+            *self.user.lock().unwrap() = Some(user);
+        }
     }
 
     #[async_trait]
-    impl Registrar for FakeRegistrar {
-        async fn register(&self, registration: Registration) -> Result<User, BoxError> {
-            if let Some(error) = self.error.lock().unwrap().clone() {
+    impl KeyLinker for FakeLinker {
+        async fn begin(&self, request: PairingRequest) -> Result<PendingLink, BoxError> {
+            if let Some(error) = self.begin_error.lock().unwrap().clone() {
                 return Err(error.into());
             }
-            *self.got.lock().unwrap() = Some(registration);
-            Ok(self.user.lock().unwrap().clone().unwrap())
+            *self.got.lock().unwrap() = Some(request);
+            Ok(PendingLink {
+                id: 7,
+                url: "https://bento.example.org/link/tok".to_owned(),
+                valid_for: *self.valid_for.lock().unwrap(),
+            })
+        }
+
+        async fn linked_user(&self, id: i64) -> Result<Option<User>, BoxError> {
+            assert_eq!(id, 7);
+            if let Some(error) = self.poll_error.lock().unwrap().clone() {
+                return Err(error.into());
+            }
+            let seen = self.polls.fetch_add(1, Ordering::SeqCst);
+            if seen < *self.pending_polls.lock().unwrap() {
+                return Ok(None);
+            }
+            Ok(self.user.lock().unwrap().clone())
         }
     }
 
@@ -1372,112 +1361,126 @@ mod tests {
         assert_eq!(dialer.attempts.load(Ordering::SeqCst), 5);
     }
 
-    #[tokio::test]
-    async fn registration_records_answers_and_preserves_the_key() {
-        let registrar = Arc::new(FakeRegistrar::default());
-        *registrar.user.lock().unwrap() = Some(User {
+    fn linked_user_row() -> User {
+        User {
             id: 9,
             subnet: "10.100.7.0/24".to_owned(),
             ..user("carol")
-        });
+        }
+    }
+
+    fn server_with_linker(linker: Arc<FakeLinker>) -> Server {
         let mut server = test_server(
             Arc::new(FakeInstances::default()),
             Arc::new(FakeStarter::default()),
             Arc::new(FakeCli::default()),
         );
-        server.registrar = Some(registrar.clone());
-        let fake = fake_session("", "carol\ncarol@example.com\n", false).await;
+        server.linker = Some(linker);
+        server
+    }
+
+    #[tokio::test]
+    async fn an_unknown_key_is_offered_a_link_and_told_when_it_is_used() {
+        let linker = FakeLinker::new();
+        linker.confirms_after(2, linked_user_row());
+        let server = server_with_linker(linker.clone());
+        let fake = fake_session("", "", false).await;
+
+        tokio::time::pause();
         dispatch(
             &server,
-            Authenticated::Registration(Registration {
+            Authenticated::Unlinked(PairingRequest {
                 public_key: "ssh-ed25519 AAAA carol@laptop".to_owned(),
                 fingerprint: "SHA256:abcdef".to_owned(),
-                ..Registration::default()
+                comment: "carol@laptop".to_owned(),
             }),
             fake.term,
         )
         .await;
-        let got = registrar.got.lock().unwrap().clone().unwrap();
-        assert_eq!(got.name, "carol");
-        assert_eq!(got.email, "carol@example.com");
+
+        // The key reached the linker untouched; nothing else was created.
+        let got = linker.got.lock().unwrap().clone().unwrap();
         assert_eq!(got.public_key, "ssh-ed25519 AAAA carol@laptop");
         assert_eq!(got.fingerprint, "SHA256:abcdef");
-        assert!(fake.stdout.text().contains("registered carol"));
-        assert!(fake.stdout.text().contains("10.100.7.0/24"));
+        assert_eq!(got.comment, "carol@laptop");
+
+        let output = fake.stdout.text();
+        // The fingerprint is printed so it can be compared with the page.
+        assert!(output.contains("SHA256:abcdef"), "{output}");
+        assert!(
+            output.contains("https://bento.example.org/link/tok"),
+            "{output}"
+        );
+        assert!(output.contains("3m0s"), "{output}");
+        assert!(output.contains("linked to carol"), "{output}");
+        assert!(output.contains("10.100.7.0/24"), "{output}");
+        // Every line is CRLF-terminated: this path runs before any PTY-only
+        // translation and a raw-mode client would otherwise staircase.
+        assert!(!output.replace("\r\n", "").contains('\n'), "{output:?}");
         assert_eq!(*fake.exit.0.lock().unwrap(), Some(0));
+        assert!(linker.polls.load(Ordering::SeqCst) >= 3);
     }
 
+    /// Stdin is empty here, so it reads end-of-file on the first poll --
+    /// what `ssh host < /dev/null` does. That must not read as the user
+    /// giving up: the wait runs its whole window on the timer.
     #[tokio::test]
-    async fn registration_retries_invalid_input() {
-        let registrar = Arc::new(FakeRegistrar::default());
-        *registrar.user.lock().unwrap() = Some(User {
-            subnet: "10.100.7.0/24".to_owned(),
-            ..user("carol")
-        });
-        let mut server = test_server(
-            Arc::new(FakeInstances::default()),
-            Arc::new(FakeStarter::default()),
-            Arc::new(FakeCli::default()),
-        );
-        server.registrar = Some(registrar.clone());
-        let fake = fake_session(
-            "",
-            "Carol Smith\ncarol\nnot-an-email\ncarol@example.com\n",
-            false,
-        )
-        .await;
+    async fn a_link_that_is_never_used_expires_rather_than_waiting_forever() {
+        let linker = FakeLinker::new();
+        *linker.valid_for.lock().unwrap() = Duration::from_secs(6);
+        let server = server_with_linker(linker.clone());
+        let fake = fake_session("", "", false).await;
+
+        tokio::time::pause();
         dispatch(
             &server,
-            Authenticated::Registration(Registration::default()),
+            Authenticated::Unlinked(PairingRequest::default()),
             fake.term,
         )
         .await;
-        let got = registrar.got.lock().unwrap().clone().unwrap();
-        assert_eq!(got.name, "carol");
-        assert_eq!(got.email, "carol@example.com");
-        assert!(fake.stdout.text().contains("lowercase"));
-        assert!(fake.stdout.text().contains("email address"));
-    }
 
-    #[tokio::test]
-    async fn registration_failure_is_reported() {
-        let registrar = Arc::new(FakeRegistrar::default());
-        *registrar.error.lock().unwrap() = Some("subnets exhausted".to_owned());
-        let mut server = test_server(
-            Arc::new(FakeInstances::default()),
-            Arc::new(FakeStarter::default()),
-            Arc::new(FakeCli::default()),
+        assert!(
+            fake.stdout.text().contains("expired"),
+            "{}",
+            fake.stdout.text()
         );
-        server.registrar = Some(registrar);
-        let fake = fake_session("", "carol\ncarol@example.com\n", false).await;
-        dispatch(
-            &server,
-            Authenticated::Registration(Registration::default()),
-            fake.term,
-        )
-        .await;
         assert_eq!(*fake.exit.0.lock().unwrap(), Some(1));
-        assert!(fake.stderr.text().contains("registration failed"));
     }
 
     #[tokio::test]
-    async fn read_line_handles_newlines_backspace_eof_and_cancel() {
-        for (input, echo, expected, echoed) in [
-            ("abc\n", false, Some("abc"), ""),
-            ("abc\r", false, Some("abc"), ""),
-            ("abd\x7fc\r", true, Some("abc"), "abd\x08 \x08c\r\n"),
-            ("abc", false, Some("abc"), ""),
-            ("ab\x03", false, None, ""),
-        ] {
-            let fake = fake_session("", input, false).await;
-            let mut parts = fake.term.into_parts();
-            let result = read_line(&mut parts.stdin, &mut parts.stdout, echo).await;
-            match expected {
-                Some(expected) => assert_eq!(result.unwrap(), expected),
-                None => assert!(result.is_err()),
-            }
-            assert_eq!(fake.stdout.text(), echoed);
-        }
+    async fn control_c_gives_up_on_the_wait() {
+        let linker = FakeLinker::new();
+        // Never confirms: only the keystroke can end this session.
+        *linker.pending_polls.lock().unwrap() = usize::MAX;
+        let server = server_with_linker(linker.clone());
+        let fake = fake_session("", "\x03", false).await;
+
+        tokio::time::pause();
+        dispatch(
+            &server,
+            Authenticated::Unlinked(PairingRequest::default()),
+            fake.term,
+        )
+        .await;
+
+        assert!(!fake.stdout.text().contains("expired"));
+        assert_eq!(*fake.exit.0.lock().unwrap(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn a_linker_that_cannot_mint_says_so() {
+        let linker = FakeLinker::new();
+        *linker.begin_error.lock().unwrap() = Some("database is down".to_owned());
+        let server = server_with_linker(linker);
+        let fake = fake_session("", "", false).await;
+        dispatch(
+            &server,
+            Authenticated::Unlinked(PairingRequest::default()),
+            fake.term,
+        )
+        .await;
+        assert!(fake.stderr.text().contains("database is down"));
+        assert_eq!(*fake.exit.0.lock().unwrap(), Some(1));
     }
 
     #[test]

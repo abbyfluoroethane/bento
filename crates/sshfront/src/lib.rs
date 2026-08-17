@@ -1,4 +1,4 @@
-//! Public-key authentication, instance forwarding, registration, and the
+//! Public-key authentication, instance forwarding, key linking, and the
 //! command line session for the SSH frontend (SPEC sections 10, 13, and 15).
 //!
 //! One server on one address answers every connection with one host key. The
@@ -6,14 +6,14 @@
 //! sends a user name -- `ssh bento.foid.space` sends the local login name -- so
 //! the frontend cannot demand an empty one: a known key whose user name is not
 //! an instance the user can reach runs the command line interface, and an
-//! unknown key runs registration whatever the user name says.
+//! unknown key is offered a link to sign in with, whatever the user name says.
 
 mod server;
 mod session;
 
 pub use server::{
-    AsyncReadWrite, BoxError, BoxedIo, CLIRunner, Dialer, InstanceStore, KeyStore, Registrar,
-    Registration, Server, Starter,
+    AsyncReadWrite, BoxError, BoxedIo, CLIRunner, Dialer, InstanceStore, KeyLinker, KeyStore,
+    PairingRequest, PendingLink, Server, Starter,
 };
 
 /// How long the frontend waits for sshd in a freshly started instance

@@ -50,11 +50,13 @@ together with the image and storage directories (SPEC 12.1). The other
 operator commands are `bentod reconcile` (prints libvirt/database
 disagreements, changes nothing) and `bentod images`.
 
-Users register themselves: `ssh bento.example.org` with an unknown key
-starts the registration flow, which allocates their /24 and libvirt
-network (SPEC 13). Grant quota with a `quotas` row, and add dashboard
-access by setting the user's `oidc_subject` to their OIDC subject. Names
-listed in `operators` in the config get the database download.
+Users sign themselves up through OIDC: the first login for an identity
+your provider authenticates creates the account and allocates its /24
+and libvirt network (SPEC 13). To use the command line, they then run
+`ssh bento.example.org` with an unknown key, open the three-minute link
+it prints, and confirm the fingerprint shown. Set `allow_signup = false`
+under `[oidc]` to freeze the user list. Grant quota with a `quotas` row.
+Names listed in `operators` in the config get the database download.
 
 ## Development quickstart
 
@@ -110,10 +112,11 @@ Known gaps and deviations:
   carries the name and is redefined under the new one.
 - The three processes share the SQLite database over WAL from one host.
   SPEC 4 makes the control plane the only writer; in this build the SSH
-  frontend also writes (CLI commands, registration). Single-host WAL
-  with a busy timeout serializes them.
+  frontend also writes (CLI commands, pending key links). Single-host
+  WAL with a busy timeout serializes them.
 - Dashboard sessions live in control-plane memory; a `serve` restart
   logs dashboard users out (API tokens are unaffected). The proxy
   checks sessions by forwarding credentials to the control plane.
-- OIDC accounts link by `oidc_subject`; the SSH registration flow
-  cannot know it, so the operator sets it once per user.
+- OIDC is the only thing that creates an account, so a deployment with
+  no working provider cannot admit anyone — not even over SSH, since
+  the key-linking page needs a session.

@@ -8,6 +8,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use bento_api::Lifecycle as _;
+use bento_auth::Provisioner as _;
 use bento_auth::TokenStore as _;
 use bento_cli::Lifecycle as _;
 use bento_cloudinit::Seed;
@@ -15,14 +16,14 @@ use bento_hypervisor::{Definer, Fake, Hypervisor};
 use bento_lifecycle::{ISOBuilder, ImageStore};
 use bento_network::{Plan, PortRange};
 use bento_proxy::InstanceSource as _;
-use bento_sshfront::Registrar as _;
+use bento_sshfront::KeyLinker as _;
 use bento_store::{Error as StoreError, Store};
 use bento_types::{DesiredState, Image, ImageVersion, State, Visibility};
 use time::OffsetDateTime;
 
 use crate::adapters::{
-    ApiBackend, AuthAccess, AuthTokens, AuthUsers, Backend, CliBackend, LifecycleStore,
-    NetworkEnsurer, ProxySource, Registrar, access_status,
+    ApiBackend, AuthAccess, AuthPairings, AuthTokens, AuthUsers, Backend, CliBackend,
+    LifecycleStore, Linker, NetworkEnsurer, Provisioner, ProxySource, access_status,
 };
 use crate::firewall::Firewall;
 use crate::firewall::tests::RecordingApplier;
@@ -372,30 +373,228 @@ impl NetworkEnsurer for RecordingNetworks {
 }
 
 #[tokio::test]
-async fn registrar_allocates_subnet_key_and_network() {
+async fn provisioning_allocates_a_subnet_and_network_but_no_key() {
     let env = Env::new().await;
     let networks = Arc::new(RecordingNetworks::default());
-    let registrar = Registrar {
+    let provisioner = Provisioner {
         store: env.store.clone(),
         plan: env.plan,
         networks: Some(networks.clone()),
         firewall: None,
     };
-    let user = registrar
-        .register(bento_sshfront::Registration {
-            name: "amber".into(),
+    let user = provisioner
+        .provision(bento_auth::NewAccount {
+            preferred_name: "amber".into(),
             email: "amber@example.org".into(),
+            oidc_subject: "subject-amber".into(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(user.name, "amber");
+    assert_eq!(user.subnet, "10.100.0.0/24");
+    assert_eq!(user.oidc_subject.as_deref(), Some("subject-amber"));
+    // An OIDC account starts with no SSH key; keys arrive through linking.
+    assert!(
+        env.store
+            .ssh_keys_for_user(user.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let ensured = networks.0.lock().unwrap();
+    assert_eq!(ensured[0].0, "bento-user-0");
+    assert!(ensured[0].1.contains("bento0"));
+}
+
+/// The whole of SPEC 13 over one real store: an unknown SSH key gets a
+/// link, the link sends a first-time user through OIDC, that login creates
+/// the account, confirming attaches the key, and the waiting SSH session
+/// sees it. Each half is covered in its own crate; only here do they meet.
+#[tokio::test]
+async fn a_first_time_user_gets_an_account_from_oidc_and_a_key_from_the_link() {
+    let env = Env::new().await;
+    let networks = Arc::new(RecordingNetworks::default());
+    let linker = Linker {
+        store: env.store.clone(),
+        base_domain: "bento.example.org".into(),
+    };
+    let exchanger = Arc::new(FakeExchanger::default());
+    let verifier = Arc::new(FakeVerifier::default());
+    let service = bento_auth::Service::new(
+        "bento.example.org",
+        Arc::new(AuthUsers(env.store.clone())),
+        Arc::new(AuthAccess(env.store.clone())),
+        Arc::new(AuthTokens(env.store.clone())),
+    )
+    .with_pairings(Arc::new(AuthPairings(env.store.clone())))
+    .with_provisioner(Arc::new(Provisioner {
+        store: env.store.clone(),
+        plan: env.plan,
+        networks: Some(networks.clone()),
+        firewall: None,
+    }))
+    .with_oidc(exchanger.clone(), verifier.clone());
+
+    // 1. The frontend meets an unknown key and mints a link. No account
+    //    exists yet, and none is created by this.
+    let link = linker
+        .begin(bento_sshfront::PairingRequest {
             public_key: OWNER_KEY.into(),
             fingerprint: "SHA256:fp".into(),
             comment: "owner@laptop".into(),
         })
         .await
         .unwrap();
+    assert!(env.store.users().await.unwrap().is_empty());
+    assert!(linker.linked_user(link.id).await.unwrap().is_none());
+
+    let token = link
+        .url
+        .strip_prefix("https://bento.example.org/link/")
+        .expect("the url is the base domain plus the link path");
+    let next = format!("/link/{token}");
+
+    // 2. Opening the link signed out sends the browser to login.
+    let page = service
+        .link_page_response(&http::HeaderMap::new(), token)
+        .await;
+    assert_eq!(page.status(), 302);
+    assert_eq!(
+        page.headers()[http::header::LOCATION],
+        format!("/login?next={next}").as_str()
+    );
+
+    // 3. Login through the provider creates the account (SPEC 13).
+    let login = service.login_response(&format!("/login?next={next}").parse().unwrap());
+    let (state, nonce) = exchanger.seen();
+    verifier.allow(bento_auth::Claims {
+        subject: "subject-amber".into(),
+        email: "amber@example.org".into(),
+        preferred_username: "Amber".into(),
+        nonce,
+        ..Default::default()
+    });
+    let callback = service
+        .callback_response(
+            &cookie_header(&set_cookies(&login)),
+            &format!("/callback?code=good-code&state={state}")
+                .parse()
+                .unwrap(),
+        )
+        .await;
+    assert_eq!(callback.status(), 302, "{}", callback.body());
+    assert_eq!(callback.headers()[http::header::LOCATION], next.as_str());
+    let user = env.store.user_by_name("amber").await.unwrap();
     assert_eq!(user.subnet, "10.100.0.0/24");
+    assert_eq!(networks.0.lock().unwrap()[0].0, "bento-user-0");
+
+    // 4. Back on the link, now signed in, the page names the account and
+    //    the fingerprint, and links nothing by itself.
+    let session = cookie_header(&set_cookies(&callback));
+    let page = service.link_page_response(&session, token).await;
+    assert_eq!(page.status(), 200);
+    assert!(page.body().contains("SHA256:fp"), "{}", page.body());
+    assert!(page.body().contains("amber"));
+    assert!(
+        env.store
+            .ssh_keys_for_user(user.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // 5. Confirming attaches the key, and the waiting SSH session sees it.
+    let confirm = service.link_confirm_response(&session, token).await;
+    assert_eq!(confirm.status(), 200, "{}", confirm.body());
+    assert_eq!(
+        linker
+            .linked_user(link.id)
+            .await
+            .unwrap()
+            .map(|user| user.name),
+        Some("amber".to_owned())
+    );
+    let key = env.store.ssh_key_by_fingerprint("SHA256:fp").await.unwrap();
+    assert_eq!(key.user_id, user.id);
+    assert_eq!(key.public_key, OWNER_KEY);
+    assert_eq!(key.comment, "owner@laptop");
+
+    // 6. The link is spent.
+    assert_eq!(
+        service
+            .link_confirm_response(&session, token)
+            .await
+            .status(),
+        410
+    );
     assert_eq!(env.store.ssh_keys_for_user(user.id).await.unwrap().len(), 1);
-    let ensured = networks.0.lock().unwrap();
-    assert_eq!(ensured[0].0, "bento-user-0");
-    assert!(ensured[0].1.contains("bento0"));
+}
+
+/// Records the state and nonce the service generated, so the test can play
+/// the provider's part without one.
+#[derive(Default)]
+struct FakeExchanger(Mutex<(String, String)>);
+
+impl FakeExchanger {
+    fn seen(&self) -> (String, String) {
+        self.0.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl bento_auth::Exchanger for FakeExchanger {
+    fn auth_code_url(&self, state: &str, nonce: &str) -> String {
+        *self.0.lock().unwrap() = (state.into(), nonce.into());
+        format!("https://id.example.org/authorize?state={state}")
+    }
+
+    async fn exchange(&self, code: &str) -> Result<String, bento_auth::BoxError> {
+        if code == "good-code" {
+            Ok("raw-token".into())
+        } else {
+            Err("unknown code".into())
+        }
+    }
+}
+
+#[derive(Default)]
+struct FakeVerifier(Mutex<Option<bento_auth::Claims>>);
+
+impl FakeVerifier {
+    fn allow(&self, claims: bento_auth::Claims) {
+        *self.0.lock().unwrap() = Some(claims);
+    }
+}
+
+#[async_trait]
+impl bento_auth::Verifier for FakeVerifier {
+    async fn verify(&self, _raw: &str) -> Result<bento_auth::Claims, bento_auth::BoxError> {
+        self.0
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "no claims allowed".into())
+    }
+}
+
+fn set_cookies(response: &http::Response<String>) -> Vec<String> {
+    response
+        .headers()
+        .get_all(http::header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .filter_map(|value| value.split(';').next())
+        .map(str::to_owned)
+        .collect()
+}
+
+fn cookie_header(cookies: &[String]) -> http::HeaderMap {
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::COOKIE,
+        http::HeaderValue::from_str(&cookies.join("; ")).unwrap(),
+    );
+    headers
 }
 
 #[tokio::test]

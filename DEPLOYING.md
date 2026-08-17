@@ -251,17 +251,15 @@ was ever needed. Rust does not do this, so the limit has to be set.
 systemctl enable --now bentod-serve bentod-proxy bentod-sshd
 ```
 
-> **The SSH frontend is how users register.** An unknown key connecting
-> to `bentod sshd` starts the registration flow (SPEC 13), so running it
-> on a public address means anyone can create an account. Leave the unit
-> stopped until you have decided that is what you want.
+> **The SSH frontend creates nothing.** An unknown key connecting to
+> `bentod sshd` gets a three-minute link to sign in with and nothing
+> else — no user row, no /24, no libvirt network (SPEC 13). It is
+> designed to answer the public internet.
 >
-> There is **no configuration switch for this**. `bentod sshd` always
-> installs the registrar, so the choice is the unit being run or not, or
-> a private `listen.ssh` such as `127.0.0.1:22` that keeps the frontend
-> reachable only through an SSH tunnel. The frontend library takes an
-> optional registrar and rejects unknown keys without one, so the switch
-> is a small change if it is wanted.
+> Who gets an account is decided by your OIDC provider, because a
+> verified login for an identity Bento has not seen creates the account.
+> Set `allow_signup = false` under `[oidc]` to refuse those logins and
+> freeze the user list at whoever already exists.
 
 Verify:
 
@@ -272,14 +270,15 @@ curl -sI https://bento.example.org/    # dashboard
 
 ## 7. Users, quota, and the dashboard
 
-A user registers by connecting to the SSH frontend with an unregistered
-key and answering two prompts. Registration allocates their /24 and
-libvirt network.
+A user signs in to the dashboard through OIDC; the first such login
+creates the account and allocates its /24 and libvirt network. To use
+the command line, they then run `ssh bento.example.org`, open the link
+it prints, and confirm the fingerprint. The same flow adds a second key
+later — a laptop, a phone — from an already signed-in browser.
 
-**A user with no `quotas` row is unlimited.** `checkQuotaTx` returns
-early when the row is missing, so a freshly registered user has no
-ceiling until an operator adds one. Add the row as soon as the account
-exists.
+**A user with no `quotas` row is unlimited.** The quota check returns
+early when the row is missing, so a new user has no ceiling until an
+operator adds one. Add the row as soon as the account exists.
 
 There is no operator command for this yet — no `bentod quota`, no
 `SetQuota` caller — so it is a direct database write:
@@ -291,31 +290,31 @@ VALUES (1, 4, 8, 8192, 100);
 
 ### OIDC
 
-The dashboard authenticates through OIDC; SSH and API tokens do not need
-it. With Pocket ID:
+OIDC is how accounts are created, so `bentod serve` needs it configured
+before anyone can sign in — including over SSH, since the key-linking
+page requires a session. API tokens, once minted, do not need it. With
+Pocket ID:
 
 1. Create an OIDC client with the callback URL
    **`https://bento.example.org/callback`**, exactly.
 2. Put the client ID and secret in `[oidc]` and restart `bentod serve`.
-3. Link the account: set `oidc_subject` on the user's row to the
-   subject the provider issues.
+3. Sign in. That is the whole of it — the first login for an identity
+   creates the account, records its subject, and allocates its /24.
 
-Step 3 is the awkward one. `oidc_subject` is only writable at user
-creation, so it is another direct database write, and the callback
-deliberately does not echo the subject back to the browser. The easiest
-way to learn it is to attempt a login and read the log:
-
-```
-WARN login rejected: no users row carries this OIDC subject subject=<...> email=<...>
-```
+The account name comes from the provider's `preferred_username`, then
+the email's local part, then the display name, reduced to lowercase
+letters, digits, and inner hyphens; a name already taken is suffixed
+`-2`. Rename with a direct database write if you dislike the result —
+but do it before instances exist, because nothing renames the user's
+libvirt network with them.
 
 With Pocket ID the subject is the user's UUID, and it is stable across
 clients as long as `subject_types_supported` is `["public"]`.
 
 If a login fails, the log names the branch — missing state cookie, state
 mismatch, code exchange failed, ID token invalid, nonce mismatch, or
-unmatched subject. If **nothing** is logged, the flow never reached
-Bento and the problem is at the provider. Check its logs for a redirect
+(with `allow_signup = false`) an unmatched subject. If **nothing** is
+logged, the flow never reached Bento and the problem is at the provider. Check its logs for a redirect
 to its own error page after a successful authentication; with Pocket ID
 the usual cause is a client marked group-restricted with no groups in
 its allowed list, which refuses every user.

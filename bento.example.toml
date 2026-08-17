@@ -88,10 +88,16 @@ cloudflare_token = ""
 #directory = ""
 
 [oidc]
-# OIDC provider for the dashboard (SPEC 13). Pocket ID is suitable.
+# OIDC provider (SPEC 13). Pocket ID is suitable. This is the only thing
+# that creates accounts, so `serve` cannot admit anyone without it --
+# not even over SSH, where linking a key requires a session first.
 issuer = "https://id.example.org"
 client_id = "bento"
 client_secret = ""
+# A verified login for an identity Bento has never seen creates the
+# account, so your provider decides who gets one. Set this to false to
+# refuse those logins and freeze the user list at whoever exists now.
+allow_signup = true
 
 # Operator image allowlist (SPEC 5.1). `bentod fetch-images` downloads,
 # verifies, and stores each entry by checksum. Omit pinned_checksum to

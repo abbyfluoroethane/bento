@@ -18,8 +18,8 @@ use bento_network::{NftApplier, PortRange};
 use tokio_util::sync::CancellationToken;
 
 use crate::adapters::{
-    ApiBackend, ApiStore, AuthAccess, AuthTokens, AuthUsers, Authenticator, Backend,
-    NetworkEnsurer, access_status, operator_predicate, user_network,
+    ApiBackend, ApiStore, AuthAccess, AuthPairings, AuthTokens, AuthUsers, Authenticator, Backend,
+    NetworkEnsurer, Provisioner, access_status, operator_predicate, user_network,
 };
 use crate::firewall::Firewall;
 use crate::keys::{FRONTEND_KEY_FILE, authorized_key_line, ensure_key, key_path};
@@ -72,6 +72,7 @@ async fn serve_inner(app: &App) -> Result<()> {
     let router = control_plane_router(
         app,
         manager.clone(),
+        hypervisor.clone(),
         firewall.clone(),
         frontend_public,
         host.id,
@@ -224,6 +225,7 @@ async fn converge(
 async fn control_plane_router(
     app: &App,
     manager: Arc<bento_lifecycle::Manager>,
+    hypervisor: Arc<bento_hypervisor::Client>,
     firewall: Arc<Firewall>,
     frontend_key: String,
     host_id: i64,
@@ -233,7 +235,20 @@ async fn control_plane_router(
         Arc::new(AuthUsers(app.store.clone())),
         Arc::new(AuthAccess(app.store.clone())),
         Arc::new(AuthTokens(app.store.clone())),
-    );
+    )
+    .with_pairings(Arc::new(AuthPairings(app.store.clone())));
+    if app.cfg.oidc.allow_signup {
+        // Wiring the provisioner is what opens signups: without it a login
+        // for an unknown identity is refused (SPEC 13).
+        auth = auth.with_provisioner(Arc::new(Provisioner {
+            store: app.store.clone(),
+            plan: app.plan,
+            networks: Some(hypervisor.clone()),
+            firewall: Some(firewall.clone()),
+        }));
+    } else {
+        tracing::warn!("signups are off; only existing accounts can log in");
+    }
     if !app.cfg.oidc.issuer.is_empty() {
         let redirect = format!("https://{}/callback", app.cfg.base_domain);
         match bento_auth::ProviderClient::discover(
@@ -279,6 +294,9 @@ async fn control_plane_router(
     let access_auth = auth.clone();
     let login_auth = auth.clone();
     let callback_auth = auth.clone();
+    let link_page_auth = auth.clone();
+    let link_confirm_auth = auth.clone();
+    let dashboard_auth = auth.clone();
     let logout_auth = auth;
     Ok(Router::new()
         .merge(api)
@@ -305,6 +323,24 @@ async fn control_plane_router(
                 async move { auth_response(auth.callback_response(&headers, &uri).await) }
             }),
         )
+        // The SSH frontend's link. GET renders the fingerprint and a form;
+        // only the POST attaches the key, so nothing that merely follows a
+        // link can link one (SPEC 13).
+        .route(
+            "/link/{token}",
+            get(
+                move |AxumPath(token): AxumPath<String>, headers: HeaderMap| {
+                    let auth = link_page_auth.clone();
+                    async move { auth_response(auth.link_page_response(&headers, &token).await) }
+                },
+            )
+            .post(
+                move |AxumPath(token): AxumPath<String>, headers: HeaderMap| {
+                    let auth = link_confirm_auth.clone();
+                    async move { auth_response(auth.link_confirm_response(&headers, &token).await) }
+                },
+            ),
+        )
         .route(
             "/logout",
             post(move |headers: HeaderMap| {
@@ -312,7 +348,24 @@ async fn control_plane_router(
                 async move { auth_response(auth.logout_response(&headers).await) }
             }),
         )
-        .merge(bento_dashboard::router()))
+        // The dashboard bundle assumes a session and has no sign-in of its
+        // own, so a signed-out visitor is answered by the gate instead
+        // (SPEC 13, 14). `layer` covers this router's fallback, which is
+        // every path that resolves to `index.html`.
+        .merge(bento_dashboard::router().layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let auth = dashboard_auth.clone();
+                async move {
+                    if bento_auth::is_dashboard_asset(request.uri().path()) {
+                        return next.run(request).await;
+                    }
+                    match auth.dashboard_gate(request.headers()).await {
+                        Some(response) => auth_response(response),
+                        None => next.run(request).await,
+                    }
+                }
+            },
+        ))))
 }
 
 fn auth_response(response: http::Response<String>) -> Response<Body> {

@@ -93,11 +93,9 @@ pub trait CLIRunner: Send + Sync {
     ) -> i32;
 }
 
-/// A new-user request from the SPEC 13 flow.
+/// An unknown public key, offered for linking to an account (SPEC 13).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Registration {
-    pub name: String,
-    pub email: String,
+pub struct PairingRequest {
     /// One authorized_keys line, with no trailing newline.
     pub public_key: String,
     /// SHA256 fingerprint of `public_key`.
@@ -105,11 +103,31 @@ pub struct Registration {
     pub comment: String,
 }
 
-/// Creates an account: user row, key row, subnet, and the libvirt network of
-/// the user (SPEC 13).
+/// A link that has been minted and not yet used.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingLink {
+    /// Handle for polling. The frontend never holds the link token
+    /// itself, only the URL it printed.
+    pub id: i64,
+    pub url: String,
+    /// How long the link stays usable from now.
+    pub valid_for: Duration,
+}
+
+/// Mints and watches the short-lived links that attach an unknown key to
+/// an account (SPEC 13).
+///
+/// An unknown key creates one of these links and nothing else: no user
+/// row, no subnet, no network. That is what lets the frontend answer the
+/// public internet — whoever connects gets an offer to sign in, not an
+/// account.
 #[async_trait]
-pub trait Registrar: Send + Sync {
-    async fn register(&self, registration: Registration) -> Result<User, BoxError>;
+pub trait KeyLinker: Send + Sync {
+    /// Records the key and returns the link to hand to the user.
+    async fn begin(&self, request: PairingRequest) -> Result<PendingLink, BoxError>;
+
+    /// The user who confirmed the link, or `None` while it is pending.
+    async fn linked_user(&self, id: i64) -> Result<Option<User>, BoxError>;
 }
 
 /// Dials the internal address of an instance. Tests inject a fake; production
@@ -141,8 +159,8 @@ pub struct Server {
     pub instances: Arc<dyn InstanceStore>,
     pub starter: Arc<dyn Starter>,
     pub cli: Arc<dyn CLIRunner>,
-    /// `None` disables registration and rejects unknown keys.
-    pub registrar: Option<Arc<dyn Registrar>>,
+    /// `None` rejects unknown keys outright, with no link offered.
+    pub linker: Option<Arc<dyn KeyLinker>>,
 
     /// The one host key every frontend connection sees (SPEC 10).
     pub host_key: Arc<PrivateKey>,
@@ -170,7 +188,7 @@ impl Server {
             instances,
             starter,
             cli,
-            registrar: None,
+            linker: None,
             host_key,
             guest_key,
             guest_user: DEFAULT_GUEST_USER.to_owned(),
@@ -217,19 +235,24 @@ impl Server {
                 .await
                 .ok()
                 .map(Authenticated::User),
-            Err(StoreError::NotFound) if self.registrar.is_some() => {
+            Err(StoreError::NotFound) if self.linker.is_some() => {
+                // A serialized public key is an authorized_keys line. It must
+                // be stored without its trailing newline because the
+                // cloud-init seed rejects a control character (SPEC 4.2).
                 let public_key = public_key.to_openssh().ok()?.trim().to_owned();
-                Some(Authenticated::Registration(Registration {
-                    // A serialized public key is an authorized_keys line. It
-                    // must be stored without its trailing newline because the
-                    // cloud-init seed rejects a control character (SPEC 4.2).
+                let comment = public_key
+                    .split_whitespace()
+                    .nth(2)
+                    .unwrap_or_default()
+                    .to_owned();
+                Some(Authenticated::Unlinked(PairingRequest {
                     public_key,
                     fingerprint,
-                    ..Registration::default()
+                    comment,
                 }))
             }
             // A data-layer failure is not an unknown key. Reject; never fall
-            // through to registration.
+            // through to the linking flow.
             Err(_) => None,
         }
     }
@@ -388,8 +411,8 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
     use super::{
-        BoxError, BoxedIo, CLIRunner, Dialer, InstanceStore, KeyStore, Registrar, Registration,
-        Server, Starter,
+        BoxError, BoxedIo, CLIRunner, Dialer, InstanceStore, KeyLinker, KeyStore, PairingRequest,
+        PendingLink, Server, Starter,
     };
 
     struct FakeKeys {
@@ -488,11 +511,15 @@ mod tests {
         }
     }
 
-    struct FakeRegistrar;
+    struct FakeLinker;
 
     #[async_trait]
-    impl Registrar for FakeRegistrar {
-        async fn register(&self, _registration: Registration) -> Result<User, BoxError> {
+    impl KeyLinker for FakeLinker {
+        async fn begin(&self, _request: PairingRequest) -> Result<PendingLink, BoxError> {
+            unreachable!()
+        }
+
+        async fn linked_user(&self, _id: i64) -> Result<Option<User>, BoxError> {
             unreachable!()
         }
     }
@@ -618,22 +645,22 @@ mod tests {
             );
         }
 
-        server.registrar = Some(Arc::new(FakeRegistrar));
+        server.linker = Some(Arc::new(FakeLinker));
         for username in ["web", ""] {
             let auth = server.authenticate_key(unknown.public_key()).await;
-            let Some(super::Authenticated::Registration(registration)) = auth else {
-                panic!("unknown key did not enter registration as {username:?}");
+            let Some(super::Authenticated::Unlinked(request)) = auth else {
+                panic!("unknown key was not offered a link as {username:?}");
             };
             assert_eq!(
-                registration.fingerprint,
+                request.fingerprint,
                 unknown
                     .public_key()
                     .fingerprint(HashAlg::Sha256)
                     .to_string()
             );
-            assert!(!registration.public_key.is_empty());
-            assert_eq!(registration.public_key, registration.public_key.trim());
-            assert!(!registration.public_key.contains(['\r', '\n']));
+            assert!(!request.public_key.is_empty());
+            assert_eq!(request.public_key, request.public_key.trim());
+            assert!(!request.public_key.contains(['\r', '\n']));
         }
 
         *keys.fail.lock().unwrap() = true;

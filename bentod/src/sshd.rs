@@ -1,5 +1,5 @@
 //! The SSH frontend (SPEC 4, 10, 15): public-key authentication, instance
-//! forwarding, registration, and the command-line interface.
+//! forwarding, key linking, and the command-line interface.
 
 use std::ffi::OsString;
 use std::path::Path;
@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use bento_network::{NftApplier, PortRange};
 
-use crate::adapters::{Backend, CliBackend, CliRunner, Registrar, Starter};
+use crate::adapters::{Backend, CliBackend, CliRunner, Linker, Starter};
 use crate::firewall::Firewall;
 use crate::keys::{FRONTEND_KEY_FILE, HOST_KEY_FILE, authorized_key_line, ensure_key, key_path};
 use crate::setup::{App, default_image, shutdown_signal};
@@ -75,11 +75,11 @@ async fn sshd_inner(app: &App) -> Result<()> {
         host_key,
         frontend_key,
     );
-    server.registrar = Some(Arc::new(Registrar {
+    // An unknown key gets a link to sign in with, not an account: nothing
+    // here writes a users row, a subnet, or a network (SPEC 13).
+    server.linker = Some(Arc::new(Linker {
         store: app.store.clone(),
-        plan: app.plan,
-        networks: Some(hypervisor.clone()),
-        firewall: Some(firewall.clone()),
+        base_domain: app.cfg.base_domain.clone(),
     }));
     server.guest_user = bento_lifecycle::GUEST_USER.to_owned();
 

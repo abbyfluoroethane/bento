@@ -10,6 +10,8 @@ use serde::Deserialize;
 use tokio::sync::RwLock;
 use url::Url;
 
+use bento_types::User;
+
 use crate::session::host_cookie;
 use crate::{
     BoxError, Service, append_cookie, cookie_value, query_value, random_token, redirect_response,
@@ -26,6 +28,35 @@ pub struct Claims {
     pub email: String,
     #[serde(default)]
     pub nonce: String,
+    /// The account name the provider suggests. Pocket ID sends this;
+    /// providers that do not are covered by the fallbacks in
+    /// [`account_name_from`].
+    #[serde(default)]
+    pub preferred_username: String,
+    /// The display name. Only a fallback source for the account name.
+    #[serde(default)]
+    pub name: String,
+}
+
+/// The account to create for an OIDC identity that has no users row yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewAccount {
+    /// An account name that already satisfies the grammar. The store may
+    /// still suffix it, because two identities can want the same one.
+    pub preferred_name: String,
+    pub email: String,
+    pub oidc_subject: String,
+}
+
+/// Creates the Bento account behind an OIDC identity (SPEC 13): the users
+/// row, the subnet, and the libvirt network.
+///
+/// Wiring one makes the identity provider the gate on who has an account.
+/// Leaving it unwired closes signups: a verified login for an unknown
+/// subject is then refused.
+#[async_trait]
+pub trait Provisioner: Send + Sync {
+    async fn provision(&self, account: NewAccount) -> std::result::Result<User, BoxError>;
 }
 
 /// Checks a raw ID token and returns its claims. Tests use a fake and do
@@ -41,6 +72,16 @@ pub trait Verifier: Send + Sync {
 pub trait Exchanger: Send + Sync {
     /// Returns the provider URL to redirect the browser to.
     fn auth_code_url(&self, state: &str, nonce: &str) -> String;
+
+    /// The same URL with `prompt=none`, for the silent single-sign-on
+    /// probe on the landing page. The provider must answer without
+    /// showing anything: either a code, if the visitor already has a
+    /// session there, or an `error=login_required` redirect.
+    fn auth_code_url_silent(&self, state: &str, nonce: &str) -> String {
+        let url = self.auth_code_url(state, nonce);
+        let separator = if url.contains('?') { '&' } else { '?' };
+        format!("{url}{separator}prompt=none")
+    }
 
     /// Redeems the authorization code and returns the raw ID token from
     /// the token response.
@@ -360,6 +401,52 @@ impl Verifier for ProviderClient {
     }
 }
 
+/// The longest account name a provisioned user gets. The column allows 32;
+/// the slack leaves room for the `-2`, `-3` suffix the store appends when
+/// the name is taken.
+const MAX_DERIVED_NAME: usize = 28;
+
+/// Derives an account name from an identity provider's claims.
+///
+/// Nothing about a claim is guaranteed to be a legal account name — a
+/// display name has spaces and capitals, an email has an `@` — so each
+/// candidate is reduced to the lowercase-digit-hyphen grammar and the
+/// first that survives wins. `user` is the floor, because a nameless
+/// account is worse than a dull one; the store makes it unique.
+fn account_name_from(claims: &Claims) -> String {
+    let email_local = claims.email.split('@').next().unwrap_or_default();
+    [
+        claims.preferred_username.as_str(),
+        email_local,
+        claims.name.as_str(),
+    ]
+    .into_iter()
+    .find_map(|candidate| {
+        let name = sanitize_account_name(candidate);
+        (!name.is_empty()).then_some(name)
+    })
+    .unwrap_or_else(|| "user".to_owned())
+}
+
+fn sanitize_account_name(value: &str) -> String {
+    let mut name = String::with_capacity(value.len().min(MAX_DERIVED_NAME));
+    for character in value.chars() {
+        let lowered = character.to_ascii_lowercase();
+        if lowered.is_ascii_lowercase() || lowered.is_ascii_digit() {
+            name.push(lowered);
+        } else if !name.ends_with('-') && !name.is_empty() {
+            // Runs of punctuation collapse to one hyphen, and a leading
+            // one never starts.
+            name.push('-');
+        }
+        if name.len() >= MAX_DERIVED_NAME {
+            break;
+        }
+    }
+    name.truncate(MAX_DERIVED_NAME);
+    name.trim_end_matches('-').to_owned()
+}
+
 const STATE_COOKIE_NAME: &str = "bento_oauth_state";
 const NONCE_COOKIE_NAME: &str = "bento_oauth_nonce";
 const NEXT_COOKIE_NAME: &str = "bento_login_next";
@@ -372,6 +459,20 @@ fn flow_cookie(name: &str, value: &str) -> HeaderValue {
         FLOW_COOKIE_TTL_SECONDS
     };
     host_cookie(name, value, max_age)
+}
+
+/// Puts the state, nonce, and return path on a redirect to the provider.
+/// The silent probe on the landing page uses this too, so its callback is
+/// checked exactly like a login the visitor asked for.
+pub(crate) fn attach_flow_cookies(
+    response: &mut crate::HttpResponse,
+    state: &str,
+    nonce: &str,
+    next: &str,
+) {
+    append_cookie(response, flow_cookie(STATE_COOKIE_NAME, state));
+    append_cookie(response, flow_cookie(NONCE_COOKIE_NAME, nonce));
+    append_cookie(response, flow_cookie(NEXT_COOKIE_NAME, next));
 }
 
 impl Service {
@@ -390,16 +491,15 @@ impl Service {
         let nonce = random_token();
         let next = self.safe_next(query_value(uri, "next").as_deref().unwrap_or(""));
         let mut response = redirect_response(&oauth.auth_code_url(&state, &nonce));
-        append_cookie(&mut response, flow_cookie(STATE_COOKIE_NAME, &state));
-        append_cookie(&mut response, flow_cookie(NONCE_COOKIE_NAME, &nonce));
-        append_cookie(&mut response, flow_cookie(NEXT_COOKIE_NAME, &next));
+        attach_flow_cookies(&mut response, &state, &nonce, &next);
         response
     }
 
     /// Finishes the OIDC flow: checks state, redeems the code, verifies
     /// the ID token and nonce, maps the subject to a users row, and issues
     /// the base-domain session cookie. A verified login with no matching
-    /// users row gets 403: registration happens over SSH (SPEC 13).
+    /// users row creates the account when a [`Provisioner`] is wired, and
+    /// otherwise gets 403 (SPEC 13).
     pub async fn callback_response(&self, headers: &HeaderMap, uri: &Uri) -> crate::HttpResponse {
         let (Some(oauth), Some(verifier)) = (self.oauth.as_ref(), self.verifier.as_ref()) else {
             return text_response(
@@ -407,7 +507,17 @@ impl Service {
                 "OIDC is not configured\n",
             );
         };
+        let silent = cookie_value(headers, crate::landing::SILENT_COOKIE_NAME)
+            .is_some_and(|value| value == "1");
         if let Some(error) = query_value(uri, "error").filter(|error| !error.is_empty()) {
+            if silent {
+                // The whole point of the probe is that the provider may
+                // say no. `login_required` is the specified answer for a
+                // visitor with no session there, so this is the ordinary
+                // path for a stranger, not a failure worth an error page.
+                tracing::debug!(error = %error, "silent sign-on probe found no session");
+                return self.probe_failed_response();
+            }
             tracing::warn!(error = %error, "login refused by the provider");
             return text_response(
                 StatusCode::FORBIDDEN,
@@ -452,26 +562,58 @@ impl Service {
             );
             return text_response(StatusCode::BAD_REQUEST, "nonce mismatch\n");
         }
-        let user = match self.users.user_by_oidc_subject(&claims.subject).await {
-            Ok(Some(user)) => user,
-            Ok(None) => {
-                // The operator has to copy this subject into the users row
-                // by hand (SPEC 13), and the provider is the only other
-                // place it can be read from, so name it here.
+        let existing = match self.users.user_by_oidc_subject(&claims.subject).await {
+            Ok(user) => user,
+            Err(error) => {
+                tracing::error!(error = %error, "login rejected: user lookup failed");
+                return text_response(StatusCode::INTERNAL_SERVER_ERROR, "user lookup failed\n");
+            }
+        };
+        let user = match (existing, self.provisioner.as_ref()) {
+            (Some(user), _) => user,
+            (None, Some(provisioner)) => {
+                let account = NewAccount {
+                    preferred_name: account_name_from(&claims),
+                    email: claims.email.clone(),
+                    oidc_subject: claims.subject.clone(),
+                };
+                match provisioner.provision(account).await {
+                    Ok(user) => {
+                        tracing::info!(
+                            user = %user.name,
+                            subject = %claims.subject,
+                            subnet = %user.subnet,
+                            "account created from an OIDC login"
+                        );
+                        user
+                    }
+                    Err(error) => {
+                        tracing::error!(
+                            error = %error,
+                            subject = %claims.subject,
+                            "login rejected: account creation failed"
+                        );
+                        return text_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "account creation failed\n",
+                        );
+                    }
+                }
+            }
+            (None, None) => {
+                // Signups are closed. The subject is the value an operator
+                // would put on a users row to let this identity in, and the
+                // provider is the only other place to read it from.
                 tracing::warn!(
                     subject = %claims.subject,
                     email = %claims.email,
                     hint = "set oidc_subject on the user's row to this value",
-                    "login rejected: no users row carries this OIDC subject"
+                    "login rejected: signups are closed and no users row carries this OIDC subject"
                 );
                 return text_response(
                     StatusCode::FORBIDDEN,
-                    "no Bento account for this login; register by connecting with ssh\n",
+                    "no Bento account for this login, and signups are closed\n",
                 );
-            }
-            Err(error) => {
-                tracing::error!(error = %error, "login rejected: user lookup failed");
-                return text_response(StatusCode::INTERNAL_SERVER_ERROR, "user lookup failed\n");
             }
         };
         tracing::info!(user = %user.name, subject = %claims.subject, "dashboard login");
@@ -490,6 +632,10 @@ impl Service {
         append_cookie(&mut response, flow_cookie(STATE_COOKIE_NAME, ""));
         append_cookie(&mut response, flow_cookie(NONCE_COOKIE_NAME, ""));
         append_cookie(&mut response, flow_cookie(NEXT_COOKIE_NAME, ""));
+        // A signed-in visitor never meets the gate, but clearing these
+        // means a later sign-out probes again instead of going straight
+        // to the splash on a stale cookie.
+        self.clear_probe_cookies(&mut response);
         append_cookie(&mut response, self.session_cookie(&session));
         response
     }
@@ -543,7 +689,9 @@ mod tests {
 
     use super::*;
     use crate::SESSION_COOKIE_NAME;
-    use crate::test_support::{FakeClock, TEST_EPOCH, TestOidc, new_oidc_service};
+    use crate::test_support::{
+        FakeClock, TEST_EPOCH, TestOidc, new_oidc_service, new_oidc_service_with_signups,
+    };
 
     fn response_cookies(response: &crate::HttpResponse) -> Vec<String> {
         response
@@ -622,6 +770,7 @@ mod tests {
                 subject: "subject-1".into(),
                 email: "shaun@example.org".into(),
                 nonce,
+                ..Claims::default()
             },
         );
         let uri: Uri = format!("/callback?code=good-code&state={state}")
@@ -686,6 +835,7 @@ mod tests {
                     subject: "subject-1".into(),
                     email: String::new(),
                     nonce,
+                    ..Claims::default()
                 },
             );
             let (uri, drop_state): (String, bool) = match case {
@@ -707,6 +857,7 @@ mod tests {
                             subject: "subject-1".into(),
                             email: String::new(),
                             nonce: "replayed".into(),
+                            ..Claims::default()
                         },
                     );
                     (format!("/callback?code=good-code&state={state}"), false)
@@ -718,6 +869,7 @@ mod tests {
                             subject: "stranger".into(),
                             email: String::new(),
                             nonce: exchanger.seen().1,
+                            ..Claims::default()
                         },
                     );
                     (format!("/callback?code=good-code&state={state}"), false)
@@ -730,6 +882,214 @@ mod tests {
             assert_eq!(response.status(), expected, "body {:?}", response.body());
             assert!(cookie(&response_cookies(&response), SESSION_COOKIE_NAME).is_none());
         }
+    }
+
+    /// Drives a login through to the callback with the given claims.
+    async fn login_with(
+        test: &TestOidc,
+        subject: &str,
+        claims: impl Fn(String) -> Claims,
+    ) -> crate::HttpResponse {
+        let login = test.service.login_response(&"/login".parse().unwrap());
+        let cookies = response_cookies(&login);
+        let (state, nonce) = test.exchanger.seen();
+        let mut built = claims(nonce);
+        built.subject = subject.into();
+        test.verifier.allow("raw-token", built);
+        let uri: Uri = format!("/callback?code=good-code&state={state}")
+            .parse()
+            .unwrap();
+        test.service
+            .callback_response(&callback_headers(&cookies, None), &uri)
+            .await
+    }
+
+    #[tokio::test]
+    async fn an_unknown_subject_creates_an_account_when_signups_are_open() {
+        let test = new_oidc_service_with_signups();
+        let response = login_with(&test, "subject-new", |nonce| Claims {
+            email: "amber@example.org".into(),
+            preferred_username: "Amber.Woods".into(),
+            nonce,
+            ..Claims::default()
+        })
+        .await;
+        assert_eq!(response.status(), StatusCode::FOUND, "{}", response.body());
+        assert!(cookie(&response_cookies(&response), SESSION_COOKIE_NAME).is_some());
+        let created = test.provisioner.created();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].preferred_name, "amber-woods");
+        assert_eq!(created[0].email, "amber@example.org");
+        assert_eq!(created[0].oidc_subject, "subject-new");
+    }
+
+    #[tokio::test]
+    async fn a_known_subject_is_never_provisioned_twice() {
+        let test = new_oidc_service_with_signups();
+        let response = login_with(&test, "subject-1", |nonce| Claims {
+            preferred_username: "shaun".into(),
+            nonce,
+            ..Claims::default()
+        })
+        .await;
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert!(test.provisioner.created().is_empty());
+    }
+
+    #[tokio::test]
+    async fn signups_closed_refuses_an_unknown_subject() {
+        // No provisioner is wired, which is how an operator freezes signups.
+        let test = new_oidc_service();
+        let response = login_with(&test, "subject-new", |nonce| Claims {
+            preferred_username: "amber".into(),
+            nonce,
+            ..Claims::default()
+        })
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(test.provisioner.created().is_empty());
+        assert!(cookie(&response_cookies(&response), SESSION_COOKIE_NAME).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_provision_issues_no_session() {
+        let test = new_oidc_service_with_signups();
+        test.provisioner.fail();
+        let response = login_with(&test, "subject-new", |nonce| Claims {
+            preferred_username: "amber".into(),
+            nonce,
+            ..Claims::default()
+        })
+        .await;
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(cookie(&response_cookies(&response), SESSION_COOKIE_NAME).is_none());
+    }
+
+    #[test]
+    fn account_names_are_derived_from_whatever_the_provider_sends() {
+        for (claims, expected) in [
+            (
+                Claims {
+                    preferred_username: "riley".into(),
+                    email: "other@example.org".into(),
+                    name: "Riley Loo".into(),
+                    ..Claims::default()
+                },
+                "riley",
+            ),
+            // No preferred_username: the email's local part is next.
+            (
+                Claims {
+                    email: "riley.loo+bento@example.org".into(),
+                    name: "Riley Loo".into(),
+                    ..Claims::default()
+                },
+                "riley-loo-bento",
+            ),
+            // Neither: the display name, reduced to the grammar.
+            (
+                Claims {
+                    name: "Riley Loo".into(),
+                    ..Claims::default()
+                },
+                "riley-loo",
+            ),
+            // Nothing usable at all still yields a legal name.
+            (Claims::default(), "user"),
+            (
+                Claims {
+                    preferred_username: "!!!".into(),
+                    ..Claims::default()
+                },
+                "user",
+            ),
+            // Capitals, punctuation runs, and edge hyphens are all handled.
+            (
+                Claims {
+                    preferred_username: "--Ada__Lovelace--".into(),
+                    ..Claims::default()
+                },
+                "ada-lovelace",
+            ),
+            (
+                Claims {
+                    preferred_username: "a-very-long-name-that-runs-past-the-limit".into(),
+                    ..Claims::default()
+                },
+                "a-very-long-name-that-runs-p",
+            ),
+        ] {
+            let name = account_name_from(&claims);
+            assert_eq!(name, expected, "claims {claims:?}");
+            // Whatever the provider sent, the result is a legal account
+            // name: lowercase, digits, inner hyphens, 1..=32 bytes.
+            assert!((1..=32).contains(&name.len()));
+            assert!(
+                name.bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+            );
+            assert!(name.as_bytes()[0].is_ascii_alphanumeric());
+            assert!(name.as_bytes()[name.len() - 1].is_ascii_alphanumeric());
+        }
+    }
+
+    /// The landing page bounces a signed-out visitor off the provider
+    /// once. If that refusal came back as an error page, or as a redirect
+    /// to `/`, the visit would either look broken or start again -- so the
+    /// callback answers it with the splash and a cookie that stops the
+    /// next attempt.
+    #[tokio::test]
+    async fn a_refused_silent_probe_lands_on_the_splash_and_does_not_repeat() {
+        let TestOidc { service, .. } = new_oidc_service();
+        let probe = service.dashboard_gate(&browser_headers()).await.unwrap();
+        let cookies = response_cookies(&probe);
+
+        let response = service
+            .callback_response(
+                &callback_headers(&cookies, None),
+                &"/callback?error=login_required".parse().unwrap(),
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.body().contains("Sign in"), "{}", response.body());
+        // Not a redirect: sending the browser back to `/` would probe again.
+        assert!(response.headers().get(LOCATION).is_none());
+        assert!(cookie(&response_cookies(&response), SESSION_COOKIE_NAME).is_none());
+
+        // Replaying the visit with the cookies it set serves the splash
+        // outright, so the provider is not asked a second time.
+        let again = service
+            .dashboard_gate(&callback_headers(&response_cookies(&response), None))
+            .await
+            .unwrap();
+        assert_eq!(again.status(), StatusCode::OK);
+        assert!(again.headers().get(LOCATION).is_none());
+    }
+
+    /// A refusal on a login the visitor actually asked for is still an
+    /// error, and must not be swallowed by the silent path.
+    #[tokio::test]
+    async fn a_refused_deliberate_login_still_reports_the_error() {
+        let TestOidc { service, .. } = new_oidc_service();
+        let login = service.login_response(&"/login".parse().unwrap());
+        let response = service
+            .callback_response(
+                &callback_headers(&response_cookies(&login), None),
+                &"/callback?error=access_denied".parse().unwrap(),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert!(response.body().contains("access_denied"));
+    }
+
+    fn browser_headers() -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            http::header::ACCEPT,
+            HeaderValue::from_static("text/html,*/*;q=0.8"),
+        );
+        headers
     }
 
     #[test]
@@ -859,7 +1219,8 @@ mod tests {
             Claims {
                 subject: "subject-1".into(),
                 email: String::new(),
-                nonce: "nonce-1".into()
+                nonce: "nonce-1".into(),
+                ..Claims::default()
             }
         );
 

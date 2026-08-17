@@ -184,12 +184,30 @@ pub struct Acme {
 }
 
 /// The dashboard identity settings (SPEC 13).
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Oidc {
     pub issuer: String,
     pub client_id: String,
     pub client_secret: String,
+    /// Whether a verified login for an identity Bento has never seen
+    /// creates an account. This is the only way an account is created, so
+    /// turning it off freezes the user list at whoever already exists;
+    /// everyone else gets a refusal at the end of the login flow.
+    pub allow_signup: bool,
+}
+
+impl Default for Oidc {
+    fn default() -> Self {
+        Self {
+            issuer: String::new(),
+            client_id: String::new(),
+            client_secret: String::new(),
+            // The provider is already the gate on who can authenticate, so
+            // deferring to it is the useful default (SPEC 13).
+            allow_signup: true,
+        }
+    }
 }
 
 /// One row of the operator image allowlist (SPEC 5.1).
@@ -581,6 +599,26 @@ pinned_checksum = "sha256-deadbeef"
         ))
         .expect("read example config");
         Config::parse(&data).expect("bento.example.toml does not parse");
+    }
+
+    /// Signups follow the identity provider unless the operator says
+    /// otherwise, so the flag's absence must not read as `false`.
+    #[test]
+    fn signups_are_open_unless_turned_off() {
+        let cfg =
+            Config::parse("base_domain = \"b.example\"\n[oidc]\nissuer = \"https://id\"").unwrap();
+        assert!(cfg.oidc.allow_signup);
+        assert!(
+            Config::parse("base_domain = \"b.example\"")
+                .unwrap()
+                .oidc
+                .allow_signup
+        );
+        let closed = Config::parse(
+            "base_domain = \"b.example\"\n[oidc]\nissuer = \"https://id\"\nallow_signup = false",
+        )
+        .unwrap();
+        assert!(!closed.oidc.allow_signup);
     }
 
     /// Covers the deployment where another proxy already owns port 443

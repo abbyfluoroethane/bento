@@ -362,7 +362,7 @@ The SSH frontend does the following:
 
 1. Accept the connection and read the client public key.
 2. Look up the public key in the database to find the user.
-3. Reject the connection if the key is unknown.
+3. Offer an unknown key a link instead of a session. See section 13.
 4. Read the SSH user name and treat it as the instance name.
 5. Resolve the name to an instance UUID.
 6. Check that the user owns the instance or has a share for the UUID.
@@ -438,6 +438,7 @@ Use SQLite with write-ahead logging.
 | `users` | `id`, `name`, `email`, `oidc_subject`, `subnet`, `created_at` |
 | `quotas` | `user_id`, `max_instances`, `max_vcpu`, `max_memory`, `max_disk` |
 | `ssh_keys` | `id`, `user_id`, `public_key`, `fingerprint`, `comment`, `created_at` |
+| `pairings` | `id`, `token_hash`, `public_key`, `fingerprint`, `comment`, `created_at`, `expires_at`, `linked_user_id` |
 | `hosts` | `id`, `name`, `libvirt_uri`, `created_at` |
 | `images` | `name`, `url`, `pinned_checksum`, `current_checksum` |
 | `image_versions` | `checksum`, `image_name`, `path`, `size`, `fetched_at` |
@@ -460,6 +461,8 @@ The `released_names` table enforces the cooldown in section 7.2. The table also 
 
 Index `ssh_keys.fingerprint`. The SSH frontend reads this column on every connection.
 
+The `pairings` table holds pending key links from section 13. Only the hash of the link token is stored, as for `tokens.hash`. A row with `linked_user_id` set is spent. Unused rows are swept once they expire, so the table stays the size of the links in flight.
+
 The `last_seen_at` column records the last SSH connection or HTTP request. Bento does not act on this column. The column lets a user find a forgotten instance in the `ls` output.
 
 Poll `virConnectListAllDomains` every 30 seconds and update the `state` column. Subscribe to libvirt lifecycle events as well. A poll misses a short transition.
@@ -478,7 +481,17 @@ Bento does these three things instead:
 
 The dashboard uses OIDC. Pocket ID is a suitable provider.
 
-The command line interface uses SSH public key authentication. A new user registers by connecting to `ssh bento.foid.space`. The registration flow records the presented public key. The flow then asks for a name and an email address. Registration also allocates the subnet and the libvirt network of the user.
+OIDC is the only way an account comes into existence. A verified login for a subject no `users` row carries creates that row, deriving the account name from `preferred_username`, then the local part of the email, then the display name, reduced to lowercase letters, digits, and inner hyphens; a taken name is suffixed `-2`, `-3`. Account creation also allocates the subnet and the libvirt network of the user. The identity provider therefore decides who has an account. Setting `allow_signup = false` under `[oidc]` refuses logins from identities that have no row yet, which freezes the user list.
+
+The command line interface uses SSH public key authentication. A key is attached to an account by linking, not by registering:
+
+1. A key the `ssh_keys` table does not know connects to `ssh bento.foid.space`.
+2. The frontend records the key in `pairings` with a random link token, stores only the hash of that token, and prints the URL and the key's fingerprint. Nothing else is created: no user, no subnet, no network. The frontend can therefore answer the public internet without registration being open.
+3. The link expires in three minutes and works once. The session waits for it, so the terminal reports the result.
+4. Opening the link requires a session, so a first-time user goes through OIDC and gets an account on the way past.
+5. The page shows the fingerprint and the account name. Only a `POST` from that page attaches the key. A link that attached a key by being visited would let one user's link, sent to another, take over that account, and would fire on anything that follows links; the session cookie is `SameSite=Lax`, so a cross-site submission arrives without it and is refused.
+
+An account with no keys is normal — it is what a dashboard-only user has. Keys are added by linking again from an already signed-in browser.
 
 The HTTP proxy needs a session for private instances. Issue a cookie for the base domain after an OIDC login. The cookie is valid for every subdomain.
 
@@ -489,6 +502,8 @@ A token in the `tokens` table gives programmatic access.
 ## 14. Dashboard
 
 The dashboard exposes every operation in section 15. The dashboard is not a separate product. A user who prefers a browser must not lose a capability.
+
+The bundle assumes a session and has no sign-in of its own, so a request without one is answered before it reaches the bundle. A visitor who already has a session at the provider should not have to click anything: answer the first such request with a `prompt=none` authorization request, which returns either a code or `error=login_required` without showing the visitor anything. A refusal renders a sign-in page rather than an error, and sets a short-lived cookie so the next request goes straight there instead of to the provider again. Logging out sets the same cookie: the provider's session outlives Bento's, and without it the next request would silently sign the user back in and the logout would appear to do nothing. Built assets are served without any of this.
 
 ### 14.1 Stack
 

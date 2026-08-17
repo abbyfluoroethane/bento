@@ -17,3 +17,6 @@ tokio = { workspace = true }
 [dev-dependencies]
 rand = { workspace = true }
 time = { workspace = true }
+# `test-util` gives the tests a paused clock, so the key-linking wait can be
+# exercised over its whole three-minute window without taking three minutes.
+tokio = { workspace = true, features = ["test-util"] }

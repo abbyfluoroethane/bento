@@ -3,11 +3,12 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
-use bento_types::{Token, User};
+use bento_types::{Pairing, Token, User};
 use time::{Duration, OffsetDateTime, macros::datetime};
 
 use crate::{
-    AccessStore, BoxError, Claims, Exchanger, Service, TokenLookup, TokenStore, UserStore, Verifier,
+    AccessStore, BoxError, Claims, Exchanger, NewAccount, PairingStore, Provisioner, Service,
+    TokenLookup, TokenStore, UserStore, Verifier,
 };
 
 pub(crate) const TEST_EPOCH: OffsetDateTime = datetime!(2026-08-10 12:00 UTC);
@@ -68,6 +69,118 @@ impl UserStore for FakeUserStore {
             return Err(Box::new(io::Error::other("db is on fire")));
         }
         Ok(self.users.lock().unwrap().get(subject).cloned())
+    }
+
+    async fn user_by_id(&self, id: i64) -> std::result::Result<Option<User>, BoxError> {
+        if *self.failed.lock().unwrap() {
+            return Err(Box::new(io::Error::other("db is on fire")));
+        }
+        Ok(self
+            .users
+            .lock()
+            .unwrap()
+            .values()
+            .find(|user| user.id == id)
+            .cloned())
+    }
+}
+
+/// Records what it was asked to create and hands back a plausible user.
+pub(crate) struct FakeProvisioner {
+    created: Mutex<Vec<NewAccount>>,
+    fail: Mutex<bool>,
+    users: Arc<FakeUserStore>,
+}
+
+impl FakeProvisioner {
+    pub(crate) fn new(users: Arc<FakeUserStore>) -> Self {
+        Self {
+            created: Mutex::new(Vec::new()),
+            fail: Mutex::new(false),
+            users,
+        }
+    }
+
+    pub(crate) fn created(&self) -> Vec<NewAccount> {
+        self.created.lock().unwrap().clone()
+    }
+
+    pub(crate) fn fail(&self) {
+        *self.fail.lock().unwrap() = true;
+    }
+}
+
+#[async_trait]
+impl Provisioner for FakeProvisioner {
+    async fn provision(&self, account: NewAccount) -> std::result::Result<User, BoxError> {
+        if *self.fail.lock().unwrap() {
+            return Err(Box::new(io::Error::other("no subnets left")));
+        }
+        let id = 100 + self.created.lock().unwrap().len() as i64;
+        self.created.lock().unwrap().push(account.clone());
+        self.users
+            .insert(&account.oidc_subject, id, &account.preferred_name);
+        Ok(self
+            .users
+            .user_by_oidc_subject(&account.oidc_subject)
+            .await?
+            .expect("just inserted"))
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct FakePairingStore {
+    pairings: Mutex<HashMap<String, Pairing>>,
+    linked: Mutex<Vec<(i64, i64)>>,
+}
+
+impl FakePairingStore {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// Adds a live pairing whose link token is `token`.
+    pub(crate) fn insert(&self, token: &str, expires_at: OffsetDateTime) -> Pairing {
+        let mut pairings = self.pairings.lock().unwrap();
+        let pairing = Pairing {
+            id: pairings.len() as i64 + 1,
+            token_hash: crate::hash_token(token),
+            public_key: "ssh-ed25519 AAAAC3Nz key".into(),
+            fingerprint: format!("SHA256:fingerprint-of-{token}"),
+            comment: "riley@laptop".into(),
+            created_at: TEST_EPOCH,
+            expires_at,
+            linked_user_id: None,
+        };
+        pairings.insert(pairing.token_hash.clone(), pairing.clone());
+        pairing
+    }
+
+    pub(crate) fn linked(&self) -> Vec<(i64, i64)> {
+        self.linked.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl PairingStore for FakePairingStore {
+    async fn pairing_by_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> std::result::Result<Option<Pairing>, BoxError> {
+        Ok(self.pairings.lock().unwrap().get(token_hash).cloned())
+    }
+
+    async fn link_pairing(&self, id: i64, user_id: i64) -> std::result::Result<bool, BoxError> {
+        let mut pairings = self.pairings.lock().unwrap();
+        let Some(pairing) = pairings.values_mut().find(|pairing| pairing.id == id) else {
+            return Ok(false);
+        };
+        if pairing.linked_user_id.is_some() {
+            return Ok(false);
+        }
+        pairing.linked_user_id = Some(user_id);
+        self.linked.lock().unwrap().push((id, user_id));
+        Ok(true)
     }
 }
 
@@ -286,18 +399,35 @@ pub(crate) struct TestOidc {
     pub(crate) service: Service,
     pub(crate) exchanger: Arc<FakeExchanger>,
     pub(crate) verifier: Arc<FakeVerifier>,
+    pub(crate) provisioner: Arc<FakeProvisioner>,
 }
 
+/// An OIDC service with signups closed: no provisioner is wired, so only
+/// `subject-1` can log in.
 pub(crate) fn new_oidc_service() -> TestOidc {
+    build_oidc_service(false)
+}
+
+/// An OIDC service with signups open, which is the deployed default.
+pub(crate) fn new_oidc_service_with_signups() -> TestOidc {
+    build_oidc_service(true)
+}
+
+fn build_oidc_service(signups: bool) -> TestOidc {
     let clock = FakeClock::new(TEST_EPOCH);
     let (service, users, _, _) = new_test_service(&clock);
     users.insert("subject-1", 42, "shaun");
     let exchanger = Arc::new(FakeExchanger::new());
     let verifier = Arc::new(FakeVerifier::new());
-    let service = service.with_oidc(exchanger.clone(), verifier.clone());
+    let provisioner = Arc::new(FakeProvisioner::new(users));
+    let mut service = service.with_oidc(exchanger.clone(), verifier.clone());
+    if signups {
+        service = service.with_provisioner(provisioner.clone());
+    }
     TestOidc {
         service,
         exchanger,
         verifier,
+        provisioner,
     }
 }

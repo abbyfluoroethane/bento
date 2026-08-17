@@ -17,7 +17,7 @@ use bento_images::{DB, DynError as ImagesError, ReportSource};
 use bento_lifecycle::{DynError as LifecycleError, Manager, NewRequest};
 use bento_network::{Plan, UserNetwork};
 use bento_proxy::{Access, BoxError as ProxyError, ProxyBody};
-use bento_sshfront::{BoxError as SshError, Registration};
+use bento_sshfront::{BoxError as SshError, PairingRequest, PendingLink};
 use bento_store::{Error as StoreError, Store};
 use bento_types::{
     DesiredState, Image, ImageVersion, Instance, Quota, Share, SshKey, State, Token, User,
@@ -562,6 +562,40 @@ impl bento_auth::UserStore for AuthUsers {
             Err(error) => Err(Box::new(error)),
         }
     }
+
+    async fn user_by_id(&self, id: i64) -> Result<Option<User>, AuthError> {
+        match self.0.user_by_id(id).await {
+            Ok(user) => Ok(Some(user)),
+            Err(StoreError::NotFound) => Ok(None),
+            Err(error) => Err(Box::new(error)),
+        }
+    }
+}
+
+pub(crate) struct AuthPairings(pub(crate) Store);
+
+#[async_trait]
+impl bento_auth::PairingStore for AuthPairings {
+    async fn pairing_by_token_hash(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<bento_types::Pairing>, AuthError> {
+        match self.0.pairing_by_token_hash(token_hash).await {
+            Ok(pairing) => Ok(Some(pairing)),
+            Err(StoreError::NotFound) => Ok(None),
+            Err(error) => Err(Box::new(error)),
+        }
+    }
+
+    async fn link_pairing(&self, id: i64, user_id: i64) -> Result<bool, AuthError> {
+        match self.0.link_pairing(id, user_id).await {
+            Ok(_) => Ok(true),
+            // The store's conditional claim reports every lost race, expiry,
+            // and missing row the same way, which is what `false` means here.
+            Err(StoreError::NotFound) => Ok(false),
+            Err(error) => Err(Box::new(error)),
+        }
+    }
 }
 
 pub(crate) struct AuthAccess(pub(crate) Store);
@@ -718,7 +752,12 @@ impl NetworkEnsurer for bento_hypervisor::Client {
     }
 }
 
-pub(crate) struct Registrar {
+/// Creates the account behind a verified OIDC identity (SPEC 13): the
+/// users row, its `/24`, and its libvirt network.
+///
+/// This is the only thing that creates a user. The SSH frontend no longer
+/// does, so the identity provider is the sole gate on who has an account.
+pub(crate) struct Provisioner {
     pub(crate) store: Store,
     pub(crate) plan: Plan,
     pub(crate) networks: Option<Arc<dyn NetworkEnsurer>>,
@@ -726,43 +765,55 @@ pub(crate) struct Registrar {
 }
 
 #[async_trait]
-impl bento_sshfront::Registrar for Registrar {
-    async fn register(&self, registration: Registration) -> Result<User, SshError> {
+impl bento_auth::Provisioner for Provisioner {
+    async fn provision(&self, account: bento_auth::NewAccount) -> Result<User, AuthError> {
+        // The name comes from claims the provider chose, so a collision is
+        // ordinary rather than exceptional; the store suffixes it.
         let user = self
             .store
-            .register_user(
-                &registration.name,
-                &registration.email,
-                None,
+            .register_user_with_available_name(
+                &account.preferred_name,
+                &account.email,
+                Some(account.oidc_subject),
                 self.plan.range(),
             )
-            .await?;
-        self.store
-            .add_ssh_key(
-                user.id,
-                &registration.public_key,
-                &registration.fingerprint,
-                &registration.comment,
-            )
-            .await?;
-        let network = user_network(self.plan, &user.subnet)?;
-        if let Some(networks) = &self.networks {
-            if let Err(error) = networks
-                .ensure_network(&network.name, &network.xml()?)
-                .await
-            {
-                tracing::warn!(
-                    user = %user.name,
-                    network = %network.name,
-                    %error,
-                    "registration: user network not defined yet; the control plane will retry"
-                );
+            .await
+            .map_err(|error| Box::new(error) as AuthError)?;
+        self.settle(&user).await;
+        Ok(user)
+    }
+}
+
+impl Provisioner {
+    /// Defines the user's network and reloads the firewall. Neither
+    /// failure blocks the account: the control-plane convergence loop
+    /// re-ensures both every tick (SPEC 6.2, 6.3).
+    async fn settle(&self, user: &User) {
+        let network = match user_network(self.plan, &user.subnet) {
+            Ok(network) => network,
+            Err(error) => {
+                tracing::warn!(user = %user.name, %error, "new account: no network plan");
+                return;
             }
-        } else {
-            tracing::warn!(
+        };
+        match (&self.networks, network.xml()) {
+            (Some(networks), Ok(xml)) => {
+                if let Err(error) = networks.ensure_network(&network.name, &xml).await {
+                    tracing::warn!(
+                        user = %user.name,
+                        network = %network.name,
+                        %error,
+                        "new account: user network not defined yet; the control plane will retry"
+                    );
+                }
+            }
+            (None, _) => tracing::warn!(
                 user = %user.name,
-                "registration: no libvirt connection; the control plane will define the user network"
-            );
+                "new account: no libvirt connection; the control plane will define the user network"
+            ),
+            (_, Err(error)) => {
+                tracing::warn!(user = %user.name, %error, "new account: network xml");
+            }
         }
         if let Some(firewall) = &self.firewall
             && let Err(error) = firewall.reload().await
@@ -770,10 +821,67 @@ impl bento_sshfront::Registrar for Registrar {
             tracing::warn!(
                 user = %user.name,
                 %error,
-                "registration: firewall reload failed; the control plane will retry"
+                "new account: firewall reload failed; the control plane will retry"
             );
         }
-        Ok(user)
+    }
+}
+
+/// How long a key-linking link stays usable. Long enough to switch to a
+/// browser and sign in, short enough that a link left in a scrollback or a
+/// chat log is worthless by the time anyone reads it.
+pub(crate) const LINK_TTL: Duration = Duration::from_secs(180);
+
+/// Mints the links the SSH frontend hands to unknown keys (SPEC 13).
+pub(crate) struct Linker {
+    pub(crate) store: Store,
+    pub(crate) base_domain: String,
+}
+
+#[async_trait]
+impl bento_sshfront::KeyLinker for Linker {
+    async fn begin(&self, request: PairingRequest) -> Result<PendingLink, SshError> {
+        let (token, token_hash) = bento_auth::new_link_token();
+        let expires_at =
+            OffsetDateTime::now_utc() + time::Duration::seconds(LINK_TTL.as_secs() as i64);
+        let pairing = self
+            .store
+            .create_pairing(
+                token_hash,
+                &request.public_key,
+                &request.fingerprint,
+                &request.comment,
+                expires_at,
+            )
+            .await?;
+        tracing::info!(
+            fingerprint = %request.fingerprint,
+            "unknown key offered a link"
+        );
+        Ok(PendingLink {
+            id: pairing.id,
+            url: format!(
+                "https://{}{}{token}",
+                self.base_domain,
+                bento_auth::LINK_PATH_PREFIX
+            ),
+            valid_for: LINK_TTL,
+        })
+    }
+
+    async fn linked_user(&self, id: i64) -> Result<Option<User>, SshError> {
+        let pairing = match self.store.pairing(id).await {
+            Ok(pairing) => pairing,
+            // The sweep in `create_pairing` can remove an expired row out
+            // from under a waiting session; that is the same answer as
+            // "still pending" until the session's own deadline passes.
+            Err(StoreError::NotFound) => return Ok(None),
+            Err(error) => return Err(Box::new(error)),
+        };
+        let Some(user_id) = pairing.linked_user_id else {
+            return Ok(None);
+        };
+        Ok(Some(self.store.user_by_id(user_id).await?))
     }
 }
 

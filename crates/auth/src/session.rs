@@ -122,6 +122,13 @@ impl Service {
         }
         let mut response = crate::redirect_response("/");
         crate::append_cookie(&mut response, self.clear_session_cookie());
+        // Signing out of Bento does not sign the visitor out of the
+        // identity provider, so the landing page's silent probe would
+        // find that session and hand them straight back in -- a logout
+        // button that visibly does nothing. Suppressing the next probe
+        // lands them on the splash instead, where signing in again is a
+        // deliberate click.
+        self.suppress_next_probe(&mut response);
         response
     }
 

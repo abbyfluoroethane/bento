@@ -19,13 +19,20 @@ use percent_encoding::{AsciiSet, CONTROLS, percent_decode_str, utf8_percent_enco
 use time::{Duration, OffsetDateTime};
 
 mod authorize;
+mod landing;
 mod middleware;
 mod oidc;
+mod page;
+mod pairing;
 mod session;
 mod token;
 
+pub use landing::is_dashboard_asset;
 pub use middleware::{UserId, user_id_from_parts};
-pub use oidc::{Claims, Exchanger, ProviderClient, ProviderError, Verifier};
+pub use oidc::{
+    Claims, Exchanger, NewAccount, ProviderClient, ProviderError, Provisioner, Verifier,
+};
+pub use pairing::{LINK_PATH_PREFIX, PairingStore, new_link_token};
 pub use session::{MemorySessionStore, SESSION_COOKIE_NAME, Session, SessionStore};
 pub use token::{TOKEN_PREFIX, TokenLookup, bearer_token, hash_token};
 
@@ -49,7 +56,8 @@ pub enum Error {
     #[error("auth: token expired")]
     TokenExpired,
     /// The OIDC login succeeded but no users row has the presented
-    /// subject. Registration happens over SSH (SPEC 13).
+    /// subject and no provisioner is configured, so signups are closed
+    /// (SPEC 13).
     #[error("auth: no account for OIDC subject")]
     NoAccount,
     /// A consumer-side persistence operation failed.
@@ -74,6 +82,10 @@ pub trait UserStore: Send + Sync {
         &self,
         subject: &str,
     ) -> std::result::Result<Option<User>, BoxError>;
+
+    /// Returns the user with the given primary key. The key-linking page
+    /// names the account the key is about to be attached to.
+    async fn user_by_id(&self, id: i64) -> std::result::Result<Option<User>, BoxError>;
 }
 
 /// Answers the per-request authorization question of SPEC 13.
@@ -120,6 +132,8 @@ pub struct Service {
     tokens: Arc<dyn TokenStore>,
     oauth: Option<Arc<dyn Exchanger>>,
     verifier: Option<Arc<dyn Verifier>>,
+    provisioner: Option<Arc<dyn Provisioner>>,
+    pairings: Option<Arc<dyn PairingStore>>,
     now: Clock,
     session_ttl: Duration,
     login_path: String,
@@ -149,6 +163,8 @@ impl Service {
             tokens,
             oauth: None,
             verifier: None,
+            provisioner: None,
+            pairings: None,
             now: Arc::new(OffsetDateTime::now_utc),
             session_ttl: DEFAULT_SESSION_TTL,
             login_path: "/login".to_string(),
@@ -185,6 +201,23 @@ impl Service {
     pub fn with_oidc(mut self, exchanger: Arc<dyn Exchanger>, verifier: Arc<dyn Verifier>) -> Self {
         self.oauth = Some(exchanger);
         self.verifier = Some(verifier);
+        self
+    }
+
+    /// Injects the account provisioner. With one wired, a verified login
+    /// whose subject is unknown creates the account (SPEC 13); without
+    /// one, that login is refused, which is how an operator closes
+    /// signups.
+    #[must_use]
+    pub fn with_provisioner(mut self, provisioner: Arc<dyn Provisioner>) -> Self {
+        self.provisioner = Some(provisioner);
+        self
+    }
+
+    /// Injects the pairing store that backs the SSH key-linking page.
+    #[must_use]
+    pub fn with_pairings(mut self, pairings: Arc<dyn PairingStore>) -> Self {
+        self.pairings = Some(pairings);
         self
     }
 
@@ -248,6 +281,16 @@ fn text_response(status: StatusCode, message: impl Into<String>) -> HttpResponse
     response.headers_mut().insert(
         CONTENT_TYPE,
         HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    response
+}
+
+fn html_response(status: StatusCode, body: impl Into<String>) -> HttpResponse {
+    let mut response = Response::new(body.into());
+    *response.status_mut() = status;
+    response.headers_mut().insert(
+        CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
     );
     response
 }
