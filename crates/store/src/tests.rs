@@ -82,6 +82,7 @@ pub(crate) async fn seed_store(store: &Store) -> (User, Host) {
         .upsert_image(Image {
             name: "debian-13".into(),
             url: "https://example.org/d13.qcow2".into(),
+            kind: Default::default(),
             pinned_checksum: None,
             current_checksum: None,
         })
@@ -93,6 +94,7 @@ pub(crate) async fn seed_store(store: &Store) -> (User, Host) {
             image_name: "debian-13".into(),
             path: "/var/lib/bento/images/sha256-aa.qcow2".into(),
             size: 1,
+            source_digest: None,
             fetched_at: datetime!(2026-01-01 0:00 UTC),
         })
         .await
@@ -241,4 +243,51 @@ async fn shares_cascade_on_instance_delete() {
         .query_row("SELECT COUNT(*) FROM shares", [], |row| row.get(0))
         .unwrap();
     assert_eq!(count, 0);
+}
+
+#[tokio::test]
+async fn opens_and_migrates_a_pre_oci_database() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("legacy.db");
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE images (
+                name TEXT PRIMARY KEY,
+                url TEXT NOT NULL,
+                pinned_checksum TEXT,
+                current_checksum TEXT REFERENCES image_versions(checksum)
+             );
+             CREATE TABLE image_versions (
+                checksum TEXT PRIMARY KEY,
+                image_name TEXT NOT NULL REFERENCES images(name),
+                path TEXT NOT NULL UNIQUE,
+                size INTEGER NOT NULL,
+                fetched_at TEXT NOT NULL
+             );
+             INSERT INTO images (name, url) VALUES ('legacy', 'https://example/legacy.qcow2');",
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = Store::open(&path).await.unwrap();
+    let image = store.image("legacy").await.unwrap();
+    assert_eq!(image.kind, bento_types::ImageKind::Qcow2);
+    store
+        .add_image_version(ImageVersion {
+            checksum: "legacy-checksum".into(),
+            image_name: "legacy".into(),
+            path: "/tmp/legacy-checksum.qcow2".into(),
+            size: 1,
+            source_digest: Some("sha256:source".into()),
+            fetched_at: datetime!(2026-01-01 0:00 UTC),
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        store.image_versions("legacy").await.unwrap()[0]
+            .source_digest
+            .as_deref(),
+        Some("sha256:source")
+    );
 }

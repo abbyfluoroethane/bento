@@ -53,6 +53,7 @@ export interface Whoami {
 export interface Image {
   name: string;
   url: string;
+  kind: "qcow2" | "oci" | string;
   pinned_checksum: string;
   current_checksum: string;
   instances_on_older_versions: number;
@@ -138,6 +139,8 @@ export const api = {
   removeShare: (uuid: string, user: string) =>
     req<void>("DELETE", `/api/instances/${uuid}/shares/${encodeURIComponent(user)}`),
   listImages: () => req<Image[]>("GET", "/api/images"),
+  addOciImage: (name: string, reference: string) =>
+    req<{ name: string }>("POST", "/api/images", { name, reference }),
   listSSHKeys: () => req<SSHKey[]>("GET", "/api/ssh-keys"),
   addSSHKey: (publicKey: string, comment: string) =>
     req<SSHKey>("POST", "/api/ssh-keys", { public_key: publicKey, comment }),

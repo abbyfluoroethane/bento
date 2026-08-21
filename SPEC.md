@@ -120,7 +120,14 @@ A `qcow2` overlay records the absolute path of its backing file inside the overl
 
 Never move the image directory after the first instance exists. Never write to a stored image version.
 
-The operator allowlist gives each image a name, a download URL, and an optional pinned checksum. The `fetch-images` command does the following:
+The durable operator allowlist is stored in SQLite. Configuration entries are merged into it, and an operator may append a bootc OCI entry at runtime from the dashboard or SSH CLI. A name cannot be reused for a different runtime source.
+
+An image has one of two source kinds:
+
+- `qcow2`: a download URL and an optional pinned checksum.
+- `oci`: a bootc-compatible operating-system image reference. This is not an arbitrary OCI application container.
+
+For a `qcow2` source, the `fetch-images` command does the following:
 
 1. Download the file from the URL.
 2. Compute the checksum.
@@ -131,6 +138,8 @@ The operator allowlist gives each image a name, a download URL, and an optional 
 7. Mark the new row as the current version of that image.
 
 An unpinned image is trusted on first use. Bento stores a later version under its own checksum and marks it current. Bento then logs a warning that names both checksums. A change is not an error, because a distribution republishes a cloud image as normal practice. Pin the checksum for any image where a change is not acceptable.
+
+For an `oci` source, Bento pulls it with rootful Podman, records the resolved source digest, and runs the configured image-builder container privileged to produce a qcow2 artifact. It computes the output checksum and then uses steps 4-7 above. A previously successful build of the same image name and source digest is reused. Runtime addition performs this build immediately; `fetch-images` refreshes both source kinds.
 
 **Never delete an image version while an overlay depends on it.** A new instance uses the current version. An existing instance keeps the version that Bento built it from. Delete an image version only when no row in `instances` carries its checksum. The `fetch-images` command runs this collection at the end. This deletion is safe because the condition is exact. Compare the reconciliation in section 6.1, where the condition is not exact.
 
@@ -150,7 +159,9 @@ Bento configures the first boot with `cloud-init` and the NoCloud data source. B
 - Create one user account.
 - Install the public keys of the owner.
 - Set the static address, the gateway, and the DNS server. See section 6.2.
-- Install and start `qemu-guest-agent`.
+- Install and start `qemu-guest-agent` for a traditional cloud image. A bootc image must already contain the package because its `/usr` is immutable; first boot only enables it.
+
+A bootc OCI image must contain a kernel, `cloud-init` with the NoCloud data source, and `qemu-guest-agent`. This is the image author's contract. Bento uses the same cloud-init seed and instance lifecycle after conversion; there is no separate boot path.
 
 Detach and delete the ISO after the first successful boot. The ISO holds the public keys of the owner. The ISO does not need to stay attached.
 
@@ -595,7 +606,8 @@ The interface runs over SSH. The form is `ssh bento.foid.space <command> [argume
 | `port <name> <port>` | Set the default HTTP port. |
 | `visibility <name> <off\|private\|public>` | Set the visibility value. |
 | `share <name> <user>` | Grant or revoke access for a second user. |
-| `images` | List the images and the current checksum of each. Show how many instances hold an older version. |
+| `images` | List the images, their source kinds, current checksums, and how many instances hold an older version. |
+| `images add <name> <oci-reference>` | Operator only. Append and immediately build a bootc OCI image. |
 | `ssh-key` | Add, list, or remove an SSH key. |
 | `whoami` | Show the account and the quota of the user. |
 
@@ -651,23 +663,23 @@ Four more items need answers before this ships:
 
 This list is ordered. Do the first item first.
 
-### 18.1 bootc images, version 1.1
+### 18.1 bootc images, version 1.1 (implemented)
 
-Support a base image built from a Containerfile. This is the first task after version 1 ships.
+Support a base image published as a bootc-compatible registry image.
 
-A bootc image is an OCI image that holds a full operating system and a kernel. The `bootc-image-builder` tool converts it to a `qcow2` file. Section 5.1 already stores a `qcow2` file by checksum. Section 5.2 already creates an overlay from such a file. The work is a build pipeline, not a new instance path.
+A bootc image is an OCI image that holds a full operating system and a kernel. The image-builder tool converts it to a `qcow2` file. Section 5.1 already stores a `qcow2` file by checksum. Section 5.2 already creates an overlay from such a file. The work is a build pipeline, not a new instance path.
 
 The steps are:
 
-1. Let the operator name a Containerfile or a registry image in the configuration.
-2. Run `bootc-image-builder` with `--type qcow2`. This tool runs privileged under `podman`.
+1. Let the operator name a registry image in the configuration or append one at runtime.
+2. Run image-builder for `qcow2`. This tool runs privileged under `podman`.
 3. Compute the checksum of the output and store it as an image version.
 4. Record the source image digest next to the checksum.
 
-Two problems need answers first:
+The implementation answers the two design questions as follows:
 
-- **First boot.** Section 5.2 depends on `cloud-init` and the NoCloud data source. A bootc base image may not have `cloud-init` installed. Either require the Containerfile to install it, or add a second first-boot path that uses the bootc user configuration.
-- **Size and time.** A bootc image carries a full operating system, and the build takes minutes. Neither fits inside a `new` command. Put the build in `fetch-images`.
+- **First boot.** The image contract requires `cloud-init`, NoCloud, and `qemu-guest-agent` in the OCI image.
+- **Size and time.** Builds happen in `fetch-images` or synchronously when an operator appends a runtime entry, never in `new`.
 
 The bootc update model applies a new image in place from a registry. That model is out of scope. Bento treats a bootc output as a static image version.
 

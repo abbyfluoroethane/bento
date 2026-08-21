@@ -55,6 +55,12 @@ pub mod defaults {
     /// Written into an instance's network configuration when `dns` is
     /// unset (SPEC 6.2).
     pub const DNS: [&str; 2] = ["1.1.1.1", "9.9.9.9"];
+    /// Containerized image-builder used to turn bootc images into qcow2.
+    pub const BOOTC_BUILDER_IMAGE: &str = "ghcr.io/osbuild/image-builder-cli:latest";
+    /// Root filesystem used when a bootc image does not declare one.
+    pub const BOOTC_ROOTFS: &str = "ext4";
+    /// Rootful Podman storage shared with the image-builder container.
+    pub const CONTAINER_STORAGE: &str = "/var/lib/containers/storage";
 }
 
 /// Anything that stops `bentod` from reading its configuration.
@@ -135,6 +141,7 @@ pub struct Config {
     pub defaults: Defaults,
     pub acme: Acme,
     pub oidc: Oidc,
+    pub bootc: Bootc,
 
     /// The operator image allowlist (SPEC 5.1).
     pub images: Vec<ImageEntry>,
@@ -166,6 +173,28 @@ pub struct Defaults {
     pub vcpu: u32,
     pub memory_mib: i64,
     pub disk_gib: i64,
+}
+
+/// Host-side bootc conversion settings.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Bootc {
+    /// Pin this reference by digest in production for reproducible tooling.
+    pub builder_image: String,
+    /// Passed to image-builder for images that do not declare a rootfs.
+    pub rootfs: String,
+    /// Rootful Podman storage containing pulled bootc images.
+    pub container_storage: String,
+}
+
+impl Default for Bootc {
+    fn default() -> Self {
+        Self {
+            builder_image: defaults::BOOTC_BUILDER_IMAGE.to_owned(),
+            rootfs: defaults::BOOTC_ROOTFS.to_owned(),
+            container_storage: defaults::CONTAINER_STORAGE.to_owned(),
+        }
+    }
 }
 
 /// Certificate settings (SPEC 8). The wildcard certificate needs the
@@ -215,7 +244,11 @@ impl Default for Oidc {
 #[serde(deny_unknown_fields)]
 pub struct ImageEntry {
     pub name: String,
+    #[serde(default)]
     pub url: String,
+    /// A bootc-compatible OCI operating-system image reference.
+    #[serde(default)]
+    pub oci: String,
     /// When set, a download whose checksum differs is rejected. Absent
     /// means trust on first use.
     #[serde(default)]
@@ -243,6 +276,7 @@ impl Default for Config {
             defaults: Defaults::default(),
             acme: Acme::default(),
             oidc: Oidc::default(),
+            bootc: Bootc::default(),
             images: Vec::new(),
         }
     }
@@ -410,13 +444,25 @@ impl Config {
                 "defaults: vcpu, memory_mib, and disk_gib must be positive",
             ));
         }
+        if self.bootc.builder_image.is_empty() {
+            return Err(invalid("bootc: builder_image is required"));
+        }
+        if !matches!(self.bootc.rootfs.as_str(), "ext4" | "xfs" | "btrfs") {
+            return Err(invalid("bootc: rootfs must be one of ext4, xfs, or btrfs"));
+        }
+        if self.bootc.container_storage.is_empty() {
+            return Err(invalid("bootc: container_storage is required"));
+        }
         let mut seen = std::collections::HashSet::new();
         for img in &self.images {
             if img.name.is_empty() {
                 return Err(invalid("images: entry with empty name"));
             }
-            if img.url.is_empty() {
-                return Err(invalid(format!("images: entry {:?} has no url", img.name)));
+            if img.url.is_empty() == img.oci.is_empty() {
+                return Err(invalid(format!(
+                    "images: entry {:?} must set exactly one of url or oci",
+                    img.name
+                )));
             }
             if !seen.insert(img.name.as_str()) {
                 return Err(invalid(format!("images: duplicate entry {:?}", img.name)));
@@ -462,6 +508,8 @@ mod tests {
         assert_eq!(cfg.listen.proxy_port_max, 9999);
         // SPEC 8 is the default: the proxy owns its certificate.
         assert_eq!(cfg.listen.tls, TlsMode::Acme);
+        assert_eq!(cfg.bootc.rootfs, "ext4");
+        assert_eq!(cfg.bootc.container_storage, "/var/lib/containers/storage");
     }
 
     #[test]
@@ -568,6 +616,14 @@ pinned_checksum = "sha256-deadbeef"
         parse_err(
             "base_domain = \"b.example\"\n[[images]]\nname = \"debian-13\"",
             "url",
+        );
+        parse_err(
+            "base_domain = \"b.example\"\n[[images]]\nname = \"both\"\nurl = \"https://x/a\"\noci = \"quay.io/x/a\"",
+            "exactly one",
+        );
+        parse_err(
+            "base_domain = \"b.example\"\n[bootc]\nrootfs = \"zfs\"",
+            "rootfs",
         );
         parse_err(
             "base_domain = \"b.example\"\n[[images]]\nname = \"a\"\nurl = \"https://x/a\"\n\

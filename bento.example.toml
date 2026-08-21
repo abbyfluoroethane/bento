@@ -49,6 +49,15 @@ base_domain = "bento.example.org"
 # as the database download (SPEC 12.1).
 operators = []
 
+[bootc]
+# Bento runs image-builder as a privileged Podman container to turn a
+# bootc-compatible OCI image into qcow2. Pin this by digest in production.
+#builder_image = "ghcr.io/osbuild/image-builder-cli:latest"
+# Filesystem fallback for images such as Fedora that do not declare one.
+#rootfs = "ext4"
+# Rootful Podman storage shared read-write with the builder container.
+#container_storage = "/var/lib/containers/storage"
+
 [listen]
 # Control plane (dashboard and API), reached through the HTTP proxy.
 # Keep this port outside the proxy port range below: the proxy binds
@@ -106,3 +115,9 @@ allow_signup = true
 name = "debian-13"
 url = "https://cloud.debian.org/images/cloud/trixie/latest/debian-13-genericcloud-amd64.qcow2"
 #pinned_checksum = "sha256-..."
+
+# Bootc-compatible OCI operating-system images use `oci` instead of `url`.
+# Operators can append the same kind of entry at runtime from SSH or the UI.
+#[[images]]
+#name = "fedora-bootc"
+#oci = "quay.io/fedora/fedora-bootc:latest"

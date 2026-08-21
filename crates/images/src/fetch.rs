@@ -1,11 +1,14 @@
 use std::collections::HashSet;
 use std::os::unix::fs::PermissionsExt;
 
-use bento_types::{Image, ImageVersion};
+use std::ffi::OsString;
+use std::path::{Path, PathBuf};
+
+use bento_types::{Image, ImageKind, ImageVersion};
 use futures::StreamExt;
 use reqwest::{Method, Request, Url};
 use sha2::{Digest, Sha256};
-use tempfile::Builder;
+use tempfile::{Builder, TempPath};
 use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt;
 
@@ -46,10 +49,67 @@ impl Store {
         joined(errors)
     }
 
+    /// Adds a bootc-compatible OCI image to the durable allowlist and builds
+    /// its qcow2 version immediately. The row remains visible with no current
+    /// version if the build fails, so an operator can retry `fetch-images`.
+    pub async fn add_oci_image(&self, name: &str, reference: &str) -> Result<()> {
+        validate_image_name(name)?;
+        validate_oci_reference(reference)?;
+        let image = Image {
+            name: name.to_owned(),
+            url: reference.to_owned(),
+            kind: ImageKind::Oci,
+            pinned_checksum: None,
+            current_checksum: None,
+        };
+        let inserted = self
+            .db
+            .insert_image(image.clone())
+            .await
+            .map_err(|error| dependency("append OCI image to allowlist", error))?;
+        if !inserted {
+            let existing = self
+                .db
+                .images()
+                .await
+                .map_err(|error| dependency("read existing allowlist entry", error))?
+                .into_iter()
+                .find(|existing| existing.name == name);
+            if let Some(existing) = existing
+                && existing.kind == ImageKind::Oci
+                && existing.url == reference
+            {
+                // A failed first build leaves the durable allowlist entry in
+                // place. Re-submitting the same entry is therefore a retry.
+                return self.fetch_one(existing).await;
+            }
+            return Err(Error::Invalid(format!(
+                "image name {name:?} is already on the allowlist with a different source"
+            )));
+        }
+        self.fetch_one(image).await
+    }
+
+    /// Refreshes one named allowlist entry.
+    pub async fn fetch_named(&self, name: &str) -> Result<()> {
+        let image = self
+            .db
+            .images()
+            .await
+            .map_err(|error| dependency("list allowlist", error))?
+            .into_iter()
+            .find(|image| image.name == name)
+            .ok_or_else(|| Error::Invalid(format!("unknown image {name:?}")))?;
+        self.fetch_one(image).await
+    }
+
     /// Runs steps 1-7 of SPEC section 5.1 for one image. The download and
     /// checksum run without the store lock; the lock is taken only for the
     /// version-creation steps 4-7 (SPEC section 19).
     async fn fetch_one(&self, image: Image) -> Result<()> {
+        if image.kind == ImageKind::Oci {
+            return self.fetch_oci(image).await;
+        }
         // 1. Download the file from the URL, streaming into a temporary file
         // in the image directory so the final rename is atomic.
         let url = Url::parse(&image.url)
@@ -150,6 +210,7 @@ impl Store {
                 image_name: image.name.clone(),
                 path: path.display().to_string(),
                 size,
+                source_digest: None,
                 fetched_at: OffsetDateTime::now_utc(),
             })
             .await
@@ -174,6 +235,168 @@ impl Store {
             .set_current_checksum(&image.name, &checksum)
             .await
             .map_err(|error| dependency("mark current", error))?;
+        Ok(())
+    }
+
+    async fn fetch_oci(&self, image: Image) -> Result<()> {
+        validate_oci_reference(&image.url)?;
+        tokio::fs::create_dir_all(&self.dir)
+            .await
+            .map_err(|error| io_error("create image directory", error))?;
+        let podman = self.podman.to_string_lossy();
+        run(
+            self,
+            &podman,
+            "podman pull",
+            &[
+                OsString::from("pull"),
+                OsString::from("--quiet"),
+                OsString::from("--policy=always"),
+                OsString::from("--"),
+                OsString::from(&image.url),
+            ],
+        )
+        .await?;
+        let digest_output = run(
+            self,
+            &podman,
+            "podman inspect",
+            &[
+                OsString::from("image"),
+                OsString::from("inspect"),
+                OsString::from("--format={{.Digest}}"),
+                OsString::from("--"),
+                OsString::from(&image.url),
+            ],
+        )
+        .await?;
+        let digest_text = String::from_utf8_lossy(&digest_output);
+        let digest = format!(
+            "sha256:{}",
+            normalize_checksum(digest_text.trim()).map_err(|error| {
+                Error::Invalid(format!("podman returned no usable OCI digest: {error}"))
+            })?
+        );
+
+        // A previous successful conversion of this exact OCI digest is the
+        // cache. Moving tags are pulled and inspected before this comparison.
+        if let Some(version) = self
+            .db
+            .image_versions()
+            .await
+            .map_err(|error| dependency("list image versions", error))?
+            .into_iter()
+            .find(|version| {
+                version.image_name == image.name
+                    && version.source_digest.as_deref() == Some(digest.as_str())
+            })
+            && tokio::fs::metadata(&version.path).await.is_ok()
+        {
+            self.db
+                .set_current_checksum(&image.name, &version.checksum)
+                .await
+                .map_err(|error| dependency("mark cached OCI build current", error))?;
+            return Ok(());
+        }
+
+        let output = Builder::new()
+            .prefix("bootc-output-")
+            .tempdir_in(&self.dir)
+            .map_err(|error| io_error("create bootc output directory", error))?;
+        let output_mount = format!("{}:/output", output.path().display());
+        let storage_mount = format!(
+            "{}:/var/lib/containers/storage",
+            self.container_storage.display()
+        );
+        run(
+            self,
+            &podman,
+            "image-builder",
+            &[
+                OsString::from("run"),
+                OsString::from("--rm"),
+                OsString::from("--privileged"),
+                OsString::from("--security-opt"),
+                OsString::from("label=type:unconfined_t"),
+                OsString::from("-v"),
+                OsString::from(output_mount),
+                OsString::from("-v"),
+                OsString::from(storage_mount),
+                OsString::from(&self.builder_image),
+                OsString::from("build"),
+                OsString::from("--bootc-ref"),
+                OsString::from(&image.url),
+                OsString::from("--bootc-default-fs"),
+                OsString::from(&self.bootc_rootfs),
+                OsString::from("qcow2"),
+            ],
+        )
+        .await?;
+        let disk = find_single_qcow2(output.path())?;
+        let temporary = Builder::new()
+            .prefix("bootc-disk-")
+            .tempfile_in(&self.dir)
+            .map_err(|error| io_error("create bootc disk staging file", error))?;
+        tokio::fs::copy(&disk, temporary.path())
+            .await
+            .map_err(|error| io_error("copy image-builder qcow2", error))?;
+        let (file, temporary_path) = temporary.into_parts();
+        drop(file);
+        let (checksum, size) = hash_file(&temporary_path).await?;
+        self.commit_generated(image, temporary_path, checksum, size, digest)
+            .await
+    }
+
+    async fn commit_generated(
+        &self,
+        image: Image,
+        temporary_path: TempPath,
+        checksum: String,
+        size: i64,
+        source_digest: String,
+    ) -> Result<()> {
+        if let Some(pinned_checksum) = &image.pinned_checksum
+            && normalize_checksum(pinned_checksum)? != checksum
+        {
+            return Err(Error::Invalid(format!(
+                "checksum mismatch: pinned {pinned_checksum}, built {checksum}"
+            )));
+        }
+        let _guard = self.acquire_lock().await?;
+        if self
+            .db
+            .has_image_version(&checksum)
+            .await
+            .map_err(|error| dependency("check existing generated version", error))?
+        {
+            self.db
+                .set_current_checksum(&image.name, &checksum)
+                .await
+                .map_err(|error| dependency("mark generated version current", error))?;
+            return Ok(());
+        }
+        tokio::fs::set_permissions(&temporary_path, std::fs::Permissions::from_mode(0o444))
+            .await
+            .map_err(|error| io_error("chmod generated image", error))?;
+        let path = self.path_normalized(&checksum);
+        temporary_path
+            .persist(&path)
+            .map_err(|error| io_error(format!("store at {}", path.display()), error.error))?;
+        self.db
+            .insert_image_version(ImageVersion {
+                checksum: checksum.clone(),
+                image_name: image.name.clone(),
+                path: path.display().to_string(),
+                size,
+                source_digest: Some(source_digest),
+                fetched_at: OffsetDateTime::now_utc(),
+            })
+            .await
+            .map_err(|error| dependency("insert generated image version", error))?;
+        self.db
+            .set_current_checksum(&image.name, &checksum)
+            .await
+            .map_err(|error| dependency("mark generated version current", error))?;
         Ok(())
     }
 
@@ -242,13 +465,123 @@ impl Store {
     }
 }
 
+fn validate_image_name(name: &str) -> Result<()> {
+    let valid_edge = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    let bytes = name.as_bytes();
+    if bytes.is_empty()
+        || bytes.len() > 63
+        || !valid_edge(bytes[0])
+        || !valid_edge(bytes[bytes.len() - 1])
+        || !bytes.iter().all(|byte| valid_edge(*byte) || *byte == b'-')
+    {
+        return Err(Error::Invalid(
+            "image name must be a lower-case DNS label".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_oci_reference(reference: &str) -> Result<()> {
+    let valid_character = |character: char| {
+        character.is_ascii_alphanumeric()
+            || matches!(
+                character,
+                '.' | '_' | '-' | '/' | ':' | '@' | '+' | '[' | ']'
+            )
+    };
+    if reference.is_empty()
+        || reference.len() > 2048
+        || !reference
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_alphanumeric() || first == '[')
+        || !reference.chars().all(valid_character)
+    {
+        return Err(Error::Invalid(
+            "OCI image reference is not a valid option-safe registry reference".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+async fn run(
+    store: &Store,
+    program: &str,
+    context: &'static str,
+    args: &[OsString],
+) -> Result<Vec<u8>> {
+    store.runner.run(program, args).await.map_err(|error| {
+        let (source, output) = error.into_parts();
+        Error::Command {
+            context,
+            source,
+            output: String::from_utf8_lossy(&output).into_owned(),
+        }
+    })
+}
+
+async fn hash_file(path: &Path) -> Result<(String, i64)> {
+    let mut file = tokio::fs::File::open(path)
+        .await
+        .map_err(|error| io_error("open generated qcow2", error))?;
+    let mut hash = Sha256::new();
+    let mut size = 0_i64;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    loop {
+        let read = tokio::io::AsyncReadExt::read(&mut file, &mut buffer)
+            .await
+            .map_err(|error| io_error("read generated qcow2", error))?;
+        if read == 0 {
+            break;
+        }
+        hash.update(&buffer[..read]);
+        size = size
+            .checked_add(i64::try_from(read).unwrap_or(i64::MAX))
+            .ok_or_else(|| Error::Invalid("generated image exceeds i64 size".to_owned()))?;
+    }
+    Ok((hex::encode(hash.finalize()), size))
+}
+
+fn find_single_qcow2(root: &Path) -> Result<PathBuf> {
+    fn visit(directory: &Path, found: &mut Vec<PathBuf>) -> std::io::Result<()> {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let path = entry.path();
+            if entry.file_type()?.is_dir() {
+                visit(&path, found)?;
+            } else if path
+                .extension()
+                .is_some_and(|extension| extension == "qcow2")
+            {
+                found.push(path);
+            }
+        }
+        Ok(())
+    }
+    let mut found = Vec::new();
+    visit(root, &mut found).map_err(|error| io_error("scan image-builder output", error))?;
+    match found.as_slice() {
+        [disk] => Ok(disk.clone()),
+        [] => Err(Error::Invalid(
+            "image-builder produced no qcow2 artifact".to_owned(),
+        )),
+        _ => Err(Error::Invalid(format!(
+            "image-builder produced {} qcow2 artifacts; expected one",
+            found.len()
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::ffi::OsString;
     use std::fs::Permissions;
+    use std::io;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::{Arc, Mutex};
 
+    use async_trait::async_trait;
     use bento_types::{Image, ImageVersion};
 
     use super::*;
@@ -260,6 +593,133 @@ mod tests {
         (store, temp)
     }
 
+    type RunnerCalls = Vec<(String, Vec<OsString>)>;
+
+    #[derive(Clone, Default)]
+    struct OciRunner(Arc<Mutex<RunnerCalls>>);
+
+    impl OciRunner {
+        fn calls(&self) -> Vec<(String, Vec<OsString>)> {
+            self.0.lock().expect("runner calls").clone()
+        }
+    }
+
+    #[async_trait]
+    impl crate::Runner for OciRunner {
+        async fn run(
+            &self,
+            name: &str,
+            args: &[OsString],
+        ) -> std::result::Result<Vec<u8>, crate::RunError> {
+            self.0
+                .lock()
+                .expect("runner calls")
+                .push((name.to_owned(), args.to_vec()));
+            if args.first().is_some_and(|arg| arg == "image") {
+                return Ok(format!("sha256:{}\n", "ab".repeat(32)).into_bytes());
+            }
+            if args.first().is_some_and(|arg| arg == "run") {
+                let mount = args
+                    .iter()
+                    .find_map(|arg| arg.to_str().and_then(|text| text.strip_suffix(":/output")))
+                    .ok_or_else(|| {
+                        crate::RunError::new(io::Error::other("missing output mount"), vec![])
+                    })?;
+                let artifact = Path::new(mount).join("qcow2/disk.qcow2");
+                std::fs::create_dir_all(artifact.parent().expect("artifact parent"))
+                    .map_err(|error| crate::RunError::new(error, vec![]))?;
+                std::fs::write(artifact, b"bootc-qcow2")
+                    .map_err(|error| crate::RunError::new(error, vec![]))?;
+            }
+            Ok(Vec::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn add_oci_image_persists_builds_and_caches_by_source_digest() {
+        let db = FakeDb::new();
+        let runner = OciRunner::default();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = Store::new(temp.path(), db.clone())
+            .with_runner(runner.clone())
+            .with_podman("test-podman")
+            .with_builder_image("builder.example/image-builder@sha256:123")
+            .with_bootc_rootfs("xfs")
+            .with_container_storage("/test/containers");
+
+        store
+            .add_oci_image("fedora-bootc", "quay.io/fedora/fedora-bootc:latest")
+            .await
+            .expect("add OCI image");
+
+        let image = &db.images_snapshot()[0];
+        assert_eq!(image.name, "fedora-bootc");
+        assert_eq!(image.kind, ImageKind::Oci);
+        assert!(image.current_checksum.is_some());
+        let inserted = db.inserted();
+        assert_eq!(inserted.len(), 1);
+        assert_eq!(inserted[0].size, 11);
+        assert_eq!(
+            inserted[0].source_digest,
+            Some(format!("sha256:{}", "ab".repeat(32)))
+        );
+        assert_eq!(
+            std::fs::read(&inserted[0].path).expect("generated qcow2"),
+            b"bootc-qcow2"
+        );
+        let calls = runner.calls();
+        assert_eq!(calls.len(), 3);
+        assert!(calls.iter().all(|call| call.0 == "test-podman"));
+        let build = &calls[2].1;
+        assert!(build.contains(&OsString::from("builder.example/image-builder@sha256:123")));
+        assert!(build.contains(&OsString::from(
+            "/test/containers:/var/lib/containers/storage"
+        )));
+        assert!(
+            build
+                .windows(2)
+                .any(|args| args == ["--bootc-default-fs", "xfs"])
+        );
+
+        store
+            .fetch_named("fedora-bootc")
+            .await
+            .expect("reuse OCI build");
+        assert_eq!(db.inserted().len(), 1);
+        assert_eq!(runner.calls().len(), 5, "cache skips the builder command");
+
+        let error = store
+            .add_oci_image("fedora-bootc", "quay.io/example/different:latest")
+            .await
+            .expect_err("duplicate allowlist name");
+        assert!(error.to_string().contains("already on the allowlist"));
+        assert_eq!(runner.calls().len(), 5, "duplicate is rejected before pull");
+    }
+
+    #[tokio::test]
+    async fn add_oci_image_validates_before_persisting_or_running() {
+        let db = FakeDb::new();
+        let runner = OciRunner::default();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = Store::new(temp.path(), db.clone()).with_runner(runner.clone());
+
+        let error = store
+            .add_oci_image("Not Valid", "quay.io/example/os:latest")
+            .await
+            .expect_err("invalid name");
+        assert!(error.to_string().contains("DNS label"));
+        assert!(db.images_snapshot().is_empty());
+        assert!(runner.calls().is_empty());
+
+        let error = store
+            .add_oci_image("valid", "--authfile=/root/secret")
+            .await
+            .expect_err("option-like reference");
+        assert!(error.to_string().contains("option-safe"));
+        assert!(db.images_snapshot().is_empty());
+        assert!(runner.calls().is_empty());
+    }
+
     #[tokio::test]
     async fn fetch_images_stores_new_version() {
         let content = "debian-13-content";
@@ -268,6 +728,7 @@ mod tests {
         db.set_images(vec![Image {
             name: "debian-13".into(),
             url: "https://img.example/d13.qcow2".into(),
+            kind: Default::default(),
             pinned_checksum: None,
             current_checksum: None,
         }]);
@@ -318,6 +779,7 @@ mod tests {
         db.set_images(vec![Image {
             name: "pinned-img".into(),
             url: "https://img.example/p.qcow2".into(),
+            kind: Default::default(),
             pinned_checksum: Some(pinned.clone()),
             current_checksum: None,
         }]);
@@ -343,6 +805,7 @@ mod tests {
         db.set_images(vec![Image {
             name: "pinned-img".into(),
             url: "https://img.example/p.qcow2".into(),
+            kind: Default::default(),
             pinned_checksum: Some(format!("sha256:{}", checksum.to_uppercase())),
             current_checksum: None,
         }]);
@@ -362,6 +825,7 @@ mod tests {
         db.set_images(vec![Image {
             name: "debian-13".into(),
             url: "https://img.example/d13.qcow2".into(),
+            kind: Default::default(),
             pinned_checksum: None,
             current_checksum: Some(checksum.clone()),
         }]);
@@ -370,6 +834,7 @@ mod tests {
             image_name: "debian-13".into(),
             path: String::new(),
             size: 0,
+            source_digest: None,
             fetched_at: OffsetDateTime::UNIX_EPOCH,
         });
         let (store, _temp) = new_test_store(
@@ -390,6 +855,7 @@ mod tests {
         db.set_images(vec![Image {
             name: "debian-13".into(),
             url: "https://img.example/d13.qcow2".into(),
+            kind: Default::default(),
             pinned_checksum: None,
             current_checksum: Some(old_checksum.clone()),
         }]);
@@ -398,6 +864,7 @@ mod tests {
             image_name: "debian-13".into(),
             path: String::new(),
             size: 0,
+            source_digest: None,
             fetched_at: OffsetDateTime::UNIX_EPOCH,
         });
         db.set_in_use(&old_checksum, true);
@@ -428,12 +895,14 @@ mod tests {
             Image {
                 name: "broken".into(),
                 url: "https://img.example/broken.qcow2".into(),
+                kind: Default::default(),
                 pinned_checksum: None,
                 current_checksum: None,
             },
             Image {
                 name: "fine".into(),
                 url: "https://img.example/fine.qcow2".into(),
+                kind: Default::default(),
                 pinned_checksum: None,
                 current_checksum: None,
             },
@@ -468,6 +937,7 @@ mod tests {
         db.set_images(vec![Image {
             name: "debian-13".into(),
             url: "https://img.example/d13.qcow2".into(),
+            kind: Default::default(),
             pinned_checksum: None,
             current_checksum: None,
         }]);
@@ -476,6 +946,7 @@ mod tests {
             image_name: "debian-13".into(),
             path: String::new(),
             size: 0,
+            source_digest: None,
             fetched_at: OffsetDateTime::UNIX_EPOCH,
         });
         db.set_in_use(&existing_checksum, true);
@@ -526,6 +997,7 @@ mod tests {
         db.set_images(vec![Image {
             name: "debian-13".into(),
             url: "https://img.example/d13.qcow2".into(),
+            kind: Default::default(),
             pinned_checksum: None,
             current_checksum: Some(current.clone()),
         }]);
@@ -535,6 +1007,7 @@ mod tests {
                 image_name: "debian-13".into(),
                 path: String::new(),
                 size: 0,
+                source_digest: None,
                 fetched_at: OffsetDateTime::UNIX_EPOCH,
             });
         }

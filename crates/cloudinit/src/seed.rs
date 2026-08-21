@@ -27,6 +27,10 @@ pub struct Seed {
     pub gateway: String,
     /// The DNS server address.
     pub dns: String,
+    /// Traditional cloud images install the guest agent on first boot.
+    /// Bootc images must bake packages into the OCI image because `/usr` is
+    /// read-only after deployment.
+    pub install_guest_agent: bool,
 }
 
 impl Seed {
@@ -114,9 +118,11 @@ impl Seed {
         for key in &self.authorized_keys {
             writeln!(rendered, "      - {}", quote(key.trim())).unwrap();
         }
-        rendered.push_str("package_update: true\n");
-        rendered.push_str("packages:\n");
-        rendered.push_str("  - qemu-guest-agent\n");
+        if self.install_guest_agent {
+            rendered.push_str("package_update: true\n");
+            rendered.push_str("packages:\n");
+            rendered.push_str("  - qemu-guest-agent\n");
+        }
         rendered.push_str("runcmd:\n");
         rendered.push_str("  - [systemctl, enable, --now, qemu-guest-agent]\n");
         Ok(rendered)
@@ -269,6 +275,7 @@ pub(crate) mod tests {
             address_cidr: "10.20.3.5/24".to_string(),
             gateway: "10.20.3.1".to_string(),
             dns: "10.20.3.1".to_string(),
+            install_guest_agent: true,
         }
     }
 

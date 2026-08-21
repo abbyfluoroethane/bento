@@ -1,6 +1,6 @@
 use bento_cloudinit::Seed;
 use bento_network::GuestNetwork;
-use bento_types::{DesiredState, Instance, State, User, Visibility};
+use bento_types::{DesiredState, ImageKind, Instance, State, User, Visibility};
 
 use crate::fs::remove_file;
 use crate::manager::{AddressView, parse_prefix};
@@ -114,7 +114,7 @@ impl Manager {
                     .await);
             }
         };
-        let seed = seed(&instance, &request, &guest);
+        let seed = seed(&instance, &request, &guest, image.kind != ImageKind::Oci);
         if let Err(error) = self.iso.build(&seed, &self.seed_iso_path(&uuid)).await {
             return Err(self.unwind_new(&instance, error, true, false).await);
         }
@@ -169,7 +169,12 @@ impl Manager {
     }
 }
 
-pub(crate) fn seed(instance: &Instance, request: &NewRequest, guest: &GuestNetwork) -> Seed {
+pub(crate) fn seed(
+    instance: &Instance,
+    request: &NewRequest,
+    guest: &GuestNetwork,
+    install_guest_agent: bool,
+) -> Seed {
     Seed {
         instance_id: instance.uuid.clone(),
         hostname: request.name.clone(),
@@ -179,5 +184,6 @@ pub(crate) fn seed(instance: &Instance, request: &NewRequest, guest: &GuestNetwo
         address_cidr: format!("{}/{}", guest.address.addr, guest.address.bits),
         gateway: guest.gateway.to_string(),
         dns: guest.dns[0].to_string(),
+        install_guest_agent,
     }
 }

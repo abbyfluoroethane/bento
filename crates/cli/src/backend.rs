@@ -42,6 +42,12 @@ pub trait Store: Send + Sync {
     async fn images(&self) -> Result<Vec<Image>, BoxError>;
 }
 
+/// Operator-only mutations of the persistent image allowlist.
+#[async_trait]
+pub trait ImageAdmin: Send + Sync {
+    async fn add_oci_image(&self, name: &str, reference: &str) -> Result<(), BoxError>;
+}
+
 #[async_trait]
 impl Store for bento_store::Store {
     async fn user_by_id(&self, id: i64) -> Result<User, BoxError> {

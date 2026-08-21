@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::adapters::{
     ApiBackend, ApiStore, AuthAccess, AuthPairings, AuthTokens, AuthUsers, Authenticator, Backend,
-    NetworkEnsurer, Provisioner, access_status, operator_predicate, user_network,
+    NetworkEnsurer, Provisioner, RuntimeImages, access_status, operator_predicate, user_network,
 };
 use crate::firewall::Firewall;
 use crate::keys::{FRONTEND_KEY_FILE, authorized_key_line, ensure_key, key_path};
@@ -336,6 +336,7 @@ async fn control_plane_router(
             store: app.store.clone(),
         }),
         is_operator: Some(Arc::new(move |user| operators.contains(&user.name))),
+        image_admin: Some(Arc::new(RuntimeImages(app.image_store()))),
         db_path: app.cfg.db_path.clone(),
     });
 

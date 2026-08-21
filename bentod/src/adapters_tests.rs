@@ -154,6 +154,7 @@ impl Env {
             .upsert_image(Image {
                 name: "debian-13".into(),
                 url: "https://example.test/debian-13".into(),
+                kind: Default::default(),
                 pinned_checksum: None,
                 current_checksum: None,
             })
@@ -165,6 +166,7 @@ impl Env {
                 image_name: "debian-13".into(),
                 path: "/var/lib/bento/images/sha256-aa11.qcow2".into(),
                 size: 1,
+                source_digest: None,
                 fetched_at: OffsetDateTime::now_utc(),
             })
             .await
