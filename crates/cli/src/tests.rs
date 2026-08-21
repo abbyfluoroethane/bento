@@ -32,6 +32,20 @@ struct StoreData {
 #[derive(Default)]
 struct FakeStore(Mutex<StoreData>);
 
+#[derive(Default)]
+struct FakeImageAdmin(Mutex<Vec<(String, String)>>);
+
+#[async_trait]
+impl ImageAdmin for FakeImageAdmin {
+    async fn add_oci_image(&self, name: &str, reference: &str) -> Result<(), BoxError> {
+        self.0
+            .lock()
+            .unwrap()
+            .push((name.to_owned(), reference.to_owned()));
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl Store for FakeStore {
     async fn user_by_id(&self, id: i64) -> Result<User, BoxError> {
@@ -827,12 +841,14 @@ async fn images_output() {
         Image {
             name: "ubuntu-lts".into(),
             url: "https://example.org/u".into(),
+            kind: Default::default(),
             pinned_checksum: None,
             current_checksum: Some("ccc".into()),
         },
         Image {
             name: "debian-13".into(),
             url: "https://example.org/d".into(),
+            kind: Default::default(),
             pinned_checksum: None,
             current_checksum: Some("aaa".into()),
         },
@@ -841,10 +857,47 @@ async fn images_output() {
     assert_eq!(code, 0, "{error}");
     assert_eq!(
         output,
-        "NAME        CURRENT CHECKSUM  ON OLDER VERSIONS\n\
-debian-13   aaa               1\n\
-ubuntu-lts  ccc               0\n"
+        "NAME        KIND   SOURCE                 CURRENT CHECKSUM  ON OLDER VERSIONS\n\
+debian-13   qcow2  https://example.org/d  aaa               1\n\
+ubuntu-lts  qcow2  https://example.org/u  ccc               0\n"
     );
+}
+
+#[tokio::test]
+async fn only_operators_can_append_oci_images() {
+    let (store, lifecycle, _) = fixture();
+    let admin = Arc::new(FakeImageAdmin::default());
+    let cli = Cli::new(
+        store,
+        lifecycle,
+        Options {
+            is_operator: Some(Arc::new(|user| user.id == 1)),
+            ..Options::default()
+        },
+    )
+    .with_image_admin(admin.clone());
+    let args = [
+        "images",
+        "add",
+        "fedora-bootc",
+        "quay.io/fedora/fedora-bootc:latest",
+    ];
+
+    let (code, output, error) = run(&cli, user(1, "alice"), "", &args).await;
+    assert_eq!(code, 0, "{error}");
+    assert!(output.contains("images: added fedora-bootc"));
+    assert_eq!(
+        *admin.0.lock().unwrap(),
+        vec![(
+            "fedora-bootc".to_owned(),
+            "quay.io/fedora/fedora-bootc:latest".to_owned()
+        )]
+    );
+
+    let (code, _, error) = run(&cli, user(2, "bob"), "", &args).await;
+    assert_eq!(code, 1);
+    assert!(error.contains("operator only"));
+    assert_eq!(admin.0.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

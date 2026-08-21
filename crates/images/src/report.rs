@@ -86,6 +86,7 @@ mod tests {
         Image {
             name: name.into(),
             url: String::new(),
+            kind: Default::default(),
             pinned_checksum: None,
             current_checksum: checksum.map(str::to_owned),
         }

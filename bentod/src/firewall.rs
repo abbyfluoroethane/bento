@@ -167,6 +167,7 @@ pub(crate) mod tests {
             .upsert_image(Image {
                 name: "debian-13".into(),
                 url: "https://example.test/image".into(),
+                kind: Default::default(),
                 pinned_checksum: None,
                 current_checksum: None,
             })
@@ -178,6 +179,7 @@ pub(crate) mod tests {
                 image_name: "debian-13".into(),
                 path: "/images/aa11".into(),
                 size: 1,
+                source_digest: None,
                 fetched_at: OffsetDateTime::now_utc(),
             })
             .await

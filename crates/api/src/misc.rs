@@ -183,6 +183,7 @@ pub(crate) async fn handle_whoami(
 pub(crate) struct ImageJson {
     pub(crate) name: String,
     pub(crate) url: String,
+    pub(crate) kind: String,
     pub(crate) pinned_checksum: String,
     pub(crate) current_checksum: String,
     /// Counts instances built from a version that is no longer current
@@ -226,11 +227,46 @@ pub(crate) async fn list_images(
             instances_on_older_versions: older.get(&image.name).copied().unwrap_or_default(),
             name: image.name,
             url: image.url,
+            kind: image.kind.as_str().to_owned(),
             pinned_checksum: image.pinned_checksum.unwrap_or_default(),
             current_checksum: image.current_checksum.unwrap_or_default(),
         })
         .collect();
     json_response(StatusCode::OK, &response)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct AddImageRequest {
+    name: String,
+    reference: String,
+}
+
+pub(crate) async fn add_image(
+    State(state): State<AppState>,
+    Extension(user): Extension<User>,
+    request: Request<Body>,
+) -> Response {
+    if !is_operator(&state, &user) {
+        return error_response(StatusCode::FORBIDDEN, "operator only");
+    }
+    let request: AddImageRequest = match decode_json(request).await {
+        Ok(request) => request,
+        Err(response) => return *response,
+    };
+    let Some(admin) = &state.0.image_admin else {
+        return error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "runtime image management is unavailable",
+        );
+    };
+    match admin.add_oci_image(&request.name, &request.reference).await {
+        Ok(()) => json_response(
+            StatusCode::CREATED,
+            &serde_json::json!({ "name": request.name }),
+        ),
+        Err(error) => mapped_error(error),
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

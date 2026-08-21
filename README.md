@@ -24,6 +24,8 @@ leaves out.
 local socket at `qemu:///system`, `qemu-img`, `xorriso`, and `nft` on
 `PATH`. Run `bentod` as a user in the `libvirt` group. `bentod serve`
 refuses to start if a requirement is missing (SPEC 4.2).
+Bootc OCI sources additionally require rootful Podman; Bento runs the
+configured image-builder container privileged to produce qcow2 disks.
 
 **Config** — copy [`bento.example.toml`](bento.example.toml) to
 `/etc/bento/bento.toml` and set at least `base_domain`, the `[acme]`
@@ -57,6 +59,17 @@ and libvirt network (SPEC 13). To use the command line, they then run
 it prints, and confirm the fingerprint shown. Set `allow_signup = false`
 under `[oidc]` to freeze the user list. Grant quota with a `quotas` row.
 Names listed in `operators` in the config get the database download.
+They can also append bootc-compatible OCI OS images while Bento is
+running, either from the Images dashboard or over SSH:
+
+```
+ssh bento.example.org images add fedora-bootc quay.io/fedora/fedora-bootc:latest
+```
+
+The command pulls and builds immediately, and the durable database row
+survives process restarts. An OCI source must be a bootable OS image with
+`cloud-init` and `qemu-guest-agent` baked in; ordinary application
+containers are not bootable by Bento.
 
 ## Development quickstart
 

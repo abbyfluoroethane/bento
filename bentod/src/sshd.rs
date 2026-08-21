@@ -8,7 +8,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use bento_network::{NftApplier, PortRange};
 
-use crate::adapters::{Backend, CliBackend, CliRunner, Linker, Starter};
+use crate::adapters::{Backend, CliBackend, CliRunner, Linker, RuntimeImages, Starter};
 use crate::firewall::Firewall;
 use crate::keys::{FRONTEND_KEY_FILE, HOST_KEY_FILE, authorized_key_line, ensure_key, key_path};
 use crate::setup::{App, default_image, shutdown_signal};
@@ -54,19 +54,24 @@ async fn sshd_inner(app: &App) -> Result<()> {
         frontend_key: frontend_public,
         firewall: Some(firewall.clone()),
     }));
-    let cli = Arc::new(bento_cli::Cli::new(
-        Arc::new(app.store.clone()),
-        lifecycle,
-        bento_cli::Options {
-            domain: app.cfg.base_domain.clone(),
-            default_image: default_image(&app.cfg),
-            default_vcpu: app.cfg.defaults.vcpu,
-            default_memory_mib: app.cfg.defaults.memory_mib,
-            default_disk_gib: app.cfg.defaults.disk_gib,
-            name_cooldown: app.cfg.cooldown(),
-            ..Default::default()
-        },
-    ));
+    let operators = Arc::new(crate::adapters::operator_predicate(&app.cfg.operators));
+    let cli = Arc::new(
+        bento_cli::Cli::new(
+            Arc::new(app.store.clone()),
+            lifecycle,
+            bento_cli::Options {
+                domain: app.cfg.base_domain.clone(),
+                default_image: default_image(&app.cfg),
+                default_vcpu: app.cfg.defaults.vcpu,
+                default_memory_mib: app.cfg.defaults.memory_mib,
+                default_disk_gib: app.cfg.defaults.disk_gib,
+                name_cooldown: app.cfg.cooldown(),
+                is_operator: Some(Arc::new(move |user| operators.contains(&user.name))),
+                ..Default::default()
+            },
+        )
+        .with_image_admin(Arc::new(RuntimeImages(app.image_store()))),
+    );
     let mut server = bento_sshfront::Server::new(
         Arc::new(app.store.clone()),
         Arc::new(app.store.clone()),

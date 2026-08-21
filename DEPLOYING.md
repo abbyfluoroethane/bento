@@ -21,6 +21,13 @@ On Fedora, `libvirt-daemon-kvm`, `qemu-img`, `xorriso`, and `nftables`
 cover it. KSM is a warning, not a requirement; enable it or run
 `ksmtuned` if you want the SPEC 5.4 memory sharing.
 
+Bootc OCI images additionally need rootful Podman. Bento pulls the OCI
+image into `/var/lib/containers/storage` and runs the configured
+image-builder container with `--privileged`, so budget substantial disk
+space in that filesystem and `/tmp`. Pin `bootc.builder_image` by digest
+in production; the example's `:latest` default is convenient, not
+reproducible.
+
 Bento needs root: it runs `nft`, and by default binds ports 22 and 443.
 
 ### Modular libvirt daemons
@@ -151,6 +158,44 @@ checksum. Instances cannot be created until it has run: the allowlist
 row alone is not enough, the image needs a fetched version.
 `bentod images` lists what is stored, with the current checksum of each
 allowlist entry and how many instances still run an older one.
+
+### Bootc OCI images
+
+A static allowlist entry uses `oci` in place of `url`:
+
+```toml
+[bootc]
+builder_image = "ghcr.io/osbuild/image-builder-cli@sha256:<digest>"
+rootfs = "ext4"
+container_storage = "/var/lib/containers/storage"
+
+[[images]]
+name = "fedora-bootc"
+oci = "quay.io/fedora/fedora-bootc:latest"
+```
+
+`bentod fetch-images` pulls the source, resolves its registry digest,
+and converts it to qcow2. A moving tag is rebuilt only when that source
+digest changes. The output then follows the same content-addressed
+storage and overlay path as downloaded qcow2 images.
+
+Names in `operators` may append an OCI entry without editing TOML or
+restarting a process. Use the Images dashboard or:
+
+```
+ssh bento.example.org images add fedora-bootc quay.io/fedora/fedora-bootc:latest
+```
+
+The request waits for the build, which can take several minutes. A failed
+build leaves the allowlist row in the database; submit the identical name
+and reference again to retry, or run `bentod fetch-images`. Reusing a name
+for a different source is rejected.
+
+Only bootc-compatible operating-system images are accepted. They must
+contain a kernel plus `cloud-init` with the NoCloud data source and must
+bake in `qemu-guest-agent`; Bento cannot install packages into immutable
+`/usr` during first boot. Ordinary OCI application images do not satisfy
+this contract.
 
 ## 5. Behind an existing TLS terminator
 

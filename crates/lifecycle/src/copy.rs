@@ -1,6 +1,6 @@
 use bento_hypervisor::Error as HypervisorError;
 use bento_network::GuestNetwork;
-use bento_types::{DesiredState, Instance, State, Visibility};
+use bento_types::{DesiredState, ImageKind, Instance, State, Visibility};
 
 use crate::fs::copy_file;
 use crate::manager::{AddressView, parse_prefix};
@@ -15,6 +15,11 @@ impl Manager {
         let source = self
             .store
             .instance(source_uuid)
+            .await
+            .map_err(crate::actions::external)?;
+        let source_image = self
+            .store
+            .image(&source.image_name)
             .await
             .map_err(crate::actions::external)?;
         if request.name.is_empty() {
@@ -107,7 +112,12 @@ impl Manager {
                     .await);
             }
         };
-        let cloud_seed = seed(&instance, &request, &guest);
+        let cloud_seed = seed(
+            &instance,
+            &request,
+            &guest,
+            source_image.kind != ImageKind::Oci,
+        );
         if let Err(error) = self
             .iso
             .build(&cloud_seed, &self.seed_iso_path(&uuid))

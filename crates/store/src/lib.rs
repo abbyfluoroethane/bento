@@ -178,7 +178,33 @@ fn open_connection(path: &Path) -> Result<Connection> {
     conn.pragma_update(None, "foreign_keys", true)?;
     conn.busy_timeout(Duration::from_millis(5000))?;
     conn.execute_batch(SCHEMA_SQL)?;
+    migrate_image_sources(&conn)?;
     Ok(conn)
+}
+
+/// Adds the version 1.1 image-source columns to databases created by 0.9.
+/// SQLite has no portable `ADD COLUMN IF NOT EXISTS`, so inspect first.
+fn migrate_image_sources(conn: &Connection) -> Result<()> {
+    fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
+        let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let names = statement.query_map([], |row| row.get::<_, String>(1))?;
+        for name in names {
+            if name? == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    if !has_column(conn, "images", "kind")? {
+        conn.execute_batch(
+            "ALTER TABLE images ADD COLUMN kind TEXT NOT NULL DEFAULT 'qcow2' \
+             CHECK (kind IN ('qcow2', 'oci'));",
+        )?;
+    }
+    if !has_column(conn, "image_versions", "source_digest")? {
+        conn.execute_batch("ALTER TABLE image_versions ADD COLUMN source_digest TEXT;")?;
+    }
+    Ok(())
 }
 
 fn format_time(value: OffsetDateTime) -> rusqlite::Result<String> {
