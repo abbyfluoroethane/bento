@@ -234,8 +234,37 @@ impl Cli {
     }
 
     pub(crate) async fn images(&self, env: &mut Env<'_>) -> i32 {
+        if env.args.first().map(String::as_str) == Some("add") {
+            if env.args.len() != 3 {
+                return env.usage("images add <name> <oci-reference>");
+            }
+            if !self
+                .options
+                .is_operator
+                .as_ref()
+                .is_some_and(|predicate| predicate(&env.user))
+            {
+                let _ = writeln!(env.err, "bento: operator only");
+                return 1;
+            }
+            let Some(admin) = &self.image_admin else {
+                let _ = writeln!(env.err, "bento: runtime image management is unavailable");
+                return 1;
+            };
+            return match admin.add_oci_image(&env.args[1], &env.args[2]).await {
+                Ok(()) => {
+                    let _ = writeln!(
+                        env.out,
+                        "images: added {} from {}",
+                        env.args[1], env.args[2]
+                    );
+                    0
+                }
+                Err(error) => env.fail(error),
+            };
+        }
         if !env.args.is_empty() {
-            return env.usage("images");
+            return env.usage("images [add <name> <oci-reference>]");
         }
         let mut images = match self.store.images().await {
             Ok(images) => images,
@@ -248,7 +277,13 @@ impl Cli {
         images.sort_by(|left, right| left.name.cmp(&right.name));
         // SPEC 5.1: show each image, its current checksum, and how many
         // instances hold an older version.
-        let mut rows = vec![cells(&["NAME", "CURRENT CHECKSUM", "ON OLDER VERSIONS"])];
+        let mut rows = vec![cells(&[
+            "NAME",
+            "KIND",
+            "SOURCE",
+            "CURRENT CHECKSUM",
+            "ON OLDER VERSIONS",
+        ])];
         for image in images {
             let older = instances
                 .iter()
@@ -260,6 +295,8 @@ impl Cli {
                 .count();
             rows.push(vec![
                 image.name,
+                image.kind.as_str().to_owned(),
+                image.url,
                 image
                     .current_checksum
                     .unwrap_or_else(|| "(never fetched)".into()),

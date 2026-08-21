@@ -5,7 +5,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
-use bento_types::Image;
+use bento_types::{Image, ImageKind};
 use time::macros::format_description;
 
 use crate::adapters::ImageReport;
@@ -16,7 +16,16 @@ pub(crate) async fn sync_image_allowlist(app: &App) -> Result<()> {
         app.store
             .upsert_image(Image {
                 name: image.name.clone(),
-                url: image.url.clone(),
+                url: if image.oci.is_empty() {
+                    image.url.clone()
+                } else {
+                    image.oci.clone()
+                },
+                kind: if image.oci.is_empty() {
+                    ImageKind::Qcow2
+                } else {
+                    ImageKind::Oci
+                },
                 pinned_checksum: image.pinned_checksum.clone(),
                 current_checksum: None,
             })

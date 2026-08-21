@@ -44,6 +44,8 @@ pub struct Config {
     /// Gates the operator-only database download (SPEC 12.1). `None` denies
     /// everyone.
     pub is_operator: Option<OperatorPredicate>,
+    /// Builds newly appended OCI images. `None` disables runtime additions.
+    pub image_admin: Option<Arc<dyn ImageAdmin>>,
 
     /// The documented database path shown to operators (SPEC 12.1).
     pub db_path: String,
@@ -75,7 +77,7 @@ pub fn router(config: Config) -> Router {
             get(list_shares).post(add_share),
         )
         .route("/api/instances/{uuid}/shares/{user}", delete(remove_share))
-        .route("/api/images", get(list_images))
+        .route("/api/images", get(list_images).post(add_image))
         .route("/api/ssh-keys", get(list_ssh_keys).post(add_ssh_key))
         .route("/api/ssh-keys/{id}", delete(delete_ssh_key))
         .route("/api/db.sqlite", get(dump_db))

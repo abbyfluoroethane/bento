@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::http::{HeaderMap, Method};
@@ -408,6 +408,20 @@ impl Authenticator for FakeAuth {
     }
 }
 
+#[derive(Default)]
+struct FakeImageAdmin(Mutex<Vec<(String, String)>>);
+
+#[async_trait]
+impl ImageAdmin for FakeImageAdmin {
+    async fn add_oci_image(&self, name: &str, reference: &str) -> Result<(), BoxError> {
+        self.0
+            .lock()
+            .unwrap()
+            .push((name.to_owned(), reference.to_owned()));
+        Ok(())
+    }
+}
+
 fn user(id: i64, name: &str, email: &str, created_at: i64) -> User {
     User {
         id,
@@ -462,6 +476,7 @@ struct Fixture {
     store: Arc<FakeStore>,
     lifecycle: Arc<FakeLifecycle>,
     auth: Arc<FakeAuth>,
+    image_admin: Arc<FakeImageAdmin>,
     app: Router,
     alice: User,
     bob: User,
@@ -508,17 +523,20 @@ fn fixture() -> Fixture {
     }
     let lifecycle = Arc::new(FakeLifecycle::new(store.clone()));
     let auth = Arc::new(FakeAuth(Mutex::new(Some(alice.clone()))));
+    let image_admin = Arc::new(FakeImageAdmin::default());
     let app = router(Config {
         store: store.clone(),
         lifecycle: lifecycle.clone(),
         auth: auth.clone(),
         is_operator: Some(Arc::new(|user| user.id == 1)),
+        image_admin: Some(image_admin.clone()),
         db_path: "/var/lib/bento/bento.db".to_string(),
     });
     Fixture {
         store,
         lifecycle,
         auth,
+        image_admin,
         app,
         alice,
         bob,
@@ -587,6 +605,7 @@ async fn authentication_is_required_on_every_route() {
         (Method::POST, "/api/instances/uuid-web/shares"),
         (Method::DELETE, "/api/instances/uuid-web/shares/bob"),
         (Method::GET, "/api/images"),
+        (Method::POST, "/api/images"),
         (Method::GET, "/api/ssh-keys"),
         (Method::POST, "/api/ssh-keys"),
         (Method::DELETE, "/api/ssh-keys/1"),
@@ -1052,12 +1071,14 @@ async fn images_count_instances_on_old_versions() {
         Image {
             name: "debian-13".to_string(),
             url: "https://example.com/d13.qcow2".to_string(),
+            kind: Default::default(),
             pinned_checksum: None,
             current_checksum: Some("bbb".to_string()),
         },
         Image {
             name: "fedora-42".to_string(),
             url: "https://example.com/f42.qcow2".to_string(),
+            kind: Default::default(),
             pinned_checksum: Some("ccc".to_string()),
             current_checksum: Some("ccc".to_string()),
         },
@@ -1072,6 +1093,26 @@ async fn images_count_instances_on_old_versions() {
     assert_eq!(by_name["debian-13"].instances_on_older_versions, 2);
     assert_eq!(by_name["fedora-42"].instances_on_older_versions, 0);
     assert_eq!(by_name["debian-13"].pinned_checksum, "");
+}
+
+#[tokio::test]
+async fn only_operators_can_append_oci_images() {
+    let fixture = fixture();
+    let body = r#"{"name":"fedora-bootc","reference":"quay.io/fedora/fedora-bootc:latest"}"#;
+    let response = request(&fixture.app, Method::POST, "/api/images", body).await;
+    assert_eq!(response.status, StatusCode::CREATED);
+    assert_eq!(
+        *fixture.image_admin.0.lock().unwrap(),
+        vec![(
+            "fedora-bootc".to_owned(),
+            "quay.io/fedora/fedora-bootc:latest".to_owned()
+        )]
+    );
+
+    *fixture.auth.0.lock().unwrap() = Some(fixture.bob.clone());
+    let response = request(&fixture.app, Method::POST, "/api/images", body).await;
+    assert_eq!(response.status, StatusCode::FORBIDDEN);
+    assert_eq!(fixture.image_admin.0.lock().unwrap().len(), 1);
 }
 
 const TEST_PUBLIC_KEY: &str = concat!(
@@ -1163,6 +1204,7 @@ async fn database_download_is_a_consistent_operator_only_snapshot() {
         lifecycle: fixture.lifecycle.clone(),
         auth: fixture.auth.clone(),
         is_operator: None,
+        image_admin: None,
         db_path: String::new(),
     });
     *fixture.auth.0.lock().unwrap() = Some(fixture.alice.clone());

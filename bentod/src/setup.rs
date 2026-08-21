@@ -56,10 +56,12 @@ impl App {
 
     /// Returns the content-addressed image store over the database (SPEC 5.1).
     pub(crate) fn image_store(&self) -> Arc<ImageStore> {
-        Arc::new(ImageStore::new(
-            &self.cfg.image_dir,
-            ImageDb(self.store.clone()),
-        ))
+        Arc::new(
+            ImageStore::new(&self.cfg.image_dir, ImageDb(self.store.clone()))
+                .with_builder_image(&self.cfg.bootc.builder_image)
+                .with_bootc_rootfs(&self.cfg.bootc.rootfs)
+                .with_container_storage(&self.cfg.bootc.container_storage),
+        )
     }
 
     /// Builds the lifecycle manager over the given hypervisor connection.

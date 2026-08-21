@@ -227,10 +227,42 @@ pub struct Host {
 }
 
 /// A named entry in the operator allowlist (SPEC 5.1).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ImageKind {
+    #[default]
+    Qcow2,
+    Oci,
+}
+
+impl ImageKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Qcow2 => "qcow2",
+            Self::Oci => "oci",
+        }
+    }
+}
+
+impl std::str::FromStr for ImageKind {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "qcow2" => Ok(Self::Qcow2),
+            "oci" => Ok(Self::Oci),
+            other => Err(format!("unknown image kind {other:?}")),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Image {
     pub name: String,
+    /// Download URL for qcow2 entries, or an OCI image reference for bootc.
     pub url: String,
+    #[serde(default)]
+    pub kind: ImageKind,
     /// When set, a download whose checksum differs is rejected. `None`
     /// means trust on first use.
     pub pinned_checksum: Option<String>,
@@ -245,6 +277,9 @@ pub struct ImageVersion {
     pub image_name: String,
     pub path: String,
     pub size: i64,
+    /// Digest of the OCI image used to build this disk, when applicable.
+    #[serde(default)]
+    pub source_digest: Option<String>,
     #[serde(with = "time::serde::rfc3339")]
     pub fetched_at: OffsetDateTime,
 }

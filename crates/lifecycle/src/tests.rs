@@ -59,6 +59,7 @@ impl TestStore {
             Image {
                 name: "debian-13".into(),
                 url: "https://example.test/debian".into(),
+                kind: Default::default(),
                 pinned_checksum: None,
                 current_checksum: checksum.map(str::to_string),
             },

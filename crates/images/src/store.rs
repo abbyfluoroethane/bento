@@ -186,31 +186,36 @@ pub struct CommandRunner;
 #[async_trait]
 impl Runner for CommandRunner {
     async fn run(&self, name: &str, args: &[OsString]) -> std::result::Result<Vec<u8>, RunError> {
-        let output = tempfile::tempfile().map_err(|error| RunError::new(error, Vec::new()))?;
-        let stdout = output
+        let stdout_file = tempfile::tempfile().map_err(|error| RunError::new(error, Vec::new()))?;
+        let stderr_file = tempfile::tempfile().map_err(|error| RunError::new(error, Vec::new()))?;
+        let stdout = stdout_file
             .try_clone()
             .map_err(|error| RunError::new(error, Vec::new()))?;
-        let stderr = output
+        let stderr = stderr_file
             .try_clone()
             .map_err(|error| RunError::new(error, Vec::new()))?;
         let status = tokio::process::Command::new(name)
             .args(args)
             .stdout(Stdio::from(stdout))
             .stderr(Stdio::from(stderr))
+            .kill_on_drop(true)
             .status()
             .await
             .map_err(|error| RunError::new(error, Vec::new()))?;
-        let mut output = tokio::fs::File::from_std(output);
-        let mut combined = Vec::new();
-        tokio::io::AsyncSeekExt::seek(&mut output, std::io::SeekFrom::Start(0))
+        let stdout = read_command_output(stdout_file)
             .await
             .map_err(|error| RunError::new(error, Vec::new()))?;
-        tokio::io::AsyncReadExt::read_to_end(&mut output, &mut combined)
+        let stderr = read_command_output(stderr_file)
             .await
             .map_err(|error| RunError::new(error, Vec::new()))?;
         if status.success() {
-            Ok(combined)
+            Ok(stdout)
         } else {
+            let mut combined = stdout;
+            if !combined.is_empty() && !combined.ends_with(b"\n") && !stderr.is_empty() {
+                combined.push(b'\n');
+            }
+            combined.extend(stderr);
             Err(RunError::new(
                 io::Error::other(format!("command exited with {status}")),
                 combined,
@@ -219,10 +224,22 @@ impl Runner for CommandRunner {
     }
 }
 
+async fn read_command_output(file: File) -> io::Result<Vec<u8>> {
+    let mut file = tokio::fs::File::from_std(file);
+    tokio::io::AsyncSeekExt::seek(&mut file, std::io::SeekFrom::Start(0)).await?;
+    let mut output = Vec::new();
+    tokio::io::AsyncReadExt::read_to_end(&mut file, &mut output).await?;
+    Ok(output)
+}
+
 /// The consumer-side view of the queries the image store needs. The
 /// real store package implements it.
 #[async_trait]
 pub trait DB: Send + Sync {
+    /// Appends a new persistent allowlist entry without replacement.
+    async fn insert_image(&self, image: Image) -> std::result::Result<bool, DynError>;
+    /// Inserts or updates one persistent allowlist entry.
+    async fn upsert_image(&self, image: Image) -> std::result::Result<(), DynError>;
     /// Returns the operator allowlist with current checksums.
     async fn images(&self) -> std::result::Result<Vec<Image>, DynError>;
     /// Reports whether a version with the checksum exists.
@@ -249,6 +266,13 @@ pub trait DB: Send + Sync {
 
 #[async_trait]
 impl<T: DB + ?Sized> DB for Arc<T> {
+    async fn insert_image(&self, image: Image) -> std::result::Result<bool, DynError> {
+        (**self).insert_image(image).await
+    }
+
+    async fn upsert_image(&self, image: Image) -> std::result::Result<(), DynError> {
+        (**self).upsert_image(image).await
+    }
     async fn images(&self) -> std::result::Result<Vec<Image>, DynError> {
         (**self).images().await
     }
@@ -294,6 +318,10 @@ pub struct Store {
     pub(crate) client: Arc<dyn Doer>,
     pub(crate) runner: Arc<dyn Runner>,
     pub(crate) qemu_img: OsString,
+    pub(crate) podman: OsString,
+    pub(crate) builder_image: String,
+    pub(crate) bootc_rootfs: String,
+    pub(crate) container_storage: PathBuf,
 
     // Serializes version creation and deletion inside this process. The
     // flock on LOCK_FILE_NAME does the same across processes. Together
@@ -318,6 +346,10 @@ impl Store {
             client: Arc::new(ReqwestClient::default()),
             runner: Arc::new(CommandRunner),
             qemu_img: OsString::from("qemu-img"),
+            podman: OsString::from("podman"),
+            builder_image: "ghcr.io/osbuild/image-builder-cli:latest".to_owned(),
+            bootc_rootfs: "ext4".to_owned(),
+            container_storage: PathBuf::from("/var/lib/containers/storage"),
             lock: Arc::new(Mutex::new(())),
         }
     }
@@ -337,6 +369,34 @@ impl Store {
     /// Sets the qemu-img binary path.
     pub fn with_qemu_img(mut self, path: impl Into<OsString>) -> Self {
         self.qemu_img = path.into();
+        self
+    }
+
+    /// Sets the Podman binary used to pull and convert OCI images.
+    #[must_use]
+    pub fn with_podman(mut self, path: impl Into<OsString>) -> Self {
+        self.podman = path.into();
+        self
+    }
+
+    /// Overrides the privileged image-builder container image.
+    #[must_use]
+    pub fn with_builder_image(mut self, image: impl Into<String>) -> Self {
+        self.builder_image = image.into();
+        self
+    }
+
+    /// Sets the fallback root filesystem passed to image-builder.
+    #[must_use]
+    pub fn with_bootc_rootfs(mut self, rootfs: impl Into<String>) -> Self {
+        self.bootc_rootfs = rootfs.into();
+        self
+    }
+
+    /// Sets the rootful Podman storage shared with image-builder.
+    #[must_use]
+    pub fn with_container_storage(mut self, path: impl Into<PathBuf>) -> Self {
+        self.container_storage = path.into();
         self
     }
 
@@ -475,5 +535,33 @@ mod tests {
             path.file_name().and_then(|name| name.to_str()),
             Some(format!("sha256-{checksum}.qcow2").as_str())
         );
+    }
+
+    #[tokio::test]
+    async fn command_runner_separates_success_stderr_and_preserves_failure_output() {
+        let runner = CommandRunner;
+        let output = runner
+            .run(
+                "/bin/sh",
+                &[
+                    OsString::from("-c"),
+                    OsString::from("printf out; printf warning >&2"),
+                ],
+            )
+            .await
+            .expect("successful command");
+        assert_eq!(output, b"out");
+
+        let error = runner
+            .run(
+                "/bin/sh",
+                &[
+                    OsString::from("-c"),
+                    OsString::from("printf out; printf error >&2; exit 7"),
+                ],
+            )
+            .await
+            .expect_err("failed command");
+        assert_eq!(error.output(), b"out\nerror");
     }
 }

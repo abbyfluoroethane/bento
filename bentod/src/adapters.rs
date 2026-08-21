@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use bento_api::{BoxError as ApiError, StoreError as ApiStoreError};
+use bento_api::{BoxError as ApiError, StatusError as ApiStatusError, StoreError as ApiStoreError};
 use bento_auth::{BoxError as AuthError, TokenLookup};
 use bento_cli::{BoxError as CliError, ReadWrite};
 use bento_hypervisor::{Hypervisor, NetworkManager, StopResult};
@@ -35,6 +35,13 @@ pub(crate) struct ImageDb(pub(crate) Store);
 
 #[async_trait]
 impl DB for ImageDb {
+    async fn insert_image(&self, image: Image) -> Result<bool, ImagesError> {
+        Ok(self.0.insert_image(image).await?)
+    }
+
+    async fn upsert_image(&self, image: Image) -> Result<(), ImagesError> {
+        Ok(self.0.upsert_image(image).await?)
+    }
     async fn images(&self) -> Result<Vec<Image>, ImagesError> {
         Ok(self.0.images().await?)
     }
@@ -82,6 +89,29 @@ impl DB for ImageDb {
 }
 
 pub(crate) struct ImageReport(pub(crate) Store);
+
+pub(crate) struct RuntimeImages(pub(crate) Arc<bento_images::Store>);
+
+#[async_trait]
+impl bento_api::ImageAdmin for RuntimeImages {
+    async fn add_oci_image(&self, name: &str, reference: &str) -> Result<(), ApiError> {
+        match self.0.add_oci_image(name, reference).await {
+            Ok(()) => Ok(()),
+            Err(error @ bento_images::Error::Invalid(_)) => Err(Box::new(ApiStatusError::new(
+                StatusCode::BAD_REQUEST,
+                error.to_string(),
+            ))),
+            Err(error) => Err(Box::new(error)),
+        }
+    }
+}
+
+#[async_trait]
+impl bento_cli::ImageAdmin for RuntimeImages {
+    async fn add_oci_image(&self, name: &str, reference: &str) -> Result<(), CliError> {
+        Ok(self.0.add_oci_image(name, reference).await?)
+    }
+}
 
 #[async_trait]
 impl ReportSource for ImageReport {

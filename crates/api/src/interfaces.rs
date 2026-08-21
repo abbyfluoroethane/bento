@@ -97,6 +97,12 @@ pub trait Store: Send + Sync + 'static {
     async fn dump_db(&self, destination: &Path) -> Result<(), BoxError>;
 }
 
+/// Operator-only mutations of the persistent image allowlist.
+#[async_trait]
+pub trait ImageAdmin: Send + Sync + 'static {
+    async fn add_oci_image(&self, name: &str, reference: &str) -> Result<(), BoxError>;
+}
+
 /// What the dashboard sends to create an instance. Zero resource values mean
 /// "use the operator default"; the lifecycle layer applies those defaults.
 #[derive(Debug, Clone, PartialEq, Eq)]

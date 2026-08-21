@@ -75,6 +75,26 @@ impl FakeDb {
 
 #[async_trait]
 impl DB for FakeDb {
+    async fn insert_image(&self, image: Image) -> std::result::Result<bool, DynError> {
+        let mut state = self.0.lock().expect("db");
+        if state.images.iter().any(|row| row.name == image.name) {
+            return Ok(false);
+        }
+        state.images.push(image);
+        Ok(true)
+    }
+
+    async fn upsert_image(&self, image: Image) -> std::result::Result<(), DynError> {
+        let mut state = self.0.lock().expect("db");
+        if let Some(existing) = state.images.iter_mut().find(|row| row.name == image.name) {
+            let current = existing.current_checksum.clone();
+            *existing = image;
+            existing.current_checksum = current;
+        } else {
+            state.images.push(image);
+        }
+        Ok(())
+    }
     async fn images(&self) -> std::result::Result<Vec<Image>, DynError> {
         Ok(self.images_snapshot())
     }

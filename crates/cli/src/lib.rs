@@ -10,7 +10,9 @@ mod info;
 mod instance;
 mod parse;
 
-pub use backend::{BoxError, CreateRequest, Lifecycle, ReadWrite, ResizeRequest, Store};
+pub use backend::{
+    BoxError, CreateRequest, ImageAdmin, Lifecycle, ReadWrite, ResizeRequest, Store,
+};
 
 use std::error::Error as StdError;
 use std::fmt;
@@ -30,6 +32,7 @@ const FALLBACK_DISK_GIB: i64 = 20;
 
 /// Thread-safe time source used for deterministic last-use rendering.
 pub type Clock = Arc<dyn Fn() -> OffsetDateTime + Send + Sync>;
+pub type OperatorPredicate = Arc<dyn Fn(&User) -> bool + Send + Sync>;
 
 /// Configuration for the SSH command line interface.
 #[derive(Clone)]
@@ -51,6 +54,8 @@ pub struct Options {
     pub name_cooldown: Duration,
     /// Time source for last-use formatting.
     pub now: Clock,
+    /// Gates runtime allowlist changes. `None` denies everyone.
+    pub is_operator: Option<OperatorPredicate>,
 }
 
 impl Default for Options {
@@ -63,6 +68,7 @@ impl Default for Options {
             default_disk_gib: FALLBACK_DISK_GIB,
             name_cooldown: Duration::from_secs(24 * 60 * 60),
             now: Arc::new(OffsetDateTime::now_utc),
+            is_operator: None,
         }
     }
 }
@@ -118,7 +124,10 @@ const HELP_COMMANDS: [(&str, &str); 16] = [
         "share [--revoke] <name> [<user>]",
         "grant, revoke, or list access",
     ),
-    ("images", "list images and versions in use"),
+    (
+        "images [add <name> <oci-reference>]",
+        "list or add allowed images",
+    ),
     ("ssh-key [add|list|remove]", "manage your SSH keys"),
     ("whoami", "show your account and quota"),
 ];
@@ -133,6 +142,7 @@ const HELP_USAGE_WIDTH: usize = 35;
 pub struct Cli {
     store: Arc<dyn Store>,
     lifecycle: Arc<dyn Lifecycle>,
+    image_admin: Option<Arc<dyn ImageAdmin>>,
     options: Options,
 }
 
@@ -142,8 +152,16 @@ impl Cli {
         Self {
             store,
             lifecycle,
+            image_admin: None,
             options: options.with_defaults(),
         }
+    }
+
+    /// Enables operator-managed runtime image additions.
+    #[must_use]
+    pub fn with_image_admin(mut self, image_admin: Arc<dyn ImageAdmin>) -> Self {
+        self.image_admin = Some(image_admin);
+        self
     }
 
     /// Executes one SSH command line and returns `0` on success, `1` on

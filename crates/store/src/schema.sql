@@ -48,6 +48,8 @@ CREATE TABLE IF NOT EXISTS hosts (
 CREATE TABLE IF NOT EXISTS images (
     name             TEXT PRIMARY KEY,
     url              TEXT NOT NULL,
+    kind             TEXT NOT NULL DEFAULT 'qcow2'
+                     CHECK (kind IN ('qcow2', 'oci')),
     pinned_checksum  TEXT,
     current_checksum TEXT REFERENCES image_versions(checksum)
 );
@@ -57,6 +59,7 @@ CREATE TABLE IF NOT EXISTS image_versions (
     image_name TEXT    NOT NULL REFERENCES images(name),
     path       TEXT    NOT NULL UNIQUE,
     size       INTEGER NOT NULL,
+    source_digest TEXT,
     fetched_at TEXT    NOT NULL
 );
 
