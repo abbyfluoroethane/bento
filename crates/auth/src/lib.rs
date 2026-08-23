@@ -8,7 +8,7 @@
 //! therefore grants nothing on the new instance.
 
 use std::error::Error as StdError;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, RwLock};
 
 use async_trait::async_trait;
 use base64::Engine;
@@ -130,13 +130,20 @@ pub struct Service {
     users: Arc<dyn UserStore>,
     access: Arc<dyn AccessStore>,
     tokens: Arc<dyn TokenStore>,
-    oauth: Option<Arc<dyn Exchanger>>,
-    verifier: Option<Arc<dyn Verifier>>,
+    oidc: RwLock<Option<Oidc>>,
     provisioner: Option<Arc<dyn Provisioner>>,
     pairings: Option<Arc<dyn PairingStore>>,
     now: Clock,
     session_ttl: Duration,
     login_path: String,
+}
+
+/// The provider pair that OIDC login needs. The two are installed and
+/// read together: half of it is no more useful than none of it.
+#[derive(Clone)]
+pub(crate) struct Oidc {
+    pub(crate) exchanger: Arc<dyn Exchanger>,
+    pub(crate) verifier: Arc<dyn Verifier>,
 }
 
 /// The default session lifetime is seven days.
@@ -161,8 +168,7 @@ impl Service {
             users,
             access,
             tokens,
-            oauth: None,
-            verifier: None,
+            oidc: RwLock::new(None),
             provisioner: None,
             pairings: None,
             now: Arc::new(OffsetDateTime::now_utc),
@@ -198,10 +204,33 @@ impl Service {
     /// Injects the OAuth2 exchanger and ID token verifier. Wire one
     /// [`ProviderClient`] for both in production; tests pass fakes.
     #[must_use]
-    pub fn with_oidc(mut self, exchanger: Arc<dyn Exchanger>, verifier: Arc<dyn Verifier>) -> Self {
-        self.oauth = Some(exchanger);
-        self.verifier = Some(verifier);
+    pub fn with_oidc(self, exchanger: Arc<dyn Exchanger>, verifier: Arc<dyn Verifier>) -> Self {
+        self.install_oidc(exchanger, verifier);
         self
+    }
+
+    /// Wires the provider into a service that is already serving requests.
+    ///
+    /// Discovery talks to the provider over the network, so it can fail for
+    /// reasons that have nothing to do with this host and that later fix
+    /// themselves — most often because the provider is still starting up
+    /// alongside us after a reboot. A caller that retries in the background
+    /// uses this to light login up the moment discovery succeeds, instead of
+    /// leaving it dark until someone restarts the process.
+    pub fn install_oidc(&self, exchanger: Arc<dyn Exchanger>, verifier: Arc<dyn Verifier>) {
+        *self.oidc.write().unwrap_or_else(PoisonError::into_inner) = Some(Oidc {
+            exchanger,
+            verifier,
+        });
+    }
+
+    /// The provider pair, if one is wired yet. Returns a clone so no lock
+    /// guard is held across the awaits of the login flow.
+    pub(crate) fn oidc(&self) -> Option<Oidc> {
+        self.oidc
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Injects the account provisioner. With one wired, a verified login

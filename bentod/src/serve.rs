@@ -222,6 +222,65 @@ async fn converge(
     }
 }
 
+/// The wait before the second discovery attempt, and the ceiling the wait
+/// doubles up to.
+const OIDC_RETRY_INITIAL: Duration = Duration::from_secs(2);
+const OIDC_RETRY_MAX: Duration = Duration::from_secs(60);
+
+/// Discovers the OIDC provider in the background, retrying until it answers.
+///
+/// Discovery is a network call to a service this unit cannot order itself
+/// against: the provider is typically a rootless user unit, and a root system
+/// unit has no way to wait for one. A single attempt at startup therefore
+/// loses a race after every reboot, and because the provider is wired exactly
+/// once, losing it left login answering 500 for the life of the process —
+/// visible only as one warning in the journal. Retrying costs an idle task
+/// and removes the whole failure mode.
+fn spawn_oidc_discovery(
+    auth: Arc<bento_auth::Service>,
+    issuer: String,
+    client_id: String,
+    client_secret: String,
+    redirect: String,
+) {
+    tokio::spawn(async move {
+        let mut backoff = OIDC_RETRY_INITIAL;
+        let mut attempt = 1_u32;
+        loop {
+            match bento_auth::ProviderClient::discover(
+                &issuer,
+                &client_id,
+                &client_secret,
+                &redirect,
+            )
+            .await
+            {
+                Ok(provider) => {
+                    let provider = Arc::new(provider);
+                    auth.install_oidc(provider.clone(), provider);
+                    tracing::info!(%issuer, attempt, "OIDC discovered; dashboard login is up");
+                    return;
+                }
+                Err(error) => {
+                    // Kept at warn even once it is clearly a standing
+                    // misconfiguration: login is down the whole time, and the
+                    // capped backoff means this is at most one line a minute.
+                    tracing::warn!(
+                        %issuer,
+                        %error,
+                        attempt,
+                        retry_in = ?backoff,
+                        "OIDC discovery failed; dashboard login is disabled until it succeeds"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(OIDC_RETRY_MAX);
+                    attempt += 1;
+                }
+            }
+        }
+    });
+}
+
 async fn control_plane_router(
     app: &App,
     manager: Arc<bento_lifecycle::Manager>,
@@ -249,30 +308,19 @@ async fn control_plane_router(
     } else {
         tracing::warn!("signups are off; only existing accounts can log in");
     }
-    if !app.cfg.oidc.issuer.is_empty() {
-        let redirect = format!("https://{}/callback", app.cfg.base_domain);
-        match bento_auth::ProviderClient::discover(
-            &app.cfg.oidc.issuer,
-            &app.cfg.oidc.client_id,
-            &app.cfg.oidc.client_secret,
-            &redirect,
-        )
-        .await
-        {
-            Ok(provider) => {
-                let provider = Arc::new(provider);
-                auth = auth.with_oidc(provider.clone(), provider);
-            }
-            Err(error) => tracing::warn!(
-                issuer = %app.cfg.oidc.issuer,
-                %error,
-                "OIDC discovery failed; dashboard login disabled until restart"
-            ),
-        }
-    } else {
+    if app.cfg.oidc.issuer.is_empty() {
         tracing::warn!("no OIDC issuer configured; dashboard login disabled");
     }
     let auth = Arc::new(auth);
+    if !app.cfg.oidc.issuer.is_empty() {
+        spawn_oidc_discovery(
+            auth.clone(),
+            app.cfg.oidc.issuer.clone(),
+            app.cfg.oidc.client_id.clone(),
+            app.cfg.oidc.client_secret.clone(),
+            format!("https://{}/callback", app.cfg.base_domain),
+        );
+    }
     let operators = Arc::new(operator_predicate(&app.cfg.operators));
     let api = bento_api::router(bento_api::Config {
         store: Arc::new(ApiStore(app.store.clone())),

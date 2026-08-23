@@ -336,7 +336,7 @@ pub(crate) struct FakeExchanger {
 }
 
 impl FakeExchanger {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             seen: Mutex::new((String::new(), String::new())),
         }
@@ -368,7 +368,7 @@ pub(crate) struct FakeVerifier {
 }
 
 impl FakeVerifier {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             claims: Mutex::new(HashMap::new()),
         }

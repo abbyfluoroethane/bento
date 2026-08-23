@@ -481,12 +481,13 @@ impl Service {
     /// the provider. An optional `?next=` query parameter names the path
     /// or same-site URL to return to after login.
     pub fn login_response(&self, uri: &Uri) -> crate::HttpResponse {
-        let Some(oauth) = self.oauth.as_ref() else {
+        let Some(oidc) = self.oidc() else {
             return text_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "OIDC is not configured\n",
             );
         };
+        let oauth = &oidc.exchanger;
         let state = random_token();
         let nonce = random_token();
         let next = self.safe_next(query_value(uri, "next").as_deref().unwrap_or(""));
@@ -501,12 +502,13 @@ impl Service {
     /// users row creates the account when a [`Provisioner`] is wired, and
     /// otherwise gets 403 (SPEC 13).
     pub async fn callback_response(&self, headers: &HeaderMap, uri: &Uri) -> crate::HttpResponse {
-        let (Some(oauth), Some(verifier)) = (self.oauth.as_ref(), self.verifier.as_ref()) else {
+        let Some(oidc) = self.oidc() else {
             return text_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "OIDC is not configured\n",
             );
         };
+        let (oauth, verifier) = (&oidc.exchanger, &oidc.verifier);
         let silent = cookie_value(headers, crate::landing::SILENT_COOKIE_NAME)
             .is_some_and(|value| value == "1");
         if let Some(error) = query_value(uri, "error").filter(|error| !error.is_empty()) {
@@ -1161,6 +1163,34 @@ mod tests {
                 .await
                 .status(),
             StatusCode::INTERNAL_SERVER_ERROR
+        );
+    }
+
+    #[test]
+    fn installing_the_provider_lights_up_a_service_already_serving() {
+        // Discovery can fail at startup for reasons that later fix
+        // themselves, so a service that answered 500 must start redirecting
+        // the moment the provider is installed, without being rebuilt.
+        let clock = FakeClock::new(TEST_EPOCH);
+        let (service, _, _, _) = crate::test_support::new_test_service(&clock);
+        let service = Arc::new(service);
+        assert_eq!(
+            service.login_response(&"/login".parse().unwrap()).status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+
+        service.install_oidc(
+            Arc::new(crate::test_support::FakeExchanger::new()),
+            Arc::new(crate::test_support::FakeVerifier::new()),
+        );
+
+        let response = service.login_response(&"/login".parse().unwrap());
+        assert_eq!(response.status(), StatusCode::FOUND);
+        assert!(
+            response.headers()[LOCATION]
+                .to_str()
+                .unwrap()
+                .starts_with("https://id.example.org/authorize")
         );
     }
 

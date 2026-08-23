@@ -41,7 +41,7 @@ impl Service {
         if self.session_from_headers(headers).await.is_some() {
             return None;
         }
-        let probe_is_useful = self.oauth.is_some()
+        let probe_is_useful = self.oidc().is_some()
             && cookie_value(headers, PROBED_COOKIE_NAME).is_none()
             // A crawler or a `curl` gains nothing from a round trip to the
             // provider, and would never keep the cookie that stops the
@@ -57,9 +57,10 @@ impl Service {
     /// flow's state and nonce cookies, so the callback validates it
     /// exactly like a login the visitor asked for.
     fn silent_login_response(&self) -> crate::HttpResponse {
-        let Some(oauth) = self.oauth.as_ref() else {
+        let Some(oidc) = self.oidc() else {
             return html_response(StatusCode::OK, self.splash_page());
         };
+        let oauth = &oidc.exchanger;
         let state = crate::random_token();
         let nonce = crate::random_token();
         let mut response = redirect_response(&oauth.auth_code_url_silent(&state, &nonce));
