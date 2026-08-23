@@ -200,6 +200,79 @@ express a port range, so publishing them through Caddy means either one
 site block per port (narrow the range first) or giving Bento a
 public bind and its own certificate.
 
+### Reaching instances under a second domain
+
+A front proxy can also publish instances under a domain that is not
+`base_domain` — a short alias zone, say, with `<service>.example.net` a
+CNAME onto `<service>.bento.example.org`:
+
+```
+git.example.net   CNAME   git.bento.example.org
+wiki.example.net  CNAME   outline.bento.example.org
+```
+
+Both names already resolve to the host, so the requests arrive at the
+front proxy either way. Two things are needed to serve them.
+
+The alias domain needs **its own certificate**, for the same
+one-label reason as above: `*.bento.example.org` does not cover
+`*.example.net`. If the alias zone sits in a different DNS account, that
+is a second API token, not the one in `[acme]`.
+
+The alias name must then be **rewritten to the `base_domain` name it
+stands for** before the request is forwarded. The proxy reads the
+hostname from SNI when there is one and the `Host` header otherwise, and
+the hop to `127.0.0.1:10443` is plaintext — so there is no SNI, and it
+routes on `Host` alone. A `Host` outside `base_domain` fails the suffix
+strip and answers 404:
+
+```caddy
+*.example.net, example.net {
+	tls {
+		dns cloudflare {env.ALIAS_CF_API_TOKEN}
+	}
+
+	map {host} {bento_host} {
+		wiki.example.net           outline.bento.example.org
+		~^([^.]+)\.example\.net$   "${1}.bento.example.org"
+		default                    ""
+	}
+
+	@instance vars_regexp {bento_host} .
+	handle @instance {
+		reverse_proxy 127.0.0.1:10443 {
+			header_up Host {bento_host}
+		}
+	}
+
+	handle {
+		abort
+	}
+}
+```
+
+The regex row carries every alias whose label already matches the
+instance name; spell out the ones that differ above it, since `map`
+takes the first matching row. The empty `default` drops the apex and
+anything more than one label deep — the regex is deliberately
+`[^.]+`, because the proxy rejects a name containing a dot before it
+ever reaches the instance lookup.
+
+That 404 is the trap worth knowing about. It is the same 404 that a
+missing name, a released name, and an instance with visibility off all
+return, byte for byte and by design (SPEC 9.2) — so a missing `Host`
+rewrite reads as "the instance does not exist" rather than as a routing
+mistake. `curl -sI --resolve <alias>:443:<host address> https://<alias>/`
+against both the alias and the `base_domain` name is the quick tell: the
+`.bento` name answers and the alias 404s.
+
+One consequence to expect. The proxy forwards the rewritten name to the
+guest, in both `Host` and `X-Forwarded-Host`, so the application inside
+the instance sees `<service>.bento.example.org` and never learns the
+alias. An application configured with a canonical URL will redirect
+visitors from the alias back to that name. Nothing in the proxy can fix
+this — the guest's own configuration has to name the alias.
+
 ## 6. Running it
 
 Three units, one per process (SPEC 4). `bentod-serve` owns the database;
