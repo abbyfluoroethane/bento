@@ -25,7 +25,9 @@ local socket at `qemu:///system`, `qemu-img`, `xorriso`, and `nft` on
 `PATH`. Run `bentod` as a user in the `libvirt` group. `bentod serve`
 refuses to start if a requirement is missing (SPEC 4.2).
 Bootc OCI sources additionally require rootful Podman; Bento runs the
-configured image-builder container privileged to produce qcow2 disks.
+configured, digest-pinned image-builder container privileged to produce
+qcow2 disks. `serve` checks Podman and its writable container storage when
+an OCI source is configured.
 
 **Config** — copy [`bento.example.toml`](bento.example.toml) to
 `/etc/bento/bento.toml` and set at least `base_domain`, the `[acme]`
@@ -67,9 +69,13 @@ ssh bento.example.org images add fedora-bootc quay.io/fedora/fedora-bootc:latest
 ```
 
 The command pulls and builds immediately, and the durable database row
-survives process restarts. An OCI source must be a bootable OS image with
-`cloud-init` and `qemu-guest-agent` baked in; ordinary application
-containers are not bootable by Bento.
+survives process restarts. A failed first build rolls the row back so the
+name can be corrected and retried. An OCI source must be a bootable OS
+image with a kernel, `cloud-init` NoCloud support, and `qemu-guest-agent`
+baked in; Bento checks these before the privileged build. Ordinary
+application containers are not bootable by Bento. Granting operator access
+also grants an effective path to host root because operators choose input
+to that privileged build.
 
 ## Development quickstart
 

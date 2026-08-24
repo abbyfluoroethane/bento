@@ -60,7 +60,8 @@ impl App {
             ImageStore::new(&self.cfg.image_dir, ImageDb(self.store.clone()))
                 .with_builder_image(&self.cfg.bootc.builder_image)
                 .with_bootc_rootfs(&self.cfg.bootc.rootfs)
-                .with_container_storage(&self.cfg.bootc.container_storage),
+                .with_container_storage(&self.cfg.bootc.container_storage)
+                .with_build_timeout(self.cfg.bootc.build_timeout.std()),
         )
     }
 

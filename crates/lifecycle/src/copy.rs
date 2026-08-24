@@ -17,9 +17,9 @@ impl Manager {
             .instance(source_uuid)
             .await
             .map_err(crate::actions::external)?;
-        let source_image = self
+        let source_version = self
             .store
-            .image(&source.image_name)
+            .image_version(&source.base_checksum)
             .await
             .map_err(crate::actions::external)?;
         if request.name.is_empty() {
@@ -116,7 +116,7 @@ impl Manager {
             &instance,
             &request,
             &guest,
-            source_image.kind != ImageKind::Oci,
+            source_version.kind != ImageKind::Oci,
         );
         if let Err(error) = self
             .iso

@@ -179,6 +179,7 @@ pub(crate) mod tests {
                 image_name: "debian-13".into(),
                 path: "/images/aa11".into(),
                 size: 1,
+                kind: Default::default(),
                 source_digest: None,
                 fetched_at: OffsetDateTime::now_utc(),
             })

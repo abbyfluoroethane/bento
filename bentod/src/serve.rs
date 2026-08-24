@@ -149,6 +149,8 @@ async fn host_checks(app: &App) -> Result<()> {
             socket_path: socket_path(&app.cfg.libvirt_uri),
             image_dir: PathBuf::from(&app.cfg.image_dir),
             storage_dir: PathBuf::from(&app.cfg.storage_dir),
+            container_storage: PathBuf::from(&app.cfg.bootc.container_storage),
+            podman_required: app.cfg.images.iter().any(|image| !image.oci.is_empty()),
             nested_wanted,
             ..Default::default()
         },

@@ -94,6 +94,7 @@ pub(crate) async fn seed_store(store: &Store) -> (User, Host) {
             image_name: "debian-13".into(),
             path: "/var/lib/bento/images/sha256-aa.qcow2".into(),
             size: 1,
+            kind: Default::default(),
             source_digest: None,
             fetched_at: datetime!(2026-01-01 0:00 UTC),
         })
@@ -171,6 +172,7 @@ async fn schema_executes() {
         "hosts",
         "images",
         "image_versions",
+        "image_source_versions",
         "instances",
         "shares",
         "released_names",
@@ -279,6 +281,7 @@ async fn opens_and_migrates_a_pre_oci_database() {
             image_name: "legacy".into(),
             path: "/tmp/legacy-checksum.qcow2".into(),
             size: 1,
+            kind: Default::default(),
             source_digest: Some("sha256:source".into()),
             fetched_at: datetime!(2026-01-01 0:00 UTC),
         })
@@ -289,5 +292,55 @@ async fn opens_and_migrates_a_pre_oci_database() {
             .source_digest
             .as_deref(),
         Some("sha256:source")
+    );
+    assert_eq!(
+        store.image_versions("legacy").await.unwrap()[0].kind,
+        bento_types::ImageKind::Qcow2
+    );
+}
+
+#[tokio::test]
+async fn migrates_bootc_version_provenance_from_the_initial_oci_schema() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("initial-oci.db");
+    let connection = Connection::open(&path).unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE images (
+                name TEXT PRIMARY KEY,
+                url TEXT NOT NULL,
+                kind TEXT NOT NULL DEFAULT 'qcow2',
+                pinned_checksum TEXT,
+                current_checksum TEXT REFERENCES image_versions(checksum)
+             );
+             CREATE TABLE image_versions (
+                checksum TEXT PRIMARY KEY,
+                image_name TEXT NOT NULL REFERENCES images(name),
+                path TEXT NOT NULL UNIQUE,
+                size INTEGER NOT NULL,
+                source_digest TEXT,
+                fetched_at TEXT NOT NULL
+             );
+             INSERT INTO images (name, url, kind)
+             VALUES ('bootc', 'quay.io/example/os:latest', 'oci');
+             INSERT INTO image_versions
+                 (checksum, image_name, path, size, source_digest, fetched_at)
+             VALUES ('disk-checksum', 'bootc', '/images/disk.qcow2', 1,
+                     'sha256:source', '2026-01-01T00:00:00Z');",
+        )
+        .unwrap();
+    drop(connection);
+
+    let store = Store::open(&path).await.unwrap();
+    let version = store.image_version("disk-checksum").await.unwrap();
+    assert_eq!(version.kind, bento_types::ImageKind::Oci);
+    assert_eq!(
+        store
+            .image_version_for_source("bootc", "sha256:source")
+            .await
+            .unwrap()
+            .unwrap()
+            .checksum,
+        "disk-checksum"
     );
 }

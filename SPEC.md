@@ -43,9 +43,7 @@ Version 1 runs the control plane and `libvirtd` on the same machine.
 
 Bento does not implement virtualization. QEMU and KVM do this. libvirt manages them.
 
-Bento does not run containers.
-
-Bento does not consume OCI images in version 1. Section 18 makes this the first task after version 1.
+Bento does not run application containers. It uses Podman only to convert an operator-approved bootc operating-system image into a static VM disk.
 
 Bento does not place instances across hosts. Version 1 has one host.
 
@@ -85,6 +83,7 @@ Bento generates domain XML from a Go template. Keep one template. Do not build a
 5. Check that both directories are writable.
 6. Read `/sys/kernel/mm/ksm/run`. Warn if the value is 0. See section 5.4.
 7. Read the nested virtualization module parameter. Warn if the parameter is off and any instance requests nested virtualization.
+8. Check for Podman and writable rootful container storage. Refuse to start if either is unavailable when the static allowlist contains an OCI image. Warn otherwise, because an operator can add an OCI image at runtime.
 
 Run `bentod` as a user in the `libvirt` group. This group can create and control any domain on the host. Treat every string that reaches the domain XML as hostile. Escape every value that Bento writes into XML.
 
@@ -132,14 +131,16 @@ For a `qcow2` source, the `fetch-images` command does the following:
 1. Download the file from the URL.
 2. Compute the checksum.
 3. Reject the file if the allowlist pins a checksum and the two do not match.
-4. Return without action if a version with that checksum already exists.
+4. If a version with that checksum already exists, repair a missing stored file if necessary and mark the version current.
 5. Store the file at the content addressed path.
 6. Insert a row in `image_versions`.
 7. Mark the new row as the current version of that image.
 
 An unpinned image is trusted on first use. Bento stores a later version under its own checksum and marks it current. Bento then logs a warning that names both checksums. A change is not an error, because a distribution republishes a cloud image as normal practice. Pin the checksum for any image where a change is not acceptable.
 
-For an `oci` source, Bento pulls it with rootful Podman, records the resolved source digest, and runs the configured image-builder container privileged to produce a qcow2 artifact. It computes the output checksum and then uses steps 4-7 above. A previously successful build of the same image name and source digest is reused. Runtime addition performs this build immediately; `fetch-images` refreshes both source kinds.
+For an `oci` source, Bento accepts only an option-safe registry reference and does not accept a local container transport. It pulls the source with rootful Podman, records the resolved source digest, checks the bootc file contract without privileges or host mounts, and runs a digest-pinned image-builder container privileged to produce a qcow2 artifact. It computes the output checksum and then uses steps 4-7 above. A separate source mapping lets more than one allowlist name select the same content-addressed disk. A previously successful build of the same image name and source digest is reused.
+
+One cross-process lock covers the complete OCI pull, validation, and build pipeline because Podman and image-builder share writable rootful container storage. This lock is separate from the image-version lock, so a long build does not stop an overlay creation. Each Podman operation has an operator-configured timeout. Runtime addition performs the work in a server task: the SSH or HTTP request waits for the result, but a disconnected client does not cancel the build or its final file-and-database commit. If the first build fails, Bento removes the unbuilt allowlist row so the operator can correct and reuse the name.
 
 **Never delete an image version while an overlay depends on it.** A new instance uses the current version. An existing instance keeps the version that Bento built it from. Delete an image version only when no row in `instances` carries its checksum. The `fetch-images` command runs this collection at the end. This deletion is safe because the condition is exact. Compare the reconciliation in section 6.1, where the condition is not exact.
 
@@ -161,7 +162,7 @@ Bento configures the first boot with `cloud-init` and the NoCloud data source. B
 - Set the static address, the gateway, and the DNS server. See section 6.2.
 - Install and start `qemu-guest-agent` for a traditional cloud image. A bootc image must already contain the package because its `/usr` is immutable; first boot only enables it.
 
-A bootc OCI image must contain a kernel, `cloud-init` with the NoCloud data source, and `qemu-guest-agent`. This is the image author's contract. Bento uses the same cloud-init seed and instance lifecycle after conversion; there is no separate boot path.
+A bootc OCI image must contain a kernel, `cloud-init` with the NoCloud data source, and `qemu-guest-agent`. Bento checks the required files before the privileged build. This is a useful preflight, not proof that the resulting guest boots. Bento uses the same cloud-init seed and instance lifecycle after conversion; there is no separate boot path. The source kind is stored on each immutable image version, and instance creation and copy use the kind of the exact backing checksum rather than the mutable allowlist row.
 
 Detach and delete the ISO after the first successful boot. The ISO holds the public keys of the owner. The ISO does not need to stay attached.
 
@@ -451,8 +452,9 @@ Use SQLite with write-ahead logging.
 | `ssh_keys` | `id`, `user_id`, `public_key`, `fingerprint`, `comment`, `created_at` |
 | `pairings` | `id`, `token_hash`, `public_key`, `fingerprint`, `comment`, `created_at`, `expires_at`, `linked_user_id` |
 | `hosts` | `id`, `name`, `libvirt_uri`, `created_at` |
-| `images` | `name`, `url`, `pinned_checksum`, `current_checksum` |
-| `image_versions` | `checksum`, `image_name`, `path`, `size`, `fetched_at` |
+| `images` | `name`, `url`, `kind`, `pinned_checksum`, `current_checksum` |
+| `image_versions` | `checksum`, `image_name`, `path`, `size`, `kind`, `source_digest`, `fetched_at` |
+| `image_source_versions` | `image_name`, `source_digest`, `checksum` |
 | `instances` | `uuid`, `name`, `owner_id`, `host_id`, `image_name`, `base_checksum`, `state`, `desired_state`, `address`, `mac`, `vcpu`, `memory`, `disk`, `nested`, `ksm`, `http_port`, `visibility`, `created_at`, `last_seen_at` |
 | `shares` | `instance_uuid`, `user_id`, `created_at` |
 | `released_names` | `name`, `previous_owner_id`, `released_at` |
@@ -681,6 +683,8 @@ The implementation answers the two design questions as follows:
 - **First boot.** The image contract requires `cloud-init`, NoCloud, and `qemu-guest-agent` in the OCI image.
 - **Size and time.** Builds happen in `fetch-images` or synchronously when an operator appends a runtime entry, never in `new`.
 
+An OCI build uses a privileged container with writable access to the host's rootful container storage. Therefore, permission to append an OCI image is equivalent to host-root trust: an operator controls the content supplied to that privileged workflow. Deployments must grant `operators` accordingly.
+
 The bootc update model applies a new image in place from a registry. That model is out of scope. Bento treats a bootc output as a static image version.
 
 ### 18.2 virtio-mem for live memory change
@@ -710,8 +714,6 @@ A separate public address for each instance removes the user name method in sect
 **The Go libvirt library choice is not settled.** Section 4.1 recommends `go-libvirt` because it builds without cgo. Confirm that it covers every call in section 11 before you commit.
 
 **The cooldown period is a guess.** Section 7.2 sets 24 hours with no evidence. Pick a number and watch for complaints.
-
-**The image store has no lock.** A `fetch-images` collection can delete a version while a `new` command reads it. Take a lock around image version creation and deletion. An alternative is to run the collection only when no create is in progress.
 
 **The disk quota counts virtual size, not real size.** A user with a 100 GiB quota can create ten 10 GiB instances that together use 4 GiB on disk. The quota is a worst case bound. Decide whether that is the number to show a user, or whether `ls` shows both numbers.
 

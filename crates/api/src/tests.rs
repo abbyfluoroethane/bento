@@ -1093,6 +1093,11 @@ async fn images_count_instances_on_old_versions() {
     assert_eq!(by_name["debian-13"].instances_on_older_versions, 2);
     assert_eq!(by_name["fedora-42"].instances_on_older_versions, 0);
     assert_eq!(by_name["debian-13"].pinned_checksum, "");
+    assert_eq!(by_name["debian-13"].source, "https://example.com/d13.qcow2");
+    assert_eq!(
+        by_name["debian-13"].url, by_name["debian-13"].source,
+        "legacy clients retain the url response alias"
+    );
 }
 
 #[tokio::test]
