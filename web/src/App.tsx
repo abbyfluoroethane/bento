@@ -21,8 +21,16 @@ export function App() {
       <div className="mx-auto max-w-5xl px-4 pb-16">
         <header className="flex items-center justify-between gap-4 py-5">
           <div className="flex items-center gap-6">
-            <h1 className="text-lg font-semibold tracking-tight">
-              <span aria-hidden>🍱</span> bento
+            <h1>
+              <span
+                role="img"
+                aria-label="bento"
+                className={cn(
+                  "block h-6 aspect-[722/136] bg-text",
+                  "[mask-image:url(/branding/wordmark.png)] [mask-repeat:no-repeat] [mask-size:contain] [mask-position:left_center]",
+                  "[-webkit-mask-image:url(/branding/wordmark.png)] [-webkit-mask-repeat:no-repeat] [-webkit-mask-size:contain] [-webkit-mask-position:left_center]",
+                )}
+              />
             </h1>
             <Tabs.List aria-label="Sections" className="flex gap-1">
               {tabs.map((t) => (
