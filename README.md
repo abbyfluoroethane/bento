@@ -8,8 +8,9 @@ HTTPS and as `ssh NAME@<your-domain>`. One binary, `bentod`, runs
 everything.
 
 [SPEC.md](SPEC.md) is the system specification. It is authoritative. Read
-it before you change anything. [DEPLOYING.md](DEPLOYING.md) is the runbook
-for a new host.
+it before you change anything. [MULTI-NODE.md](MULTI-NODE.md) is the
+proposed, not-yet-implemented design for more than one VM runner.
+[DEPLOYING.md](DEPLOYING.md) is the runbook for a new host.
 
 ## Screenshots
 
