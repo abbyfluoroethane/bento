@@ -104,8 +104,8 @@ export function ImagesView() {
                 <tr key={img.name} className="hover:bg-mantle">
                   <td className="px-3 py-2 font-mono">{img.name}</td>
                   <td className="px-3 py-2">{img.kind}</td>
-                  <td className="max-w-xs truncate px-3 py-2 font-mono" title={img.url}>
-                    {img.url}
+                  <td className="max-w-xs truncate px-3 py-2 font-mono" title={img.source}>
+                    {img.source}
                   </td>
                   <td className="px-3 py-2 font-mono" title={img.current_checksum}>
                     {shortChecksum(img.current_checksum)}

@@ -12,7 +12,7 @@ use bento_hypervisor::{
     StopResult,
 };
 use bento_network::Plan;
-use bento_types::{DesiredState, Image, Instance, State, User};
+use bento_types::{DesiredState, Image, ImageKind, ImageVersion, Instance, State, User};
 use tempfile::TempDir;
 use time::macros::datetime;
 
@@ -27,6 +27,7 @@ struct StoreData {
     instances: Vec<Instance>,
     users: HashMap<i64, User>,
     images: HashMap<String, Image>,
+    versions: HashMap<String, ImageVersion>,
     mutations: Vec<String>,
     released: Vec<String>,
     create_error: Option<String>,
@@ -54,16 +55,34 @@ impl TestStore {
         user
     }
     fn add_image(&self, checksum: Option<&str>) {
-        self.data().images.insert(
+        self.add_image_kind(checksum, ImageKind::Qcow2);
+    }
+    fn add_image_kind(&self, checksum: Option<&str>, kind: ImageKind) {
+        let mut data = self.data();
+        data.images.insert(
             "debian-13".into(),
             Image {
                 name: "debian-13".into(),
                 url: "https://example.test/debian".into(),
-                kind: Default::default(),
+                kind,
                 pinned_checksum: None,
                 current_checksum: checksum.map(str::to_string),
             },
         );
+        if let Some(checksum) = checksum {
+            data.versions.insert(
+                checksum.to_owned(),
+                ImageVersion {
+                    checksum: checksum.to_owned(),
+                    image_name: "debian-13".into(),
+                    path: format!("/images/{checksum}.qcow2"),
+                    size: 1,
+                    kind,
+                    source_digest: None,
+                    fetched_at: datetime!(2026-08-10 12:00 UTC),
+                },
+            );
+        }
     }
 }
 
@@ -122,6 +141,13 @@ impl Store for TestStore {
             .get(name)
             .cloned()
             .ok_or_else(|| boxed(&format!("no image {name}")))
+    }
+    async fn image_version(&self, checksum: &str) -> std::result::Result<ImageVersion, DynError> {
+        self.data()
+            .versions
+            .get(checksum)
+            .cloned()
+            .ok_or_else(|| boxed(&format!("no image version {checksum}")))
     }
     async fn user_by_id(&self, id: i64) -> std::result::Result<User, DynError> {
         self.data()
@@ -452,6 +478,21 @@ async fn new_instance() {
     assert_eq!(domain.state, State::Running);
     assert!(domain.xml.contains("bento-user-0"));
     assert!(domain.xml.contains(&instance.mac));
+}
+
+#[tokio::test]
+async fn new_uses_immutable_version_kind_not_mutable_allowlist_kind() {
+    let f = fixture(false, false);
+    let owner = f.store.add_user(1, "amber", "10.77.0.0/24");
+    f.store.add_image_kind(Some("bootc-disk"), ImageKind::Oci);
+    f.store.data().images.get_mut("debian-13").unwrap().kind = ImageKind::Qcow2;
+
+    let instance = f.manager.create(request(owner, "bootc")).await.unwrap();
+    let seed = f.iso.seeds.lock().unwrap()[&f.manager.seed_iso_path(&instance.uuid)].clone();
+    assert!(
+        !seed.install_guest_agent,
+        "bootc disks must not mutate /usr"
+    );
 }
 
 #[tokio::test]
@@ -791,6 +832,7 @@ async fn copy_instance() {
     let source = setup(&f).await;
     f.manager.stop(&source.uuid).await.unwrap();
     let owner = f.store.user_by_id(1).await.unwrap();
+    f.store.data().images.get_mut("debian-13").unwrap().kind = ImageKind::Oci;
     let clone = f
         .manager
         .copy(&source.uuid, copy_request(owner, "clone"))
@@ -807,6 +849,10 @@ async fn copy_instance() {
     let seed = f.iso.seeds.lock().unwrap()[&f.manager.seed_iso_path(&clone.uuid)].clone();
     assert_eq!(seed.instance_id, clone.uuid);
     assert_eq!(seed.hostname, "clone");
+    assert!(
+        seed.install_guest_agent,
+        "copy must retain the source version's qcow2 behavior"
+    );
 }
 
 #[tokio::test]

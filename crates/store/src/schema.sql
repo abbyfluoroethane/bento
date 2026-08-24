@@ -59,8 +59,19 @@ CREATE TABLE IF NOT EXISTS image_versions (
     image_name TEXT    NOT NULL REFERENCES images(name),
     path       TEXT    NOT NULL UNIQUE,
     size       INTEGER NOT NULL,
+    kind       TEXT    NOT NULL DEFAULT 'qcow2'
+               CHECK (kind IN ('qcow2', 'oci')),
     source_digest TEXT,
     fetched_at TEXT    NOT NULL
+);
+
+-- One physical disk can be selected by more than one allowlist name. Keep
+-- source-digest cache keys separately from the content-addressed file row.
+CREATE TABLE IF NOT EXISTS image_source_versions (
+    image_name    TEXT NOT NULL REFERENCES images(name) ON DELETE CASCADE,
+    source_digest TEXT NOT NULL,
+    checksum      TEXT NOT NULL REFERENCES image_versions(checksum) ON DELETE CASCADE,
+    PRIMARY KEY (image_name, source_digest)
 );
 
 -- The uuid is the identifier; the name is a label (SPEC 7.2).

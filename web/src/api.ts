@@ -52,7 +52,7 @@ export interface Whoami {
 
 export interface Image {
   name: string;
-  url: string;
+  source: string;
   kind: "qcow2" | "oci" | string;
   pinned_checksum: string;
   current_checksum: string;

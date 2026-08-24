@@ -166,6 +166,7 @@ impl Env {
                 image_name: "debian-13".into(),
                 path: "/var/lib/bento/images/sha256-aa11.qcow2".into(),
                 size: 1,
+                kind: Default::default(),
                 source_digest: None,
                 fetched_at: OffsetDateTime::now_utc(),
             })

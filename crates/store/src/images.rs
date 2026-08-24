@@ -76,18 +76,95 @@ impl Store {
         self.with_conn(move |conn| {
             conn.execute(
                 "INSERT INTO image_versions \
-                 (checksum, image_name, path, size, source_digest, fetched_at) \
-                 VALUES (?, ?, ?, ?, ?, ?)",
+                 (checksum, image_name, path, size, kind, source_digest, fetched_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?)",
                 params![
                     version.checksum,
                     version.image_name,
                     version.path,
                     version.size,
+                    version.kind.as_str(),
                     version.source_digest,
                     format_time(version.fetched_at)?
                 ],
             )?;
             Ok(())
+        })
+        .await
+    }
+
+    /// Returns one immutable physical image version by checksum.
+    pub async fn image_version(&self, checksum: impl Into<String>) -> Result<ImageVersion> {
+        let checksum = checksum.into();
+        self.with_conn(move |conn| {
+            conn.query_row(
+                "SELECT checksum, image_name, path, size, kind, source_digest, fetched_at \
+                 FROM image_versions WHERE checksum = ?",
+                [checksum],
+                scan_image_version,
+            )
+            .optional()?
+            .ok_or(Error::NotFound)
+        })
+        .await
+    }
+
+    /// Returns the disk previously built from one named OCI source digest.
+    pub async fn image_version_for_source(
+        &self,
+        image_name: impl Into<String>,
+        source_digest: impl Into<String>,
+    ) -> Result<Option<ImageVersion>> {
+        let image_name = image_name.into();
+        let source_digest = source_digest.into();
+        self.with_conn(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT v.checksum, v.image_name, v.path, v.size, v.kind, \
+                            v.source_digest, v.fetched_at \
+                     FROM image_source_versions s \
+                     JOIN image_versions v ON v.checksum = s.checksum \
+                     WHERE s.image_name = ? AND s.source_digest = ?",
+                    params![image_name, source_digest],
+                    scan_image_version,
+                )
+                .optional()?)
+        })
+        .await
+    }
+
+    /// Records the source digest that selected a content-addressed disk.
+    pub async fn record_image_source(
+        &self,
+        image_name: impl Into<String>,
+        source_digest: impl Into<String>,
+        checksum: impl Into<String>,
+    ) -> Result<()> {
+        let image_name = image_name.into();
+        let source_digest = source_digest.into();
+        let checksum = checksum.into();
+        self.with_conn(move |conn| {
+            conn.execute(
+                "INSERT INTO image_source_versions (image_name, source_digest, checksum) \
+                 VALUES (?, ?, ?) \
+                 ON CONFLICT(image_name, source_digest) DO UPDATE SET checksum = excluded.checksum",
+                params![image_name, source_digest, checksum],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Removes a failed runtime addition only while nothing references it.
+    pub async fn delete_unbuilt_image(&self, name: impl Into<String>) -> Result<bool> {
+        let name = name.into();
+        self.with_conn(move |conn| {
+            Ok(conn.execute(
+                "DELETE FROM images WHERE name = ? AND current_checksum IS NULL \
+                 AND NOT EXISTS (SELECT 1 FROM image_versions WHERE image_name = images.name) \
+                 AND NOT EXISTS (SELECT 1 FROM instances WHERE image_name = images.name)",
+                [name],
+            )? == 1)
         })
         .await
     }
@@ -118,10 +195,23 @@ impl Store {
         let image_name = image_name.into();
         self.with_conn(move |conn| {
             let mut statement = conn.prepare(
-                "SELECT checksum, image_name, path, size, source_digest, fetched_at FROM image_versions \
+                "SELECT checksum, image_name, path, size, kind, source_digest, fetched_at FROM image_versions \
                  WHERE image_name = ? ORDER BY fetched_at DESC, checksum",
             )?;
             let rows = statement.query_map([image_name], scan_image_version)?;
+            Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        })
+        .await
+    }
+
+    /// Lists every physical image version.
+    pub async fn all_image_versions(&self) -> Result<Vec<ImageVersion>> {
+        self.with_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT checksum, image_name, path, size, kind, source_digest, fetched_at \
+                 FROM image_versions ORDER BY fetched_at DESC, checksum",
+            )?;
+            let rows = statement.query_map([], scan_image_version)?;
             Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
         })
         .await
@@ -133,7 +223,7 @@ impl Store {
     pub async fn unused_image_versions(&self) -> Result<Vec<ImageVersion>> {
         self.with_conn(|conn| {
             let mut statement = conn.prepare(
-                "SELECT checksum, image_name, path, size, source_digest, fetched_at FROM image_versions \
+                "SELECT checksum, image_name, path, size, kind, source_digest, fetched_at FROM image_versions \
                  WHERE checksum NOT IN (SELECT base_checksum FROM instances) \
                  AND checksum NOT IN ( \
                     SELECT current_checksum FROM images WHERE current_checksum IS NOT NULL) \
@@ -179,14 +269,25 @@ fn scan_image(row: &rusqlite::Row<'_>) -> rusqlite::Result<Image> {
 }
 
 fn scan_image_version(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImageVersion> {
-    let fetched: String = row.get(5)?;
+    let kind: String = row.get(4)?;
+    let fetched: String = row.get(6)?;
     Ok(ImageVersion {
         checksum: row.get(0)?,
         image_name: row.get(1)?,
         path: row.get(2)?,
         size: row.get(3)?,
-        source_digest: row.get(4)?,
-        fetched_at: parse_time(5, &fetched)?,
+        kind: kind.parse().map_err(|message: String| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    message,
+                )),
+            )
+        })?,
+        source_digest: row.get(5)?,
+        fetched_at: parse_time(6, &fetched)?,
     })
 }
 
@@ -209,6 +310,7 @@ mod tests {
                 image_name: "debian-13".into(),
                 path: "/var/lib/bento/images/sha256-old.qcow2".into(),
                 size: 2,
+                kind: Default::default(),
                 source_digest: None,
                 fetched_at: datetime!(2025-12-01 0:00 UTC),
             })

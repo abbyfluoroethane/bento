@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use bento_cloudinit::Seed;
 use bento_hypervisor::{AutostartClearer, Definer, DomainSpec, Hypervisor};
 use bento_network::{AddressStore, Ipv4Prefix, Plan, UserNetwork};
-use bento_types::{DesiredState, Image, Instance, State, User};
+use bento_types::{DesiredState, Image, ImageVersion, Instance, State, User};
 use time::OffsetDateTime;
 
 use crate::{Error, QemuImgResizer};
@@ -38,6 +38,7 @@ pub trait Store: Send + Sync {
     /// Lists desired-running, observed-stopped instances (SPEC 11.2).
     async fn instances_to_restore(&self) -> std::result::Result<Vec<Instance>, DynError>;
     async fn image(&self, name: &str) -> std::result::Result<Image, DynError>;
+    async fn image_version(&self, checksum: &str) -> std::result::Result<ImageVersion, DynError>;
     async fn user_by_id(&self, id: i64) -> std::result::Result<User, DynError>;
     /// Changes the row name and releases the old one atomically (SPEC 7.2).
     async fn rename_instance(

@@ -56,11 +56,13 @@ pub mod defaults {
     /// unset (SPEC 6.2).
     pub const DNS: [&str; 2] = ["1.1.1.1", "9.9.9.9"];
     /// Containerized image-builder used to turn bootc images into qcow2.
-    pub const BOOTC_BUILDER_IMAGE: &str = "ghcr.io/osbuild/image-builder-cli:latest";
+    pub const BOOTC_BUILDER_IMAGE: &str = "";
     /// Root filesystem used when a bootc image does not declare one.
     pub const BOOTC_ROOTFS: &str = "ext4";
     /// Rootful Podman storage shared with the image-builder container.
     pub const CONTAINER_STORAGE: &str = "/var/lib/containers/storage";
+    /// Maximum duration of one Podman pull, validation, or image build.
+    pub const BOOTC_BUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 }
 
 /// Anything that stops `bentod` from reading its configuration.
@@ -179,12 +181,14 @@ pub struct Defaults {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Bootc {
-    /// Pin this reference by digest in production for reproducible tooling.
+    /// Required for OCI support and always pinned by digest.
     pub builder_image: String,
     /// Passed to image-builder for images that do not declare a rootfs.
     pub rootfs: String,
     /// Rootful Podman storage containing pulled bootc images.
     pub container_storage: String,
+    /// Bounds each Podman operation, including image-builder.
+    pub build_timeout: GoDuration,
 }
 
 impl Default for Bootc {
@@ -193,6 +197,7 @@ impl Default for Bootc {
             builder_image: defaults::BOOTC_BUILDER_IMAGE.to_owned(),
             rootfs: defaults::BOOTC_ROOTFS.to_owned(),
             container_storage: defaults::CONTAINER_STORAGE.to_owned(),
+            build_timeout: GoDuration(defaults::BOOTC_BUILD_TIMEOUT),
         }
     }
 }
@@ -444,14 +449,14 @@ impl Config {
                 "defaults: vcpu, memory_mib, and disk_gib must be positive",
             ));
         }
-        if self.bootc.builder_image.is_empty() {
-            return Err(invalid("bootc: builder_image is required"));
-        }
         if !matches!(self.bootc.rootfs.as_str(), "ext4" | "xfs" | "btrfs") {
             return Err(invalid("bootc: rootfs must be one of ext4, xfs, or btrfs"));
         }
         if self.bootc.container_storage.is_empty() {
             return Err(invalid("bootc: container_storage is required"));
+        }
+        if self.bootc.build_timeout.std().is_zero() {
+            return Err(invalid("bootc: build_timeout must be positive"));
         }
         let mut seen = std::collections::HashSet::new();
         for img in &self.images {
@@ -464,12 +469,40 @@ impl Config {
                     img.name
                 )));
             }
+            if !img.oci.is_empty() && img.pinned_checksum.is_some() {
+                return Err(invalid(format!(
+                    "images: OCI entry {:?} cannot set pinned_checksum; pin the OCI reference digest instead",
+                    img.name
+                )));
+            }
             if !seen.insert(img.name.as_str()) {
                 return Err(invalid(format!("images: duplicate entry {:?}", img.name)));
             }
         }
+        let has_oci = self.images.iter().any(|image| !image.oci.is_empty());
+        if has_oci && self.bootc.builder_image.is_empty() {
+            return Err(invalid(
+                "bootc: builder_image pinned by sha256 digest is required for OCI images",
+            ));
+        }
+        if !self.bootc.builder_image.is_empty() && !pinned_oci_reference(&self.bootc.builder_image)
+        {
+            return Err(invalid(
+                "bootc: builder_image must use an immutable @sha256:<64 hex> digest",
+            ));
+        }
         Ok(())
     }
+}
+
+fn pinned_oci_reference(reference: &str) -> bool {
+    reference
+        .rsplit_once("@sha256:")
+        .is_some_and(|(name, digest)| {
+            !name.is_empty()
+                && digest.len() == 64
+                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
 }
 
 /// Resolves a listen address for binding. A leading `:` means every
@@ -510,6 +543,8 @@ mod tests {
         assert_eq!(cfg.listen.tls, TlsMode::Acme);
         assert_eq!(cfg.bootc.rootfs, "ext4");
         assert_eq!(cfg.bootc.container_storage, "/var/lib/containers/storage");
+        assert!(cfg.bootc.builder_image.is_empty());
+        assert_eq!(cfg.bootc.build_timeout.std(), Duration::from_secs(30 * 60));
     }
 
     #[test]
@@ -626,9 +661,44 @@ pinned_checksum = "sha256-deadbeef"
             "rootfs",
         );
         parse_err(
+            "base_domain = \"b.example\"\n[bootc]\nbuild_timeout = \"0s\"",
+            "build_timeout",
+        );
+        parse_err(
+            "base_domain = \"b.example\"\n[[images]]\nname = \"oci\"\noci = \"quay.io/x/os:latest\"",
+            "builder_image",
+        );
+        parse_err(
+            "base_domain = \"b.example\"\n[bootc]\nbuilder_image = \"quay.io/centos-bootc/bootc-image-builder:latest\"",
+            "immutable",
+        );
+        parse_err(
+            &format!(
+                "base_domain = \"b.example\"\n[bootc]\nbuilder_image = \"quay.io/builder@sha256:{}\"\n[[images]]\nname = \"oci\"\noci = \"quay.io/x/os:latest\"\npinned_checksum = \"abc\"",
+                "12".repeat(32)
+            ),
+            "cannot set pinned_checksum",
+        );
+        parse_err(
             "base_domain = \"b.example\"\n[[images]]\nname = \"a\"\nurl = \"https://x/a\"\n\
              [[images]]\nname = \"a\"\nurl = \"https://x/b\"",
             "duplicate",
+        );
+    }
+
+    #[test]
+    fn parse_oci_with_pinned_builder() {
+        let cfg = Config::parse(&format!(
+            "base_domain = \"b.example\"\n[bootc]\nbuilder_image = \"quay.io/builder@sha256:{}\"\nbuild_timeout = \"45m\"\n[[images]]\nname = \"oci\"\noci = \"quay.io/x/os@sha256:{}\"",
+            "12".repeat(32),
+            "34".repeat(32)
+        ))
+        .unwrap();
+        assert_eq!(cfg.bootc.build_timeout.std(), Duration::from_secs(45 * 60));
+        assert!(cfg.images[0].url.is_empty());
+        assert_eq!(
+            cfg.images[0].oci,
+            format!("quay.io/x/os@sha256:{}", "34".repeat(32))
         );
     }
 

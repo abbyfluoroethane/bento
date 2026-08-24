@@ -204,6 +204,18 @@ fn migrate_image_sources(conn: &Connection) -> Result<()> {
     if !has_column(conn, "image_versions", "source_digest")? {
         conn.execute_batch("ALTER TABLE image_versions ADD COLUMN source_digest TEXT;")?;
     }
+    if !has_column(conn, "image_versions", "kind")? {
+        conn.execute_batch(
+            "ALTER TABLE image_versions ADD COLUMN kind TEXT NOT NULL DEFAULT 'qcow2' \
+             CHECK (kind IN ('qcow2', 'oci')); \
+             UPDATE image_versions SET kind = 'oci' WHERE source_digest IS NOT NULL;",
+        )?;
+    }
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO image_source_versions (image_name, source_digest, checksum) \
+         SELECT image_name, source_digest, checksum FROM image_versions \
+         WHERE source_digest IS NOT NULL;",
+    )?;
     Ok(())
 }
 

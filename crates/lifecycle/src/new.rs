@@ -63,6 +63,9 @@ impl Manager {
             .current_checksum
             .filter(|value| !value.is_empty())
             .ok_or_else(|| Error::NoImageVersion(request.image_name.clone()))?;
+        let image_version = self.store.image_version(&checksum).await.map_err(|error| {
+            Error::operation(format!("lifecycle: image version {checksum:?}: {error}"))
+        })?;
         let subnet = parse_prefix(&request.owner.subnet).map_err(|error| {
             Error::operation(format!(
                 "lifecycle: user {} has a bad subnet {:?}: {error}",
@@ -114,7 +117,12 @@ impl Manager {
                     .await);
             }
         };
-        let seed = seed(&instance, &request, &guest, image.kind != ImageKind::Oci);
+        let seed = seed(
+            &instance,
+            &request,
+            &guest,
+            image_version.kind != ImageKind::Oci,
+        );
         if let Err(error) = self.iso.build(&seed, &self.seed_iso_path(&uuid)).await {
             return Err(self.unwind_new(&instance, error, true, false).await);
         }

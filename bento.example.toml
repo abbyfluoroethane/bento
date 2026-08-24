@@ -51,12 +51,15 @@ operators = []
 
 [bootc]
 # Bento runs image-builder as a privileged Podman container to turn a
-# bootc-compatible OCI image into qcow2. Pin this by digest in production.
-#builder_image = "ghcr.io/osbuild/image-builder-cli:latest"
+# bootc-compatible OCI image into qcow2. This has no default: configure an
+# immutable digest before adding any OCI image.
+#builder_image = "ghcr.io/osbuild/image-builder-cli@sha256:<64-hex-digest>"
 # Filesystem fallback for images such as Fedora that do not declare one.
 #rootfs = "ext4"
 # Rootful Podman storage shared read-write with the builder container.
 #container_storage = "/var/lib/containers/storage"
+# Maximum duration of each pull, validation, or image build.
+#build_timeout = "30m"
 
 [listen]
 # Control plane (dashboard and API), reached through the HTTP proxy.

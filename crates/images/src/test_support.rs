@@ -29,6 +29,7 @@ struct FakeDbState {
     in_use: HashMap<String, bool>,
     inserted: Vec<ImageVersion>,
     deleted: Vec<String>,
+    source_versions: HashMap<(String, String), String>,
 }
 
 impl FakeDb {
@@ -82,6 +83,23 @@ impl DB for FakeDb {
         }
         state.images.push(image);
         Ok(true)
+    }
+
+    async fn delete_unbuilt_image(&self, name: &str) -> std::result::Result<bool, DynError> {
+        let mut state = self.0.lock().expect("db");
+        let can_delete = state
+            .images
+            .iter()
+            .find(|image| image.name == name)
+            .is_some_and(|image| image.current_checksum.is_none())
+            && !state
+                .versions
+                .values()
+                .any(|version| version.image_name == name);
+        if can_delete {
+            state.images.retain(|image| image.name != name);
+        }
+        Ok(can_delete)
     }
 
     async fn upsert_image(&self, image: Image) -> std::result::Result<(), DynError> {
@@ -142,6 +160,32 @@ impl DB for FakeDb {
             .values()
             .cloned()
             .collect())
+    }
+
+    async fn image_version_for_source(
+        &self,
+        image_name: &str,
+        source_digest: &str,
+    ) -> std::result::Result<Option<ImageVersion>, DynError> {
+        let state = self.0.lock().expect("db");
+        Ok(state
+            .source_versions
+            .get(&(image_name.to_owned(), source_digest.to_owned()))
+            .and_then(|checksum| state.versions.get(checksum))
+            .cloned())
+    }
+
+    async fn record_image_source(
+        &self,
+        image_name: &str,
+        source_digest: &str,
+        checksum: &str,
+    ) -> std::result::Result<(), DynError> {
+        self.0.lock().expect("db").source_versions.insert(
+            (image_name.to_owned(), source_digest.to_owned()),
+            checksum.to_owned(),
+        );
+        Ok(())
     }
 
     async fn delete_image_version(&self, checksum: &str) -> std::result::Result<(), DynError> {

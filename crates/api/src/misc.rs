@@ -182,6 +182,9 @@ pub(crate) async fn handle_whoami(
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct ImageJson {
     pub(crate) name: String,
+    /// Canonical source field for both download URLs and OCI references.
+    pub(crate) source: String,
+    /// Deprecated response alias retained for existing clients.
     pub(crate) url: String,
     pub(crate) kind: String,
     pub(crate) pinned_checksum: String,
@@ -226,6 +229,7 @@ pub(crate) async fn list_images(
         .map(|image| ImageJson {
             instances_on_older_versions: older.get(&image.name).copied().unwrap_or_default(),
             name: image.name,
+            source: image.url.clone(),
             url: image.url,
             kind: image.kind.as_str().to_owned(),
             pinned_checksum: image.pinned_checksum.unwrap_or_default(),

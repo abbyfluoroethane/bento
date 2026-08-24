@@ -29,6 +29,10 @@ pub struct CheckConfig {
     pub socket_path: PathBuf,
     pub image_dir: PathBuf,
     pub storage_dir: PathBuf,
+    /// Rootful Podman storage used by bootc image builds.
+    pub container_storage: PathBuf,
+    /// Missing bootc dependencies are fatal only when OCI images are configured.
+    pub podman_required: bool,
     pub ksm_run_path: PathBuf,
     pub nested_paths: Vec<PathBuf>,
     /// The nested check only warns when at least one instance requests
@@ -194,6 +198,17 @@ pub fn check(config: CheckConfig, deps: &CheckDeps) -> CheckReport {
         ));
     }
 
+    let podman = (deps.look_path)("podman");
+    let podman_detail = podman
+        .as_ref()
+        .map_or_else(|_| String::new(), |path| path.display().to_string());
+    report.results.push(result(
+        "podman binary",
+        config.podman_required,
+        podman.map(drop),
+        podman_detail,
+    ));
+
     for (name, directory) in [
         ("image directory", &config.image_dir),
         ("storage directory", &config.storage_dir),
@@ -216,6 +231,35 @@ pub fn check(config: CheckConfig, deps: &CheckDeps) -> CheckReport {
             report.results.push(result(
                 &format!("{name} writable"),
                 true,
+                (deps.write_probe)(directory),
+                directory.display().to_string(),
+            ));
+        }
+    }
+
+    if !config.container_storage.as_os_str().is_empty() {
+        let directory = &config.container_storage;
+        let stat = (deps.stat)(directory).and_then(|kind| {
+            if kind == FileKind::Directory {
+                Ok(())
+            } else {
+                Err(io::Error::other(format!(
+                    "{} is not a directory",
+                    directory.display()
+                )))
+            }
+        });
+        let exists = stat.is_ok();
+        report.results.push(result(
+            "container storage directory",
+            config.podman_required,
+            stat,
+            directory.display().to_string(),
+        ));
+        if exists {
+            report.results.push(result(
+                "container storage directory writable",
+                config.podman_required,
                 (deps.write_probe)(directory),
                 directory.display().to_string(),
             ));
@@ -315,7 +359,7 @@ mod tests {
         CheckDeps {
             stat: Arc::new(|path| match path.to_str().unwrap() {
                 "/dev/kvm" => Ok(FileKind::File),
-                "/img" | "/store" => Ok(FileKind::Directory),
+                "/img" | "/store" | "/containers" => Ok(FileKind::Directory),
                 _ => Err(io::Error::from(io::ErrorKind::NotFound)),
             }),
             read_file: Arc::new(|path| match path.to_str().unwrap() {
@@ -333,6 +377,7 @@ mod tests {
         CheckConfig {
             image_dir: "/img".into(),
             storage_dir: "/store".into(),
+            container_storage: "/containers".into(),
             ..Default::default()
         }
     }
@@ -355,10 +400,13 @@ mod tests {
             "libvirtd socket",
             "qemu-img binary",
             "xorriso binary",
+            "podman binary",
             "image directory",
             "image directory writable",
             "storage directory",
             "storage directory writable",
+            "container storage directory",
+            "container storage directory writable",
             "ksm run",
         ] {
             assert!(named(&report, name).ok, "{name} failed");
@@ -455,6 +503,37 @@ mod tests {
         });
         check(healthy_config(), &deps);
         assert!(!probed.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[test]
+    fn bootc_dependencies_warn_until_an_oci_image_requires_them() {
+        let mut deps = healthy_deps();
+        let stat = deps.stat.clone();
+        deps.stat = Arc::new(move |path| {
+            if path == Path::new("/containers") {
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            } else {
+                stat(path)
+            }
+        });
+        deps.look_path = Arc::new(|name| {
+            if name == "podman" {
+                Err(io::Error::from(io::ErrorKind::NotFound))
+            } else {
+                Ok(PathBuf::from(format!("/usr/bin/{name}")))
+            }
+        });
+
+        let report = check(healthy_config(), &deps);
+        assert!(report.ok());
+        assert_eq!(report.warnings().len(), 2);
+
+        let mut required = healthy_config();
+        required.podman_required = true;
+        let report = check(required, &deps);
+        assert!(!report.ok());
+        assert!(named(&report, "podman binary").fatal);
+        assert!(named(&report, "container storage directory").fatal);
     }
 
     #[test]

@@ -20,6 +20,8 @@ pub const DEFAULT_DIR: &str = "/var/lib/bento/images";
 /// The flock file inside the image directory. It guards image version
 /// creation and deletion across processes (SPEC section 19).
 const LOCK_FILE_NAME: &str = ".lock";
+/// Serializes Podman storage access without blocking overlay creation.
+const OCI_LOCK_FILE_NAME: &str = ".oci.lock";
 
 /// A thread-safe dynamic error returned through an injection seam.
 pub type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -238,6 +240,8 @@ async fn read_command_output(file: File) -> io::Result<Vec<u8>> {
 pub trait DB: Send + Sync {
     /// Appends a new persistent allowlist entry without replacement.
     async fn insert_image(&self, image: Image) -> std::result::Result<bool, DynError>;
+    /// Removes an allowlist entry whose first runtime build failed.
+    async fn delete_unbuilt_image(&self, name: &str) -> std::result::Result<bool, DynError>;
     /// Inserts or updates one persistent allowlist entry.
     async fn upsert_image(&self, image: Image) -> std::result::Result<(), DynError>;
     /// Returns the operator allowlist with current checksums.
@@ -257,6 +261,19 @@ pub trait DB: Send + Sync {
     ) -> std::result::Result<(), DynError>;
     /// Returns every image_versions row.
     async fn image_versions(&self) -> std::result::Result<Vec<ImageVersion>, DynError>;
+    /// Finds a previous conversion by the named OCI source digest.
+    async fn image_version_for_source(
+        &self,
+        image_name: &str,
+        source_digest: &str,
+    ) -> std::result::Result<Option<ImageVersion>, DynError>;
+    /// Associates an OCI source digest with its physical disk version.
+    async fn record_image_source(
+        &self,
+        image_name: &str,
+        source_digest: &str,
+        checksum: &str,
+    ) -> std::result::Result<(), DynError>;
     /// Deletes one image_versions row.
     async fn delete_image_version(&self, checksum: &str) -> std::result::Result<(), DynError>;
     /// Reports whether any instances row carries the checksum in
@@ -268,6 +285,10 @@ pub trait DB: Send + Sync {
 impl<T: DB + ?Sized> DB for Arc<T> {
     async fn insert_image(&self, image: Image) -> std::result::Result<bool, DynError> {
         (**self).insert_image(image).await
+    }
+
+    async fn delete_unbuilt_image(&self, name: &str) -> std::result::Result<bool, DynError> {
+        (**self).delete_unbuilt_image(name).await
     }
 
     async fn upsert_image(&self, image: Image) -> std::result::Result<(), DynError> {
@@ -300,6 +321,27 @@ impl<T: DB + ?Sized> DB for Arc<T> {
         (**self).image_versions().await
     }
 
+    async fn image_version_for_source(
+        &self,
+        image_name: &str,
+        source_digest: &str,
+    ) -> std::result::Result<Option<ImageVersion>, DynError> {
+        (**self)
+            .image_version_for_source(image_name, source_digest)
+            .await
+    }
+
+    async fn record_image_source(
+        &self,
+        image_name: &str,
+        source_digest: &str,
+        checksum: &str,
+    ) -> std::result::Result<(), DynError> {
+        (**self)
+            .record_image_source(image_name, source_digest, checksum)
+            .await
+    }
+
     async fn delete_image_version(&self, checksum: &str) -> std::result::Result<(), DynError> {
         (**self).delete_image_version(checksum).await
     }
@@ -312,6 +354,7 @@ impl<T: DB + ?Sized> DB for Arc<T> {
 /// The content-addressed image store. One version lives at
 /// `dir()/sha256-<hex>.qcow2`; the path never changes, and the path never
 /// holds different content.
+#[derive(Clone)]
 pub struct Store {
     pub(crate) dir: PathBuf,
     pub(crate) db: Arc<dyn DB>,
@@ -322,12 +365,14 @@ pub struct Store {
     pub(crate) builder_image: String,
     pub(crate) bootc_rootfs: String,
     pub(crate) container_storage: PathBuf,
+    pub(crate) build_timeout: std::time::Duration,
 
     // Serializes version creation and deletion inside this process. The
     // flock on LOCK_FILE_NAME does the same across processes. Together
     // they close the open item in SPEC section 19: a fetch-images
     // collection cannot delete a version while a create reads it.
     lock: Arc<Mutex<()>>,
+    oci_lock: Arc<Mutex<()>>,
 }
 
 impl Store {
@@ -347,10 +392,12 @@ impl Store {
             runner: Arc::new(CommandRunner),
             qemu_img: OsString::from("qemu-img"),
             podman: OsString::from("podman"),
-            builder_image: "ghcr.io/osbuild/image-builder-cli:latest".to_owned(),
+            builder_image: String::new(),
             bootc_rootfs: "ext4".to_owned(),
             container_storage: PathBuf::from("/var/lib/containers/storage"),
+            build_timeout: std::time::Duration::from_secs(30 * 60),
             lock: Arc::new(Mutex::new(())),
+            oci_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -400,6 +447,13 @@ impl Store {
         self
     }
 
+    /// Bounds each Podman operation, including image-builder.
+    #[must_use]
+    pub fn with_build_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.build_timeout = timeout;
+        self
+    }
+
     /// Returns the image directory.
     pub fn dir(&self) -> &Path {
         &self.dir
@@ -425,7 +479,22 @@ impl Store {
     /// Takes the in-process mutex and then an exclusive flock on the lock
     /// file in the image directory. The guard releases both when dropped.
     pub(crate) async fn acquire_lock(&self) -> Result<StoreLock> {
-        let process_guard = Arc::clone(&self.lock).lock_owned().await;
+        self.acquire_named_lock(Arc::clone(&self.lock), LOCK_FILE_NAME)
+            .await
+    }
+
+    /// Serializes the complete pull/validate/build pipeline across processes.
+    pub(crate) async fn acquire_oci_lock(&self) -> Result<StoreLock> {
+        self.acquire_named_lock(Arc::clone(&self.oci_lock), OCI_LOCK_FILE_NAME)
+            .await
+    }
+
+    async fn acquire_named_lock(
+        &self,
+        process_lock: Arc<Mutex<()>>,
+        file_name: &'static str,
+    ) -> Result<StoreLock> {
+        let process_guard = process_lock.lock_owned().await;
         let dir = self.dir.clone();
         tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&dir)
@@ -435,7 +504,7 @@ impl Store {
                 .truncate(false)
                 .read(true)
                 .write(true)
-                .open(dir.join(LOCK_FILE_NAME))
+                .open(dir.join(file_name))
                 .map_err(|error| io_error("open lock file", error))?;
             flock(&file, LOCK_EX).map_err(|error| io_error("flock", error))?;
             Ok(StoreLock {

@@ -39,6 +39,10 @@ impl DB for ImageDb {
         Ok(self.0.insert_image(image).await?)
     }
 
+    async fn delete_unbuilt_image(&self, name: &str) -> Result<bool, ImagesError> {
+        Ok(self.0.delete_unbuilt_image(name).await?)
+    }
+
     async fn upsert_image(&self, image: Image) -> Result<(), ImagesError> {
         Ok(self.0.upsert_image(image).await?)
     }
@@ -67,11 +71,30 @@ impl DB for ImageDb {
     }
 
     async fn image_versions(&self) -> Result<Vec<ImageVersion>, ImagesError> {
-        let mut versions = Vec::new();
-        for image in self.0.images().await? {
-            versions.extend(self.0.image_versions(&image.name).await?);
-        }
-        Ok(versions)
+        Ok(self.0.all_image_versions().await?)
+    }
+
+    async fn image_version_for_source(
+        &self,
+        image_name: &str,
+        source_digest: &str,
+    ) -> Result<Option<ImageVersion>, ImagesError> {
+        Ok(self
+            .0
+            .image_version_for_source(image_name, source_digest)
+            .await?)
+    }
+
+    async fn record_image_source(
+        &self,
+        image_name: &str,
+        source_digest: &str,
+        checksum: &str,
+    ) -> Result<(), ImagesError> {
+        Ok(self
+            .0
+            .record_image_source(image_name, source_digest, checksum)
+            .await?)
     }
 
     async fn delete_image_version(&self, checksum: &str) -> Result<(), ImagesError> {
@@ -92,10 +115,26 @@ pub(crate) struct ImageReport(pub(crate) Store);
 
 pub(crate) struct RuntimeImages(pub(crate) Arc<bento_images::Store>);
 
+impl RuntimeImages {
+    /// Detaches the build from the request/session future. Dropping an HTTP
+    /// connection or SSH channel does not cancel a privileged build halfway
+    /// through its final file/database commit.
+    async fn add_oci_image(&self, name: &str, reference: &str) -> bento_images::Result<()> {
+        let store = self.0.clone();
+        let name = name.to_owned();
+        let reference = reference.to_owned();
+        tokio::spawn(async move { store.add_oci_image(&name, &reference).await })
+            .await
+            .map_err(|error| {
+                bento_images::Error::Invalid(format!("runtime image task failed: {error}"))
+            })?
+    }
+}
+
 #[async_trait]
 impl bento_api::ImageAdmin for RuntimeImages {
     async fn add_oci_image(&self, name: &str, reference: &str) -> Result<(), ApiError> {
-        match self.0.add_oci_image(name, reference).await {
+        match self.add_oci_image(name, reference).await {
             Ok(()) => Ok(()),
             Err(error @ bento_images::Error::Invalid(_)) => Err(Box::new(ApiStatusError::new(
                 StatusCode::BAD_REQUEST,
@@ -109,7 +148,7 @@ impl bento_api::ImageAdmin for RuntimeImages {
 #[async_trait]
 impl bento_cli::ImageAdmin for RuntimeImages {
     async fn add_oci_image(&self, name: &str, reference: &str) -> Result<(), CliError> {
-        Ok(self.0.add_oci_image(name, reference).await?)
+        Ok(self.add_oci_image(name, reference).await?)
     }
 }
 
@@ -163,6 +202,9 @@ impl bento_lifecycle::Store for LifecycleStore {
     }
     async fn image(&self, name: &str) -> Result<Image, LifecycleError> {
         Ok(self.0.image(name).await?)
+    }
+    async fn image_version(&self, checksum: &str) -> Result<ImageVersion, LifecycleError> {
+        Ok(self.0.image_version(checksum).await?)
     }
     async fn user_by_id(&self, id: i64) -> Result<User, LifecycleError> {
         Ok(self.0.user_by_id(id).await?)

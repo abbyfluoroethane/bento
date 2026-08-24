@@ -277,6 +277,9 @@ pub struct ImageVersion {
     pub image_name: String,
     pub path: String,
     pub size: i64,
+    /// How this immutable disk version was produced.
+    #[serde(default)]
+    pub kind: ImageKind,
     /// Digest of the OCI image used to build this disk, when applicable.
     #[serde(default)]
     pub source_digest: Option<String>,
