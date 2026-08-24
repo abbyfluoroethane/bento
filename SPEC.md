@@ -643,23 +643,16 @@ Use the UUID as the instance key from step 3. A change after `shares` exists nee
 
 Version 1 runs one host. This section records the design so that version 1 does not prevent it. Do not build this section in version 1.
 
-libvirt reaches a remote host with a `qemu+ssh://host/system` connection URI. There is no cluster to form and no shared database. Each host is independent. This model suits a set of machines that one operator owns.
+The complete proposed design now lives in [MULTI-NODE.md](MULTI-NODE.md). It
+supersedes this section when multi-node implementation begins; until then,
+the single-host requirements in this specification remain authoritative.
 
-The control plane changes little. The `hosts` table already exists. Each instance already carries a `host_id`.
-
-The data plane is the work. The HTTP proxy and the SSH frontend run on one machine. Both must reach an instance on any host. There are two options:
-
-1. Route a distinct subnet to each host. Run a mesh between the hosts. WireGuard and Tailscale both do this.
-2. Run a proxy on each host. Forward from the front machine to that proxy.
-
-Option 1 is simpler. The proxy keeps one routing table and adds no second hop.
-
-Four more items need answers before this ships:
-
-- **Placement.** Bento must select a host for a new instance. A quota that is global and enforced per host needs a placement rule.
-- **Copy across hosts.** Storage is local to a host. The `cp` command becomes a transfer.
-- **Image distribution.** The content addressed store in section 5.1 is per host. Each host fetches the same versions, or one host serves the others.
-- **Partial failure.** One unreachable host must not stop the whole deployment. The `ls` command must show a stale state rather than fail.
+The proposed design keeps the control plane and database central, runs a
+host-local Bento service on each VM runner, and divides every user's `/24`
+into stable `/24`-`/27` runner slots. The routed underlay may be a LAN,
+WireGuard, Tailscale, or an equivalent network. The design also specifies
+placement, local storage and image distribution, partial failure, slot
+evacuation, and the maintenance required to change the runner count.
 
 ## 18. After version 1
 
