@@ -3,7 +3,7 @@
 //! It builds a whole Bento deployment in a temporary directory and runs
 //! the real `bentod` binary against it: real configuration parsing, a real
 //! SQLite database, real `qemu-img` and `xorriso`, a real HTTP listener on
-//! loopback, and real bearer-token authentication. Only three things
+//! loopback, and real bearer-token authentication. Only four things
 //! outside the binary are substituted, because a CI runner cannot supply
 //! them:
 //!
@@ -12,6 +12,9 @@
 //! * `nft`, replaced by a stub on `PATH` that records the ruleset. Loading
 //!   a real ruleset needs `CAP_NET_ADMIN` and would rewrite the runner's
 //!   own firewall.
+//! * `podman`, replaced by a stub on `PATH` that records each command line
+//!   and writes the qcow2 image-builder would have written. A real bootc
+//!   build needs a privileged container and a rootful container store.
 //!
 //! Everything else is the shipped code path.
 
@@ -34,6 +37,26 @@ pub const IMAGE_NAME: &str = "debian-13";
 pub const USER_NAME: &str = "tester";
 /// How long readiness and state polling wait before failing.
 const TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The bootc entry, present only when a test asks for it: an OCI image in
+/// the allowlist makes Podman a fatal host requirement (SPEC 4.2).
+pub const OCI_IMAGE_NAME: &str = "fedora-bootc";
+/// A moving tag, so the pipeline has to pull and inspect before it can
+/// decide whether an earlier build still applies.
+pub const OCI_REFERENCE: &str = "quay.io/fedora/fedora-bootc:42";
+/// image-builder. The configuration refuses anything but a digest.
+pub const BUILDER_IMAGE: &str = "ghcr.io/osbuild/image-builder-cli@sha256:ababababababababababababababababababababababababababababababab01";
+/// Not the `ext4` default, so the tests can tell a configured filesystem
+/// from a fallback one.
+pub const BOOTC_ROOTFS: &str = "xfs";
+
+/// What a test wants in the deployment beyond the defaults.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Setup {
+    /// Adds the bootc OCI entry to the allowlist. Startup then converts it
+    /// with the Podman stub instead of downloading a qcow2.
+    pub bootc: bool,
+}
 
 /// A running Bento under test.
 pub struct Bento {
@@ -67,16 +90,24 @@ impl Bento {
     /// a seeded account, a real `bentod fetch-images`, and finally
     /// `bentod serve` answering on loopback.
     pub async fn start() -> Self {
+        Self::start_with(Setup::default()).await
+    }
+
+    /// Brings up a deployment with the extras a test asked for.
+    pub async fn start_with(setup: Setup) -> Self {
         install_crypto_provider();
         let dir = tempfile::Builder::new()
             .prefix("bento-e2e-")
             .tempdir()
             .expect("create temporary directory");
         let path = dir.path().to_path_buf();
-        for name in ["images", "storage", "keys", "bin"] {
+        // `containers` stands in for the rootful Podman store, which the
+        // host check reads before `serve` will start.
+        for name in ["images", "storage", "keys", "bin", "containers"] {
             std::fs::create_dir(path.join(name)).expect("create directory");
         }
         write_nft_stub(&path.join("bin"));
+        write_podman_stub(&path.join("bin"));
 
         let socket = path.join("libvirt.sock");
         let libvirtd = Libvirtd::start(&socket).expect("start fake libvirtd");
@@ -92,7 +123,7 @@ impl Bento {
         let config = path.join("bento.toml");
         std::fs::write(
             &config,
-            configuration(&path, &socket, port, images.url(), &checksum),
+            configuration(&path, &socket, port, images.url(), &checksum, setup),
         )
         .expect("write configuration");
 
@@ -150,6 +181,17 @@ impl Bento {
             .send()
             .await
             .unwrap_or_else(|error| self.fail(&format!("GET {path}: {error}")));
+        Response::read(response).await
+    }
+
+    pub async fn post_anonymous(&self, path: &str, body: serde_json::Value) -> Response {
+        let response = self
+            .http
+            .post(self.url(path))
+            .json(&body)
+            .send()
+            .await
+            .unwrap_or_else(|error| self.fail(&format!("POST {path}: {error}")));
         Response::read(response).await
     }
 
@@ -232,6 +274,34 @@ impl Bento {
     /// control plane reloads the whole table on each change (SPEC 6.3).
     pub fn nft_rulesets(&self) -> String {
         std::fs::read_to_string(self.dir.path().join("nft.log")).unwrap_or_default()
+    }
+
+    /// Every `podman` command line the bootc pipeline ran, in order. The
+    /// assertions read this to see what would have reached the host.
+    pub fn podman_commands(&self) -> Vec<String> {
+        std::fs::read_to_string(self.dir.path().join("podman.log"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Where image versions land, one file per checksum (SPEC 5.1).
+    pub fn image_dir(&self) -> PathBuf {
+        self.dir.path().join("images")
+    }
+
+    /// Where the version of this checksum belongs. The store is content
+    /// addressed, so the name follows the checksum (SPEC 5.1).
+    pub fn image_path(&self, checksum: &str) -> PathBuf {
+        self.image_dir().join(format!("sha256-{checksum}.qcow2"))
+    }
+
+    /// Where overlay disks and seed ISOs land (SPEC 5.2).
+    pub fn storage_dir(&self) -> PathBuf {
+        self.dir.path().join("storage")
     }
 
     /// The files under the storage directory, sorted. Overlay disks and
@@ -334,8 +404,20 @@ impl Response {
 
 /// Writes the configuration. Every path points inside the temporary
 /// directory, so a test can never touch a real deployment.
-fn configuration(dir: &Path, socket: &Path, port: u16, image_url: &str, checksum: &str) -> String {
+fn configuration(
+    dir: &Path,
+    socket: &Path,
+    port: u16,
+    image_url: &str,
+    checksum: &str,
+    setup: Setup,
+) -> String {
     let dir = dir.display();
+    let bootc_image = if setup.bootc {
+        format!("\n[[images]]\nname = \"{OCI_IMAGE_NAME}\"\noci = \"{OCI_REFERENCE}\"\n")
+    } else {
+        String::new()
+    };
     format!(
         r#"base_domain = "e2e.test"
 libvirt_uri = "qemu:///system?socket={socket}"
@@ -369,11 +451,20 @@ client_id = ""
 client_secret = ""
 allow_signup = false
 
+# Bootc conversion runs against the Podman stub, so the builder digest is
+# a placeholder. Only its shape has to be right: the configuration refuses
+# a builder image that is not pinned.
+[bootc]
+builder_image = "{BUILDER_IMAGE}"
+rootfs = "{BOOTC_ROOTFS}"
+container_storage = "{dir}/containers"
+build_timeout = "2m"
+
 [[images]]
 name = "{IMAGE_NAME}"
 url = "{image_url}"
 pinned_checksum = "sha256:{checksum}"
-"#,
+{bootc_image}"#,
         socket = socket.display(),
     )
 }
@@ -437,22 +528,102 @@ fn build_image(dir: &Path) -> Vec<u8> {
 /// Writes the `nft` stub. It appends each ruleset it is given, so the
 /// assertions can read what the control plane would have loaded.
 fn write_nft_stub(bin: &Path) {
-    let path = bin.join("nft");
-    let mut file = std::fs::File::create(&path).expect("create nft stub");
-    file.write_all(
-        b"#!/bin/sh\n\
-          # Stands in for nft(8): records the ruleset and accepts it.\n\
-          printf '===== ruleset =====\\n' >> \"$BENTO_E2E_NFT_LOG\"\n\
-          cat >> \"$BENTO_E2E_NFT_LOG\"\n\
-          exit 0\n",
-    )
-    .expect("write nft stub");
+    write_stub(
+        &bin.join("nft"),
+        "#!/bin/sh\n\
+         # Stands in for nft(8): records the ruleset and accepts it.\n\
+         printf '===== ruleset =====\\n' >> \"$BENTO_E2E_NFT_LOG\"\n\
+         cat >> \"$BENTO_E2E_NFT_LOG\"\n\
+         exit 0\n",
+    );
+}
+
+/// Writes one executable stub into the directory that leads `PATH`.
+fn write_stub(path: &Path, script: &str) {
+    let mut file = std::fs::File::create(path)
+        .unwrap_or_else(|error| panic!("create stub {}: {error}", path.display()));
+    file.write_all(script.as_bytes())
+        .unwrap_or_else(|error| panic!("write stub {}: {error}", path.display()));
     drop(file);
-    let mut permissions = std::fs::metadata(&path)
-        .expect("stat nft stub")
+    let mut permissions = std::fs::metadata(path)
+        .unwrap_or_else(|error| panic!("stat stub {}: {error}", path.display()))
         .permissions();
     std::os::unix::fs::PermissionsExt::set_mode(&mut permissions, 0o755);
-    std::fs::set_permissions(&path, permissions).expect("make nft stub executable");
+    std::fs::set_permissions(path, permissions)
+        .unwrap_or_else(|error| panic!("make stub {} executable: {error}", path.display()));
+}
+
+/// Writes the `podman` stub. It records each command line and, for the
+/// image-builder run, writes the qcow2 that run would have produced. The
+/// content follows the bootc reference, because two operating-system
+/// images do not convert to the same disk.
+fn write_podman_stub(bin: &Path) {
+    write_stub(
+        &bin.join("podman"),
+        r#"#!/bin/sh
+# Stands in for podman(8): records the command line and produces what each
+# step of the bootc pipeline would have produced.
+printf '%s\n' "$*" | tr '\n' ' ' >> "$BENTO_E2E_PODMAN_LOG"
+printf '\n' >> "$BENTO_E2E_PODMAN_LOG"
+
+# Every step names its subject last, after the `--` end-of-options guard.
+for argument in "$@"; do
+    subject="$argument"
+done
+
+case "$1" in
+pull)
+    exit 0
+    ;;
+image)
+    # `image inspect --format={{.Digest}}`. One digest per reference, and
+    # the same digest every time, so re-converting a tag is a cache hit.
+    printf 'sha256:%s\n' "$(printf '%s' "$subject" | sha256sum | cut -d' ' -f1)"
+    exit 0
+    ;;
+run)
+    output=''
+    privileged=''
+    reference=''
+    previous=''
+    for argument in "$@"; do
+        if [ "$argument" = '--privileged' ]; then
+            privileged=yes
+        elif [ "$previous" = '--bootc-ref' ]; then
+            reference="$argument"
+        elif [ "$previous" = '-v' ]; then
+            case "$argument" in
+            *:/output) output="${argument%:/output}" ;;
+            esac
+        fi
+        previous="$argument"
+    done
+    # Unprivileged: the contract check. The image the stub stands for
+    # carries every file that check demands.
+    if [ -z "$privileged" ]; then
+        exit 0
+    fi
+    if [ -z "$output" ]; then
+        echo 'stub podman: the image-builder run has no /output mount' >&2
+        exit 1
+    fi
+    # image-builder writes one qcow2 under a directory named for the
+    # format. Building it through qemu-img keeps it a real image, so the
+    # overlay create that follows would reject a wrong one.
+    mkdir -p "$output/qcow2" || exit 1
+    {
+        printf '%s\n' "$reference"
+        dd if=/dev/zero bs=1048576 count=48 2>/dev/null
+    } > "$output/source.raw" || exit 1
+    qemu-img convert -f raw -O qcow2 "$output/source.raw" "$output/qcow2/disk.qcow2" || exit 1
+    rm -f "$output/source.raw"
+    exit 0
+    ;;
+esac
+echo "stub podman: unexpected command $*" >&2
+exit 1
+"#,
+    );
 }
 
 fn command(config: &Path, dir: &Path) -> Command {
@@ -471,6 +642,7 @@ fn command(config: &Path, dir: &Path) -> Command {
             ),
         )
         .env("BENTO_E2E_NFT_LOG", dir.join("nft.log"))
+        .env("BENTO_E2E_PODMAN_LOG", dir.join("podman.log"))
         .env("RUST_LOG", "info");
     command
 }
