@@ -102,11 +102,7 @@ impl Manager {
         );
         let mut last = State::Stopped;
         for attempt in 0..attempts {
-            last = self
-                .hyp
-                .state(name)
-                .await
-                .map_err(|error| Error::operation(error.to_string()))?;
+            last = self.hyp.state(name).await.map_err(Error::caused)?;
             if last == State::Running {
                 return Ok(());
             }

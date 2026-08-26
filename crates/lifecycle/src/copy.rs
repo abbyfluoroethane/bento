@@ -57,7 +57,7 @@ impl Manager {
         })?;
         let address = bento_network::allocate_address(&AddressView(self.store.clone()), subnet)
             .await
-            .map_err(|error| Error::operation(error.to_string()))?;
+            .map_err(Error::caused)?;
         let uuid = (self.new_uuid)();
         let mut instance = Instance {
             uuid: uuid.clone(),
