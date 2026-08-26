@@ -31,12 +31,15 @@ Real, in every test:
 * configuration parsing, from a generated `bento.toml`;
 * the SQLite database, including its schema and the account, quota, and
   token rows the test seeds before startup;
-* `qemu-img` and `xorriso`, which really do create the overlay disk and
-  the seed ISO;
+* `qemu-img` and `xorriso`, which really do create the overlay disk, the
+  seed ISO, and the disk a bootc conversion produces;
 * the HTTP listener, reached over loopback with `reqwest`;
 * bearer-token authentication, against the stored SHA-256 hash;
 * the whole lifecycle path: quota check, address allocation, overlay,
   seed, domain definition, the state poller, rename, and delete;
+* the bootc conversion path: the order of the Podman steps, the flags each
+  one carries, the build cache keyed on the OCI source digest, and the
+  operator-only runtime addition to the allowlist;
 * SIGTERM shutdown, which the suite asserts exits cleanly.
 
 Substituted, because a CI runner cannot supply them:
@@ -46,6 +49,7 @@ Substituted, because a CI runner cannot supply them:
 | libvirtd | `libvirtd.rs` | Speaks the libvirt RPC protocol on a Unix socket. `bentod` connects to it unmodified and cannot tell the difference. It records every procedure it answers, and the assertions read that recording. |
 | The image mirror | `imageserver.rs` | Serves one small qcow2 on loopback, so `fetch-images` runs its real download, checksum, and pin-verification path without the network. |
 | `nft` | a stub on `PATH` | Loading a real ruleset needs `CAP_NET_ADMIN` and would rewrite the runner's own firewall. The stub records the ruleset instead, and the assertions read what would have been loaded. |
+| `podman` | a stub on `PATH` | A bootc build pulls gigabytes, runs a privileged container, and writes to the rootful container store. The stub records each command line and, for the image-builder step, writes a real qcow2 through `qemu-img`. The assertions read the recording, and the overlay create that follows would reject a disk that is not an image. |
 
 The fake libvirtd writes out the wire encoding again rather than sharing
 the client's codec. A fake built on the same encoder could not catch an
@@ -58,6 +62,12 @@ that cloud-init really applies the seed, that the SSH frontend really
 reaches a guest, or that the nftables ruleset really isolates one user
 from another. Those need real hardware virtualization and real network
 namespaces.
+
+Nor does any real bootc image get converted. The suite checks what Bento
+asks Podman to do, not what image-builder does with it. Whether a given
+operating-system image really satisfies the bootc contract, and whether
+the disk it produces really boots, needs a machine with Podman and the
+image itself.
 
 `MULTI-NODE.md` section 23 lists the live acceptance items and says
 plainly that multi-node support cannot ship on fakes alone. This tier is
