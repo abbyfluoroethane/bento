@@ -177,6 +177,9 @@ impl Manager {
     }
 }
 
+/// The funnel for every error a dependency hands the lifecycle layer.
+/// It keeps the cause as the error source so the HTTP layer can still
+/// recognize a store error and answer it properly.
 pub(crate) fn external(error: crate::DynError) -> Error {
-    Error::operation(error.to_string())
+    Error::caused(error)
 }

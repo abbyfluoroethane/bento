@@ -51,11 +51,35 @@ pub enum Error {
     /// An operation failed, with its orchestration context preserved.
     #[error("{0}")]
     Operation(String),
+    /// An operation failed in a dependency, with the cause kept as the
+    /// error source.
+    ///
+    /// The text alone is not enough. A caller has to be able to tell a
+    /// quota refusal from a name cooldown from a missing row, because
+    /// each has its own answer (SPEC 6.1, 7.2, 12): the HTTP layer
+    /// matches on the store's error type and returns 409 with the limits,
+    /// 409 with the remaining cooldown, or 404. Flattening the cause to a
+    /// string erased that type and turned every one of them into a 500.
+    #[error("{message}")]
+    Caused {
+        message: String,
+        #[source]
+        source: DynError,
+    },
 }
 
 impl Error {
     pub(crate) fn operation(message: impl Into<String>) -> Self {
         Self::Operation(message.into())
+    }
+
+    /// Wraps a dependency's error, keeping both its text and its type.
+    pub(crate) fn caused(source: impl Into<DynError>) -> Self {
+        let source = source.into();
+        Self::Caused {
+            message: source.to_string(),
+            source,
+        }
     }
 }
 

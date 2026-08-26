@@ -321,8 +321,7 @@ impl Manager {
                 subnet.addr, subnet.bits
             ))
         })?;
-        let network = UserNetwork::new(self.plan, index as isize)
-            .map_err(|error| Error::operation(error.to_string()))?;
+        let network = UserNetwork::new(self.plan, index as isize).map_err(Error::caused)?;
         bento_hypervisor::domain_xml(&DomainSpec {
             name: instance.name.clone(),
             uuid: instance.uuid.clone(),
@@ -340,7 +339,7 @@ impl Manager {
             ksm: instance.ksm,
             arch: String::new(),
         })
-        .map_err(|error| Error::operation(error.to_string()))
+        .map_err(Error::caused)
     }
 
     pub(crate) async fn domain_xml_by_uuid(

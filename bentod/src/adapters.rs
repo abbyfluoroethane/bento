@@ -373,6 +373,27 @@ impl bento_cli::Lifecycle for CliBackend {
 
 pub(crate) struct ApiBackend(pub(crate) Backend);
 
+/// Translates a lifecycle failure into the API's vocabulary.
+///
+/// A lifecycle action reaches the database through the lifecycle crate's
+/// own `Store` seam, which boxes the store crate's error type. The HTTP
+/// layer matches on the API crate's type instead, so without this step a
+/// quota refusal, a taken name, a name still in cooldown, or a missing
+/// row raised inside a lifecycle action reached the client as a bare 500
+/// rather than the documented 409 or 404 (SPEC 6.1, 7.2, 12).
+fn api_lifecycle_error(error: bento_lifecycle::Error) -> ApiError {
+    let mut candidate: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+    while let Some(current) = candidate {
+        if let Some(store_error) = current.downcast_ref::<StoreError>()
+            && let Some(translated) = api_store_error_ref(store_error)
+        {
+            return translated;
+        }
+        candidate = current.source();
+    }
+    Box::new(error)
+}
+
 #[async_trait]
 impl bento_api::Lifecycle for ApiBackend {
     async fn create(&self, owner: User, spec: bento_api::CreateSpec) -> Result<Instance, ApiError> {
@@ -389,29 +410,54 @@ impl bento_api::Lifecycle for ApiBackend {
                 spec.ksm,
             )
             .await?;
-        let instance = self.0.manager.create(request).await?;
+        let instance = self
+            .0
+            .manager
+            .create(request)
+            .await
+            .map_err(api_lifecycle_error)?;
         self.0.reload_firewall().await.map_err(|error| {
             io::Error::other(format!("instance created, firewall reload failed: {error}"))
         })?;
         Ok(instance)
     }
     async fn delete(&self, uuid: &str) -> Result<(), ApiError> {
-        self.0.manager.remove(uuid).await?;
+        self.0
+            .manager
+            .remove(uuid)
+            .await
+            .map_err(api_lifecycle_error)?;
         self.0.reload_firewall().await?;
         Ok(())
     }
     async fn start(&self, uuid: &str) -> Result<(), ApiError> {
-        Ok(self.0.manager.start(uuid).await?)
+        self.0
+            .manager
+            .start(uuid)
+            .await
+            .map_err(api_lifecycle_error)
     }
     async fn stop(&self, uuid: &str) -> Result<(), ApiError> {
-        self.0.manager.stop(uuid).await?;
+        self.0
+            .manager
+            .stop(uuid)
+            .await
+            .map_err(api_lifecycle_error)?;
         Ok(())
     }
     async fn restart(&self, uuid: &str) -> Result<(), ApiError> {
-        Ok(self.0.manager.restart(uuid).await?)
+        self.0
+            .manager
+            .restart(uuid)
+            .await
+            .map_err(api_lifecycle_error)
     }
     async fn rename(&self, uuid: &str, new_name: &str) -> Result<(), ApiError> {
-        Ok(self.0.manager.rename(uuid, new_name).await?)
+        self.0
+            .manager
+            .rename(uuid, new_name)
+            .await
+            .map_err(api_lifecycle_error)
     }
     async fn resize(&self, uuid: &str, spec: bento_api::ResizeSpec) -> Result<(), ApiError> {
         self.0
@@ -423,7 +469,8 @@ impl bento_api::Lifecycle for ApiBackend {
                 disk_gib: spec.disk_gib,
                 nested: spec.nested,
             })
-            .await?;
+            .await
+            .map_err(api_lifecycle_error)?;
         Ok(())
     }
     async fn set_http_port(&self, uuid: &str, port: u16) -> Result<(), ApiError> {
@@ -442,8 +489,12 @@ impl bento_api::Lifecycle for ApiBackend {
 
 pub(crate) struct ApiStore(pub(crate) Store);
 
-fn api_store_error(error: StoreError) -> ApiError {
-    match error {
+/// Returns the API-vocabulary equivalent of a store error, when it has
+/// one. The API crate declares its own error type for the four outcomes
+/// that have their own HTTP answer; every other store error travels as
+/// itself and becomes a 500.
+fn api_store_error_ref(error: &StoreError) -> Option<ApiError> {
+    Some(match error {
         StoreError::NotFound => Box::new(ApiStoreError::NotFound),
         StoreError::NameTaken => Box::new(ApiStoreError::NameTaken),
         StoreError::Quota {
@@ -452,16 +503,21 @@ fn api_store_error(error: StoreError) -> ApiError {
             requested,
             max,
         } => Box::new(ApiStoreError::Quota {
-            limit: limit.to_owned(),
-            used,
-            requested,
-            max,
+            limit: limit.to_string(),
+            used: *used,
+            requested: *requested,
+            max: *max,
         }),
-        StoreError::NameCooldown { name, remaining } => {
-            Box::new(ApiStoreError::NameCooldown { name, remaining })
-        }
-        other => Box::new(other),
-    }
+        StoreError::NameCooldown { name, remaining } => Box::new(ApiStoreError::NameCooldown {
+            name: name.clone(),
+            remaining: *remaining,
+        }),
+        _ => return None,
+    })
+}
+
+fn api_store_error(error: StoreError) -> ApiError {
+    api_store_error_ref(&error).unwrap_or_else(|| Box::new(error))
 }
 
 #[async_trait]
