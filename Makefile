@@ -1,12 +1,21 @@
 CARGO ?= cargo
 
-.PHONY: build test clippy fmt check dashboard clean
+.PHONY: build test unit e2e clippy fmt check dashboard clean
 
 build:
 	$(CARGO) build --release
 
 test:
 	$(CARGO) test --workspace
+
+# The two halves separately, matching how CI runs them.
+unit:
+	$(CARGO) test --workspace --lib --bins
+
+# The end-to-end suite (TESTING.md). It runs the real bentod binary, so
+# it needs qemu-img, xorriso, and a /dev/kvm the host check can stat.
+e2e:
+	$(CARGO) test --package bentod --test e2e -- --nocapture
 
 clippy:
 	$(CARGO) clippy --workspace --all-targets -- -D warnings

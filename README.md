@@ -68,12 +68,17 @@ never `aws-lc-rs`.
 ```
 make build       # target/release/bentod (dashboard assets embedded from web/dist)
 make check       # cargo clippy -D warnings && cargo test --workspace
+make unit        # the in-process tests only
+make e2e         # the end-to-end suite: the real binary, over real sockets
 make dashboard   # rebuild web/dist after changing web/src (npm ci && npm run build)
 ```
 
 Everything host-touching (libvirt RPC, qemu-img, xorriso, nft, /dev/kvm)
 sits behind small traits with in-memory fakes, so the full test suite
-runs anywhere. Each crate declares the narrow trait it needs rather than
+runs anywhere. On top of those, `bentod/tests/e2e/` runs the shipped
+binary against a whole deployment in a temporary directory, with a fake
+libvirtd on a unix socket. See `TESTING.md` for what is real, what is
+substituted, and why. CI runs both tiers on x86_64 and arm64. Each crate declares the narrow trait it needs rather than
 depending on the data layer; `bentod` is the one place that knows every
 concrete type.
 
@@ -98,12 +103,12 @@ calls.
 
 ## Status
 
-Built to SPEC v0.9. Every crate has unit tests against fakes and the
-whole suite passes, but the system has **not** been run against a live
-libvirtd yet — the nftables ruleset, the ACME issuance, and real guest
-boots are exercised only through their fakes. The one exception is the
-libvirt wire protocol: its codec is checked against the host's real
-daemon by a read-only test, which is `#[ignore]`d by default.
+Built to SPEC v0.9. Every crate has unit tests against fakes, and the
+end-to-end suite drives the real binary through the whole instance
+lifecycle (`TESTING.md`). The system has still **not** been run against a
+live libvirtd: no guest ever boots in a test, and the nftables ruleset and
+the ACME issuance are exercised only through their fakes. `MULTI-NODE.md`
+section 23 lists what a live acceptance run would have to cover.
 Known gaps and deviations:
 
 - `console` (serial console attach) is not wired; it returns a clear
