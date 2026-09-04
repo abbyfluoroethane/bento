@@ -64,7 +64,13 @@ The multi-node design must:
 
 ## 3. Non-goals
 
-The first multi-node release does not provide:
+These are the non-goals of the multi-node MVP, not of the design's end state.
+The MVP is the first release that runs guests on more than one machine. Some
+items below are deliberately left reachable later. The fencing rules in
+section 11 are an example: they exist to make one controller safe, and they
+also supply most of what a later high-availability control plane needs.
+
+The multi-node MVP does not provide:
 
 - high availability for the control plane or SQLite database;
 - live migration;
@@ -74,6 +80,9 @@ The first multi-node release does not provide:
 - transparent Ethernet broadcast or multicast across runners;
 - automatic creation or administration of a LAN, WireGuard, or Tailscale
   network;
+- an underlay whose routes Bento cannot program on each participant;
+- a resumable, controller-driven cross-runner transfer job;
+- a frontend that runs on a machine other than the controller;
 - placement across unlike CPU architectures;
 - placement of a nested-virtualization instance on a runner with an
   incompatible CPU.
@@ -82,12 +91,20 @@ The control plane remains a deliberate single point of coordination. Existing
 guests continue running when it is down, but lifecycle operations, the public
 frontends, and state convergence are unavailable.
 
+Three of these non-goals have a known later shape. High availability builds on
+the section 11 fencing rules. A resumable transfer job replaces the
+operator-directed move in section 13.3. A separable frontend needs its own
+certificate role and its own path to the database. None of them changes an
+MVP invariant, so none of them requires a redesign to add.
+
 ## 4. Terms
 
 **Controller** is the machine running `bentod serve` and holding SQLite.
 
-**Frontend** means the public HTTP proxy and SSH frontend. They normally run
-on the controller machine but are logically separate from it.
+**Frontend** means the public HTTP proxy and SSH frontend. In the MVP both run
+on the controller machine. They share its address, its database access, and
+its failure domain. A frontend on a separate machine is a later change, not a
+supported MVP topology.
 
 **Runner** is a machine that runs `bentod runner`, libvirt, and zero or more
 instances.
@@ -267,33 +284,50 @@ The same pattern repeats for each allocated user `/24`. The implementation
 must use the host routing API or a narrowly scoped command runner. nftables is
 not the route store.
 
-The frontend installs the route for every owned slot through its runner. It
-must never accept two equal routes for the same slot from different runners.
-When the frontend machine is also the slot's runner, its connected user bridge
-handles the locally owned slot and only remote slots need underlay routes.
+The controller machine installs the route for every owned slot through its
+runner. It must never accept two equal routes for the same slot from different
+runners. When the controller machine is also the slot's runner, its connected
+user bridge handles the locally owned slot and only remote slots need underlay
+routes.
 
 Each user network has a durable desired generation. A change to its bridge,
 slot routes, proxy ARP, firewall policy, or participant set increments this
 generation. The controller stores the exact participant set for that
-generation. The set
-contains the destination runner, every healthy runner that already hosts an
-instance for the user, every frontend, and the configured route backend. Each
-participant stores or reports an acknowledgement only after it has applied and
-verified the complete generation. Placement waits for every acknowledgement
-in this set. A later health failure does not invalidate a completed placement,
-but it prevents new placement that depends on a new unacknowledged generation.
+generation, and it divides that set into blocking and converging participants.
+
+The blocking participants are the destination runner and the controller
+machine, which carries the frontends. Placement waits for both to store an
+acknowledgement. A blocking participant acknowledges only after it has applied
+and verified the complete generation. Without the destination runner the
+instance has no working bridge or policy. Without the controller machine the
+instance has no route from the public frontends, which is the failure a user
+sees immediately.
+
+The converging participants are the other healthy runners that already host an
+instance for the user. They apply the same generation asynchronously and
+record their acknowledgement when they finish. Placement does not wait for
+them. A missing converging acknowledgement means that one guest cannot reach
+another guest of the same user across runners until convergence completes. It
+never permits cross-user reach, because every runner's policy denies a
+destination outside the ingress bridge's own user prefix. Section 21
+reconciles a converging participant that falls behind, and section 20 reports
+one that stays behind.
+
+A later health failure does not invalidate a completed placement. It does
+prevent new placement that depends on a new unacknowledged generation from a
+blocking participant.
 
 A newly enrolled or reconnecting runner compares all applicable network
 generations and converges them before it becomes healthy or
 placement-eligible. It acknowledges the current generation before it hosts a
 new instance for that user.
 
-When the underlay has a separate router, the route backend may apply routes
-through an authenticated API. A manual or external route backend renders the
-desired routes and records no acknowledgement by itself. It cannot support
-automatic placement. An operator must verify the routes and explicitly
-acknowledge the exact user network generation before placement can continue.
-The chosen route backend is explicit deployment configuration.
+Bento programs these routes on every participant itself. An underlay whose
+routes Bento cannot program on each participant is not a supported MVP
+deployment. A separate router that holds the slot routes, a manually
+maintained routing table, and an external route backend are all outside the
+MVP. This keeps one acknowledgement mechanism on the create path instead of
+one mechanism plus an operator.
 
 ### 8.3 Proxy ARP
 
@@ -347,11 +381,12 @@ route next-hop address must be outside the whole configured Bento private
 range. This rule applies to current and future user `/24` allocations, not
 only to allocated user networks. It prevents recursive routes and prevents a
 guest route from naming an underlay management endpoint. Bento validates all
-addresses before a host record or route backend becomes active. It refuses the
-activation when an address overlaps the private range or cannot be validated.
+addresses before a host record becomes active. It refuses the activation when
+an address overlaps the private range or cannot be validated.
 
 On a LAN, a slot route normally uses the runner's LAN address as its next hop.
-The LAN router may hold the frontend routes instead of the frontend host.
+Bento installs the controller machine's slot routes on the controller machine
+itself. It does not depend on a LAN router to hold them.
 
 On WireGuard, Tailscale, or another routed VPN, a slot route uses the runner's
 tunnel endpoint or the VPN's route mechanism. A runner advertises only the
@@ -619,8 +654,8 @@ A runner is eligible when:
 
 1. it is enabled and healthy;
 2. it owns at least one active slot;
-3. it supports the requested architecture, nested-virtualization setting, and
-   CPU compatibility class;
+3. it supports the requested architecture and nested-virtualization setting,
+   and holds a current libvirt CPU verdict when the instance is nested;
 4. it has the selected image version ready locally;
 5. configured or observed capacity can accept the requested vCPU, memory, and
    virtual disk reservation; and
@@ -643,12 +678,23 @@ Disk placement uses a configured allocatable limit or a conservative observed
 free-space threshold. Virtual disk quota remains based on virtual size as in
 version 1.
 
-Each runner reports a CPU compatibility class derived from its architecture
-and the host CPU features exposed by `host-passthrough`. A nested instance
-stores the exact class used at creation. It can copy or move only to a runner
-with the same class. Before a slot transfer starts, Bento reserves compatible
-CPU, memory, disk, address, and image capacity for every instance in that slot.
-One failure rejects the complete transfer plan.
+Bento does not model CPU features itself. A nested instance uses
+`host-passthrough`, so its CPU contract is the source host's actual CPU
+definition. Bento stores that definition with the instance at creation. To
+test a destination, the controller sends the stored definition to the
+destination runner. That runner asks its local libvirt to compare the
+definition against its own capabilities, and returns the verdict. Bento stores
+the verdict, not a derived class. libvirt owns the CPU-features model, stays
+correct as hardware and microcode change, and is the same code that would
+refuse the domain at start time.
+
+A destination is eligible for a nested instance only when its stored verdict
+for that instance says the destination CPU is identical or a superset. A
+missing or stale verdict is not eligibility; the controller requests a fresh
+comparison. Before a slot transfer starts, Bento collects a verdict for every
+nested instance in the slot and reserves memory, disk, address, and image
+capacity for every instance in it. One refusal rejects the complete transfer
+plan.
 
 An operator can disable placement on a runner without stopping its instances.
 Draining is an explicit stronger state that also prepares its slots for
@@ -710,6 +756,15 @@ work and leaves the source unchanged.
 Moving an existing instance is an operator maintenance action. Because routes
 belong to slots, the normal evacuation unit is an entire slot. Individual
 movement using a temporary `/32` exception is deferred.
+
+The MVP transfer runs while the operator directs it. A lost operator session
+or a controller restart abandons the transfer. The slot stays in its durable
+phase, and the operator restarts the transfer from that phase. This is
+acceptable only because a move is a deliberate, attended maintenance action.
+It is not acceptable for a large disk over a slow underlay, so a resumable,
+controller-driven transfer job is the first planned improvement after the MVP.
+That job keeps these phases and adds chunked, checksummed, restartable
+transfer with progress in the database. Nothing in the MVP phases prevents it.
 
 ### 13.4 Backup
 
@@ -836,7 +891,9 @@ The exact migration may evolve during implementation, but the model needs:
 - a persisted deployment runner prefix (`24` through `27`);
 - the controller epoch, lease holder, and lease expiry;
 - host endpoint, enablement, placement state, certificate identity, and
-  capability observations, including CPU compatibility class;
+  capability observations;
+- the stored CPU definition of each nested instance, and the per-host libvirt
+  comparison verdict for it, with the capability generation it was taken from;
 - runner-slot rows with stable slot numbers, `active`, `draining`, or `moving`
   state, active owner, ownership epoch, source, destination, and operation ID;
 - user network desired generations, participant snapshots, desired-state
@@ -922,7 +979,7 @@ child contains instances, the move acquires the same deployment-wide lock and
 Bento runs these durable phases:
 
 1. Change the child to `draining`, block conflicting work, and verify all
-   destination reservations and CPU compatibility classes.
+   destination reservations and libvirt CPU verdicts.
 2. Stop every instance on the source and record its stopped generation.
 3. Change the child to `moving`. Transfer and verify every disk and required
    image. Store each digest before continuing.
@@ -934,7 +991,8 @@ Bento runs these durable phases:
    change affected `host_id` values, and create a new user network generation
    with its exact participant set.
 6. Apply and acknowledge the destination bridge, proxy ARP, firewall policy,
-   frontend routes, peer routes, and route backend for that generation.
+   and controller-machine routes for that generation. Peer routes converge as
+   in section 8.2 and do not block the phase.
 7. Define and restore instances on the destination according to their desired
    power state.
 8. Change the slot to `active`, release the maintenance reservations, and
@@ -1020,8 +1078,8 @@ slot prefix. Advanced configuration may specify the prefix directly:
 runner_prefix = 25
 
 # These addresses must be outside the complete Bento private range.
+# The frontends run on the controller machine, so they share this address.
 controller_address = "10.0.0.10"
-frontend_addresses = ["10.0.0.11"]
 oci_builder = "runner-a"
 
 [[runners]]
@@ -1035,19 +1093,18 @@ endpoint = "https://10.0.0.22:10443"
 
 This shape is illustrative rather than a committed parser interface. Private
 keys and enrollment secrets do not belong inline in the main TOML file.
-Setup validates every controller, frontend, runner endpoint, listener, and
-route next-hop address against the whole private range. A host or route backend
-remains inactive until this validation succeeds. Setup also requires the
-underlay isolation mode, underlay interface, authenticated frontend sources,
-runner listener address, host-firewall policy, route backend, and designated
-OCI builder.
+Setup validates every controller, runner endpoint, listener, and route
+next-hop address against the whole private range. A host remains inactive
+until this validation succeeds. Setup also requires the underlay isolation
+mode, underlay interface, authenticated frontend sources, runner listener
+address, host-firewall policy, and designated OCI builder.
 
 The runbook distinguishes:
 
 - direct LAN routing;
 - routes managed on each host;
-- routes managed by an external LAN router;
-- WireGuard/Tailscale-style routed VPNs; and
+- WireGuard/Tailscale-style routed VPNs;
+- unsupported routing by an external LAN router; and
 - unsupported overlapping whole-`/24` advertisements.
 
 ## 20. Observability and operator interface
@@ -1126,7 +1183,7 @@ clock seams. Add deterministic tests for:
 - grandfathered boundary addresses after subdivision;
 - address exhaustion per slot;
 - placement transaction races;
-- network-generation acknowledgement barriers and manual route backends;
+- network-generation blocking barriers and asynchronous peer convergence;
 - private-range overlap rejection for every infrastructure address;
 - host-scoped polling, restore, and reconcile;
 - nftables rendering for local, remote-same-user, frontend, cross-user, and
