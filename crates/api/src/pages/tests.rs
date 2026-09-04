@@ -532,6 +532,7 @@ async fn dev_server() {
         return;
     };
     let fx = fixture();
+    seed_demo(&fx);
     {
         let mut data = fx.store.data.lock().unwrap();
         data.images.push(bento_types::Image {
@@ -578,4 +579,125 @@ async fn dev_server() {
         .unwrap();
     eprintln!("dev server on http://127.0.0.1:{port}/");
     axum::serve(listener, app).await.unwrap();
+}
+
+/// A realistic deployment for the dev server and screenshots: two
+/// accounts, a handful of machines in every state, real-looking
+/// addresses and ages.
+fn seed_demo(fx: &crate::tests::Fixture) {
+    use bento_types::{DesiredState, State as InstanceState, Visibility};
+    use time::{Duration, OffsetDateTime};
+    let now = OffsetDateTime::now_utc();
+    let mut data = fx.store.data.lock().unwrap();
+    // The viewer is "abby" (an operator); the other account is "zack".
+    for user in data.users.values_mut() {
+        if user.id == fx.alice.id {
+            user.name = "abby".to_string();
+            user.email = "abby@example.org".to_string();
+        } else {
+            user.name = "zack".to_string();
+            user.email = "zack@example.org".to_string();
+        }
+    }
+    let viewer = data.users[&fx.alice.id].clone();
+    fx.auth.0.lock().unwrap().replace(viewer);
+    data.instances.clear();
+    data.shares.clear();
+    let rows = [
+        (
+            "blog",
+            fx.alice.id,
+            InstanceState::Running,
+            "10.100.1.2",
+            "debian-13",
+            (2, 2048, 20),
+            Visibility::Public,
+            80,
+            3,
+            41,
+        ),
+        (
+            "ci-runner",
+            fx.alice.id,
+            InstanceState::Running,
+            "10.100.1.3",
+            "fedora-42",
+            (4, 8192, 60),
+            Visibility::Off,
+            80,
+            0,
+            12,
+        ),
+        (
+            "matrix",
+            fx.alice.id,
+            InstanceState::Starting,
+            "10.100.1.4",
+            "web-os",
+            (2, 4096, 40),
+            Visibility::Private,
+            8008,
+            1,
+            0,
+        ),
+        (
+            "scratch",
+            fx.alice.id,
+            InstanceState::Stopped,
+            "10.100.1.5",
+            "debian-13",
+            (1, 1024, 10),
+            Visibility::Off,
+            80,
+            9,
+            27,
+        ),
+        (
+            "staging",
+            fx.bob.id,
+            InstanceState::Running,
+            "10.100.2.2",
+            "web-os",
+            (2, 4096, 30),
+            Visibility::Private,
+            3000,
+            0,
+            5,
+        ),
+    ];
+    for (name, owner, state, address, image, resources, visibility, port, days_seen, days_old) in
+        rows
+    {
+        let mut row = crate::tests::instance(
+            &format!("uuid-{name}"),
+            name,
+            owner,
+            state,
+            if state == InstanceState::Stopped {
+                DesiredState::Stopped
+            } else {
+                DesiredState::Running
+            },
+            resources,
+        );
+        row.address = address.to_string();
+        row.image_name = image.to_string();
+        row.visibility = visibility;
+        row.http_port = port;
+        row.created_at = now - Duration::days(days_old);
+        row.last_seen_at = if state == InstanceState::Starting {
+            None
+        } else {
+            Some(now - Duration::days(days_seen) - Duration::minutes(7))
+        };
+        data.instances.insert(row.uuid.clone(), row);
+    }
+    data.shares.insert(
+        "uuid-staging".to_string(),
+        vec![bento_types::Share {
+            instance_uuid: "uuid-staging".to_string(),
+            user_id: fx.alice.id,
+            created_at: now - Duration::days(4),
+        }],
+    );
 }
