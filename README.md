@@ -54,6 +54,14 @@ together with the image and storage directories (SPEC 12.1). The other
 operator commands are `bentod reconcile` (prints libvirt/database
 disagreements, changes nothing) and `bentod images`.
 
+**`bento-monitor`** — the same work on a screen: install the binary, the
+directories, the configuration, and the three units; start, stop,
+restart, enable, and disable them; read the configuration and the
+journal; and watch the host and the libvirt domains. It is a shim over
+`systemctl`, so it shows each command before it runs and then runs it in
+your own terminal, where `sudo` can still ask for a password. See
+`DEPLOYING.md` section 6.
+
 Users sign themselves up through OIDC: the first login for an identity
 your provider authenticates creates the account and allocates its /24
 and libvirt network (SPEC 13). To use the command line, they then run
@@ -85,12 +93,17 @@ cmake or clang: every TLS user is pinned to the `ring` crypto provider,
 never `aws-lc-rs`.
 
 ```
-make build       # target/release/bentod (dashboard assets embedded from web/dist)
+make build       # target/release/bentod and target/release/bento-monitor
+make monitor     # build and start the terminal screen against this host
 make check       # cargo clippy -D warnings && cargo test --workspace
 make unit        # the in-process tests only
 make e2e         # the end-to-end suite: the real binary, over real sockets
 make dashboard   # rebuild web/dist after changing web/src (npm ci && npm run build)
 ```
+
+`make build` produces two binaries and names both when it finishes:
+`bentod`, the deployment, with the dashboard assets embedded from
+`web/dist`; and `bento-monitor`, the operator's terminal screen over it.
 
 Everything host-touching (libvirt RPC, qemu-img, xorriso, nft, /dev/kvm)
 sits behind small traits with in-memory fakes, so the full test suite
@@ -102,6 +115,8 @@ depending on the data layer; `bentod` is the one place that knows every
 concrete type.
 
 - `bentod` — subcommand dispatch and the wiring of all crates.
+- `bento-monitor` — the operator's terminal screen over the systemd
+  units, the configuration, and the host.
 - `crates/types` — shared domain types (SPEC 11-12).
 - `crates/config` — TOML operator configuration; see `bento.example.toml`.
 - `crates/store` — SQLite schema and persistence (SPEC 12).
