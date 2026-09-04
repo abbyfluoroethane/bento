@@ -1,0 +1,9 @@
+{% extends "layout.html" %}
+{% block content %}
+<div class="error-page">
+  <div class="code">{{ status }}</div>
+  <h1>{{ title }}</h1>
+  <p>{{ message }}</p>
+  <p><a class="btn" data-variant="outline" data-size="sm" href="/">Back</a></p>
+</div>
+{% endblock %}

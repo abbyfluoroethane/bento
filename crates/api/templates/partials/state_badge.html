@@ -1,0 +1,6 @@
+<span id="vm-state" class="vm-meta" hx-get="/vm/{{ vm.uuid }}/fragments/state" hx-trigger="every 10s" hx-target="this" hx-swap="outerHTML" hx-boost="false">
+  <span class="badge state" data-variant="outline" data-state="{{ vm.state }}"><i class="dot state-{{ vm.state }}" aria-hidden="true"></i>{{ vm.state }}</span>
+  <span class="address">{% if vm.address %}{{ vm.address }}{% else %}no address{% endif %}</span>
+  <span class="muted">{{ vm.visibility }}</span>
+  <span class="muted">last use {{ vm.last_seen }}</span>
+</span>

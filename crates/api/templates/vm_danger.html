@@ -1,0 +1,60 @@
+{% extends "layout.html" %}
+{% block content %}
+{% include "partials/vm_header.html" %}
+{% if not vm.mine %}
+<div class="alert" role="status">
+  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+  <h2>You cannot stop or delete this VM.</h2>
+  <section><p>It belongs to <span class="mono">{{ vm.owner }}</span>.</p></section>
+</div>
+{% else %}
+<div class="danger-list">
+  {% if vm.state == "stopped" %}
+  <form class="danger-row" method="post" action="/vm/{{ vm.uuid }}/start">
+    <div class="text"><h3>Start</h3><p>Boot the VM.</p></div>
+    <button type="submit" class="btn">Start VM</button>
+  </form>
+  {% else %}
+  <form class="danger-row" method="post" action="/vm/{{ vm.uuid }}/restart">
+    <div class="text"><h3>Restart</h3><p>Reboot the VM.</p></div>
+    <button type="submit" class="btn" data-variant="destructive">Restart VM</button>
+  </form>
+  <form class="danger-row" method="post" action="/vm/{{ vm.uuid }}/stop">
+    <div class="text"><h3>Stop</h3><p>Shut down. The disk is kept.</p></div>
+    <button type="submit" class="btn" data-variant="destructive">Stop VM</button>
+  </form>
+  {% endif %}
+  <div class="danger-row">
+    <div class="text"><h3>Delete</h3><p>Delete the VM and its disk.</p></div>
+    <button type="button" class="btn" data-variant="destructive" onclick="document.getElementById('delete-dialog').showModal()">Delete VM</button>
+  </div>
+</div>
+{% endif %}
+{% endblock %}
+{% block dialogs %}
+{% if vm.mine %}
+<dialog id="delete-dialog" class="dialog" aria-labelledby="delete-title" aria-describedby="delete-desc" onclick="if (event.target === this) this.close()">
+  <div>
+    <header>
+      <h2 id="delete-title">Delete {{ vm.name }}?</h2>
+      <p id="delete-desc">Deletes <span class="mono">{{ vm.name }}</span> and its disk. The name is locked for a while afterwards.</p>
+    </header>
+    <section>
+      <form id="delete-form" method="post" action="/vm/{{ vm.uuid }}/delete">
+        {% if vm.visibility == "public" %}<div class="alert" data-variant="destructive" role="status">
+  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
+  <h2>This VM is public.</h2>
+  <section><p>Links to <span class="mono">{{ vm.name }}.{{ base_domain }}</span> will break.</p></section>
+</div>{% endif %}
+        <div class="field"><label for="confirm">Type the VM name to confirm</label><input class="input mono" id="confirm" name="confirm" placeholder="{{ vm.name }}" autocomplete="off" data-confirm-name="{{ vm.name }}"></div>
+      </form>
+    </section>
+    <footer>
+      <button type="button" class="btn" data-variant="ghost" onclick="this.closest('dialog').close()">Cancel</button>
+      <button type="submit" class="btn" data-variant="destructive" form="delete-form" data-armed disabled>Delete {{ vm.name }}</button>
+    </footer>
+    <button type="button" class="btn" data-variant="ghost" data-size="icon-sm" aria-label="Close dialog" onclick="this.closest('dialog').close()"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg></button>
+  </div>
+</dialog>
+{% endif %}
+{% endblock %}

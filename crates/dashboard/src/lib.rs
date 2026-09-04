@@ -1,9 +1,14 @@
-//! Serves the built web dashboard (SPEC 14).
+//! Serves the dashboard's static assets (SPEC 14).
 //!
-//! The assets are a single-page application built in `web/` and embedded
-//! at compile time; the deployed artifact stays one binary with no Node
-//! runtime (SPEC 14.1). The control plane mounts this router at `/` and
-//! the API at `/api/`, so this router never sees an API request.
+//! The pages themselves are rendered by `bento_api::pages`; this crate
+//! carries what they link to: the Basecoat stylesheet and scripts, HTMX,
+//! uPlot, the self-hosted IBM Plex fonts (SPEC 14.3), and the branding.
+//! Everything is embedded at compile time, so the deployed artifact stays
+//! one binary with no Node runtime and no build step (SPEC 14.1).
+//!
+//! The control plane mounts this router beside the pages and `/api/`. The
+//! sign-in gate skips paths that look like files, so these are served to
+//! anyone; none of them carries session meaning.
 
 use axum::Router;
 use axum::body::Body;
@@ -11,19 +16,19 @@ use axum::http::{HeaderValue, Method, Request, StatusCode, Uri, header};
 use axum::response::{IntoResponse, Response};
 use rust_embed::RustEmbed;
 
-/// The Vite build output, committed to the repository (see `web/README.md`).
+/// The asset tree, checked in under `crates/dashboard/assets`.
 #[derive(RustEmbed)]
-#[folder = "../../web/dist"]
+#[folder = "assets"]
 struct Dist;
 
-/// An asset source. The embedded build satisfies it; tests substitute an
-/// in-memory map so the routing rules are exercised without a Node build.
+/// An asset source. The embedded tree satisfies it; tests substitute an
+/// in-memory map so the routing rules are exercised on their own.
 pub trait Assets: Send + Sync + 'static {
     /// The bytes of `path`, or `None` when no such file exists.
     fn get(&self, path: &str) -> Option<Vec<u8>>;
 }
 
-/// The dashboard build embedded in this binary.
+/// The asset tree embedded in this binary.
 #[derive(Clone, Copy, Default)]
 pub struct Embedded;
 
@@ -33,27 +38,37 @@ impl Assets for Embedded {
     }
 }
 
-/// Serves the embedded dashboard build. When the build carries no
-/// `index.html` — an asset tree that was never built — it serves a plain
-/// placeholder that says how to build the assets.
+/// The URL prefix every asset lives under.
+pub const PREFIX: &str = "/assets/";
+
+/// Serves the embedded assets under [`PREFIX`].
 pub fn router() -> Router {
     router_from(Embedded)
 }
 
-/// Serves a dashboard build from any [`Assets`]. Paths that name a file
-/// are served as-is; every other path falls back to `index.html` so
-/// client-side routes survive a reload. Hashed assets under `assets/`
-/// are immutable and cached for a year; `index.html` is revalidated on
-/// every load so a new deploy takes effect at once.
+/// Serves an asset tree from any [`Assets`]. Assets are not content
+/// hashed, so each answer carries an entity tag derived from its bytes
+/// and is revalidated on every load: a new deploy takes effect at once,
+/// and an unchanged file costs one small round trip.
 pub fn router_from(assets: impl Assets) -> Router {
-    if assets.get("index.html").is_none() {
-        return Router::new().fallback(|| async { placeholder() });
-    }
     let assets = std::sync::Arc::new(assets);
-    Router::new().fallback(move |req: Request<Body>| {
-        let assets = assets.clone();
-        async move { serve(assets.as_ref(), req.method(), req.uri()) }
-    })
+    let for_icon = assets.clone();
+    Router::new()
+        // Browsers and tools ask for this regardless of the link tags.
+        .route(
+            "/favicon.ico",
+            axum::routing::get(move |req: Request<Body>| {
+                let assets = for_icon.clone();
+                async move {
+                    let uri: Uri = "/assets/branding/favicon.png".parse().expect("static uri");
+                    serve(assets.as_ref(), req.method(), &uri, req.headers())
+                }
+            }),
+        )
+        .fallback(move |req: Request<Body>| {
+            let assets = assets.clone();
+            async move { serve(assets.as_ref(), req.method(), req.uri(), req.headers()) }
+        })
 }
 
 /// The content type for a path, from its extension.
@@ -63,12 +78,13 @@ fn content_type(path: &str) -> HeaderValue {
         .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"))
 }
 
-/// Normalizes a request path to an asset path: leading slash removed,
-/// `.` and `..` segments resolved away so nothing can escape the asset
-/// tree, and an empty path meaning `index.html`.
-fn clean_path(uri: &Uri) -> String {
+/// Normalizes a request path to an asset path: the prefix and leading
+/// slash removed, `.` and `..` segments resolved away so nothing can
+/// escape the asset tree.
+fn clean_path(uri: &Uri) -> Option<String> {
+    let rest = uri.path().strip_prefix(PREFIX)?;
     let mut parts: Vec<&str> = Vec::new();
-    for segment in uri.path().split('/') {
+    for segment in rest.split('/') {
         match segment {
             "" | "." => {}
             ".." => {
@@ -78,73 +94,54 @@ fn clean_path(uri: &Uri) -> String {
         }
     }
     if parts.is_empty() {
-        return "index.html".to_string();
+        return None;
     }
-    parts.join("/")
+    Some(parts.join("/"))
 }
 
-fn serve(assets: &dyn Assets, method: &Method, uri: &Uri) -> Response {
+/// A weak entity tag over the bytes: FNV-1a, which is plenty for
+/// distinguishing deploys and needs no dependency.
+fn etag(bytes: &[u8]) -> HeaderValue {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    HeaderValue::from_str(&format!("W/\"{hash:016x}\"")).expect("hex is a valid header")
+}
+
+fn serve(assets: &dyn Assets, method: &Method, uri: &Uri, headers: &header::HeaderMap) -> Response {
     if method != Method::GET && method != Method::HEAD {
         return (StatusCode::METHOD_NOT_ALLOWED, "method not allowed").into_response();
     }
-    let path = clean_path(uri);
-
-    if let Some(body) = assets.get(&path) {
-        // A hashed name under assets/ never changes content, so it is
-        // immutable for a year; everything else is revalidated on every
-        // load so a new deploy takes effect at once.
-        let cache = if path.starts_with("assets/") {
-            "public, max-age=31536000, immutable"
-        } else {
-            "no-cache"
-        };
+    let Some(path) = clean_path(uri) else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    let Some(body) = assets.get(&path) else {
+        return (StatusCode::NOT_FOUND, "not found").into_response();
+    };
+    let tag = etag(&body);
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .is_some_and(|value| value == tag)
+    {
         return (
-            StatusCode::OK,
+            StatusCode::NOT_MODIFIED,
             [
-                (header::CONTENT_TYPE, content_type(&path)),
-                (header::CACHE_CONTROL, HeaderValue::from_static(cache)),
+                (header::ETAG, tag),
+                (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
             ],
-            body,
         )
             .into_response();
     }
-
-    // A path with an extension names a missing file: a real 404. A path
-    // without one is a client-side route: serve the app shell.
-    if path.rsplit('/').next().is_some_and(|f| f.contains('.')) {
-        return (StatusCode::NOT_FOUND, "not found").into_response();
-    }
-    match assets.get("index.html") {
-        Some(body) => (
-            StatusCode::OK,
-            [
-                (header::CONTENT_TYPE, HeaderValue::from_static("text/html")),
-                (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
-            ],
-            body,
-        )
-            .into_response(),
-        None => placeholder(),
-    }
-}
-
-/// Answers when no dashboard build is embedded. It returns 503: the API
-/// still works, the UI is what is unavailable. This is not the proxy's
-/// instance error page of SPEC 9.3 and 14.5 — that page belongs to the
-/// HTTP proxy, never to this crate.
-fn placeholder() -> Response {
     (
-        StatusCode::SERVICE_UNAVAILABLE,
-        [(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("text/html; charset=utf-8"),
-        )],
-        concat!(
-            "<!doctype html><title>Bento</title>",
-            "<p>The dashboard assets are not embedded in this build. ",
-            "Run <code>npm install &amp;&amp; npm run build</code> in <code>web/</code> ",
-            "and rebuild.</p>"
-        ),
+        StatusCode::OK,
+        [
+            (header::CONTENT_TYPE, content_type(&path)),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-cache")),
+            (header::ETAG, tag),
+        ],
+        body,
     )
         .into_response()
 }
@@ -177,78 +174,99 @@ mod tests {
 
     fn app() -> Router {
         router_from(Fake::new(&[
-            ("index.html", "<!doctype html>shell"),
-            ("assets/app-abc123.js", "console.log(1)"),
-            ("favicon.ico", "icon"),
+            ("css/app.css", "body{}"),
+            ("js/app.js", "console.log(1)"),
+            ("branding/favicon.svg", "<svg/>"),
+            ("branding/favicon.png", "<png>"),
         ]))
     }
 
-    async fn get(app: Router, path: &str) -> (StatusCode, String, String) {
+    async fn get(
+        app: Router,
+        path: &str,
+        if_none_match: Option<&str>,
+    ) -> (StatusCode, HeaderMap, String) {
+        let mut builder = Request::builder().uri(path);
+        if let Some(tag) = if_none_match {
+            builder = builder.header(header::IF_NONE_MATCH, tag);
+        }
         let res = app
-            .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+            .oneshot(builder.body(Body::empty()).unwrap())
             .await
             .unwrap();
         let status = res.status();
-        let cache = res
-            .headers()
-            .get(header::CACHE_CONTROL)
-            .map(|v| v.to_str().unwrap().to_string())
-            .unwrap_or_default();
+        let headers = res.headers().clone();
         let body = to_bytes(res.into_body(), usize::MAX).await.unwrap();
-        (status, cache, String::from_utf8_lossy(&body).into_owned())
+        (status, headers, String::from_utf8_lossy(&body).into_owned())
     }
 
+    use axum::http::HeaderMap;
+
     #[tokio::test]
-    async fn root_serves_the_shell() {
-        let (status, cache, body) = get(app(), "/").await;
+    async fn serves_files_with_type_and_etag() {
+        let (status, headers, body) = get(app(), "/assets/css/app.css", None).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(cache, "no-cache");
-        assert!(body.contains("shell"));
+        assert_eq!(body, "body{}");
+        assert!(
+            headers[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("text/css")
+        );
+        assert_eq!(headers[header::CACHE_CONTROL], "no-cache");
+        assert!(headers[header::ETAG].to_str().unwrap().starts_with("W/\""));
     }
 
     #[tokio::test]
-    async fn hashed_assets_are_immutable() {
-        let (status, cache, body) = get(app(), "/assets/app-abc123.js").await;
+    async fn revalidation_answers_304() {
+        let (_, headers, _) = get(app(), "/assets/js/app.js", None).await;
+        let tag = headers[header::ETAG].to_str().unwrap().to_string();
+        let (status, _, body) = get(app(), "/assets/js/app.js", Some(&tag)).await;
+        assert_eq!(status, StatusCode::NOT_MODIFIED);
+        assert_eq!(body, "");
+        let (status, _, _) = get(app(), "/assets/js/app.js", Some("W/\"stale\"")).await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(cache, "public, max-age=31536000, immutable");
-        assert_eq!(body, "console.log(1)");
     }
 
-    /// A client-side route has no extension, so it gets the app shell
-    /// rather than a 404 — a reload on /instances must not break.
     #[tokio::test]
-    async fn client_side_routes_fall_back_to_the_shell() {
-        let (status, _, body) = get(app(), "/instances/web").await;
+    async fn missing_and_escaping_paths_are_404() {
+        assert_eq!(
+            get(app(), "/assets/js/missing.js", None).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(get(app(), "/assets/", None).await.0, StatusCode::NOT_FOUND);
+        assert_eq!(
+            get(app(), "/assets/../etc/passwd", None).await.0,
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(get(app(), "/other", None).await.0, StatusCode::NOT_FOUND);
+        // `..` cannot climb above the tree: this resolves to css/app.css.
+        assert_eq!(
+            get(app(), "/assets/js/../css/app.css", None).await.0,
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn favicon_ico_is_the_png() {
+        let (status, headers, body) = get(app(), "/favicon.ico", None).await;
         assert_eq!(status, StatusCode::OK);
-        assert!(body.contains("shell"));
-    }
-
-    /// A path with an extension names a file, so a missing one is a real
-    /// 404 rather than an HTML page a script tag would choke on.
-    #[tokio::test]
-    async fn missing_files_are_not_found() {
-        let (status, _, _) = get(app(), "/assets/gone.js").await;
-        assert_eq!(status, StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn traversal_cannot_escape_the_asset_tree() {
-        for path in ["/../../etc/passwd", "/assets/../../secret.txt"] {
-            let (status, _, body) = get(app(), path).await;
-            assert!(
-                status == StatusCode::NOT_FOUND || body.contains("shell"),
-                "{path} leaked: {status}"
-            );
-        }
+        assert_eq!(body, "<png>");
+        assert!(
+            headers[header::CONTENT_TYPE]
+                .to_str()
+                .unwrap()
+                .starts_with("image/png")
+        );
     }
 
     #[tokio::test]
-    async fn writes_are_rejected() {
+    async fn only_get_and_head() {
         let res = app()
             .oneshot(
                 Request::builder()
                     .method(Method::POST)
-                    .uri("/")
+                    .uri("/assets/css/app.css")
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -257,22 +275,21 @@ mod tests {
         assert_eq!(res.status(), StatusCode::METHOD_NOT_ALLOWED);
     }
 
-    /// With no build embedded the API still works; the UI is what is
-    /// unavailable, so this is a 503 and not the proxy's 9.3 page.
-    #[tokio::test]
-    async fn no_build_serves_the_placeholder() {
-        let (status, _, body) = get(router_from(Fake::new(&[])), "/").await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(body.contains("not embedded"));
-    }
-
-    /// The real embedded build must carry an index.html, or every
-    /// deployment would silently serve the placeholder.
-    #[tokio::test]
-    async fn the_embedded_build_is_present() {
-        assert!(
-            Embedded.get("index.html").is_some(),
-            "web/dist/index.html is not embedded"
-        );
+    #[test]
+    fn embedded_tree_carries_the_essentials() {
+        for path in [
+            "css/basecoat-lyra.min.css",
+            "css/uplot.min.css",
+            "css/app.css",
+            "js/basecoat.min.js",
+            "js/htmx.min.js",
+            "js/uplot.min.js",
+            "js/app.js",
+            "fonts/ibm-plex-sans-latin-400-normal.woff2",
+            "fonts/ibm-plex-mono-latin-400-normal.woff2",
+            "branding/favicon.svg",
+        ] {
+            assert!(Embedded.get(path).is_some(), "missing asset {path}");
+        }
     }
 }

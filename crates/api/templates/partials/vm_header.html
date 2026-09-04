@@ -1,0 +1,16 @@
+<header class="page">
+  <div>
+    <h1 class="vm-title"><span>{{ vm.name }}</span><span class="domain">.{{ base_domain }}</span></h1>
+    {% include "partials/state_badge.html" %}
+  </div>
+  {% if vm.mine %}{% else %}<span class="badge" data-variant="secondary">shared by {{ vm.owner }}</span>{% endif %}
+</header>
+<div class="tabs">
+  <nav role="tablist" data-variant="line" aria-orientation="horizontal" aria-label="{{ vm.name }} sections">
+    <a role="tab" href="/vm/{{ vm.uuid }}" aria-selected="{{ 'true' if tab == 'dashboard' else 'false' }}">Dashboard</a>
+    <a role="tab" href="/vm/{{ vm.uuid }}/terminal" aria-selected="{{ 'true' if tab == 'terminal' else 'false' }}">Terminal</a>
+    <a role="tab" href="/vm/{{ vm.uuid }}/settings" aria-selected="{{ 'true' if tab == 'settings' else 'false' }}">Settings</a>
+    <a role="tab" href="/vm/{{ vm.uuid }}/sharing" aria-selected="{{ 'true' if tab == 'sharing' else 'false' }}">Sharing</a>
+    <a role="tab" href="/vm/{{ vm.uuid }}/danger" data-variant="destructive" aria-selected="{{ 'true' if tab == 'danger' else 'false' }}">Danger Zone</a>
+  </nav>
+</div>

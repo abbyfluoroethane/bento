@@ -1,0 +1,10 @@
+<header class="page"><h1>Settings</h1></header>
+<div class="tabs">
+  <nav role="tablist" data-variant="line" aria-orientation="horizontal" aria-label="Settings sections">
+    <a role="tab" href="/settings/account" aria-selected="{{ 'true' if tab == 'account' else 'false' }}">Account</a>
+    {% if user.operator %}
+    <a role="tab" href="/settings" aria-selected="{{ 'true' if tab == 'users' else 'false' }}">Users</a>
+    <a role="tab" href="/settings/configuration" aria-selected="{{ 'true' if tab == 'configuration' else 'false' }}">Configuration</a>
+    {% endif %}
+  </nav>
+</div>

@@ -1,0 +1,43 @@
+{% extends "layout.html" %}
+{% block content %}
+<header class="page"><h1>Virtual Machines</h1></header>
+
+
+<section class="section">
+  <header><h2>Your VMs</h2><span class="muted small">provisioned, out of the host</span></header>
+  <dl class="tiles" aria-label="Your provisioned resources">
+    {% for tile in tiles %}
+    <div class="tile"{% if tile.full %} data-full{% endif %}>
+      <dt>{{ tile.label }}</dt>
+      <dd>{{ tile.used }}{% if tile.max %} <small>/ {{ tile.max }}</small>{% endif %}</dd>
+      {% if tile.max %}<div class="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{{ (tile.ratio * 100)|round }}" aria-label="{{ tile.label }} used"><span style="width:{{ (tile.ratio * 100)|round }}%"></span></div>{% endif %}
+    </div>
+    {% endfor %}
+  </dl>
+</section>
+
+{% include "partials/instances.html" %}
+
+<div class="charts">
+  <div class="chart-card">
+    <header><h3>Host CPU usage</h3><span><span class="badge sample" data-variant="outline"{% if not host.placeholder %} hidden{% endif %}>sample data</span> <span class="now"></span></span></header>
+    <div class="chart" data-src="/metrics/host.json?window=3600" data-series="cpu_pct" data-kind="pct" aria-label="Host CPU usage over the last hour"></div>
+  </div>
+  <div class="chart-card">
+    <header><h3>Host memory usage</h3><span><span class="badge sample" data-variant="outline"{% if not host.placeholder %} hidden{% endif %}>sample data</span> <span class="now"></span></span></header>
+    <div class="chart" data-src="/metrics/host.json?window=3600" data-series="memory_used_mib" data-kind="mib" data-max="{{ host.memory_total_mib }}" aria-label="Host memory usage over the last hour"></div>
+  </div>
+  <div class="bar-card">
+    <header><h3>Host memory provisioning</h3><span class="muted small">{{ host.memory_provisioned_mib|mib }} of {{ host.memory_total_mib|mib }}</span></header>
+    {% with bar = host.memory %}{% include "partials/bar.html" %}{% endwith %}
+  </div>
+  <div class="bar-card">
+    <header><h3>Host storage usage</h3><span class="muted small">{% if host.placeholder %}<span class="badge sample" data-variant="outline">sample data</span> {% endif %}{{ host.storage_used_gib|gib }} of {{ host.storage_total_gib }} GiB</span></header>
+    {% with bar = host.storage_usage %}{% include "partials/bar.html" %}{% endwith %}
+  </div>
+  <div class="bar-card">
+    <header><h3>Host storage provisioning</h3><span class="muted small">{{ host.storage_provisioned_gib }} GiB of {{ host.storage_total_gib }} GiB, virtual sizes</span></header>
+    {% with bar = host.storage %}{% include "partials/bar.html" %}{% endwith %}
+  </div>
+</div>
+{% endblock %}

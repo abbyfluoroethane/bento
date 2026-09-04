@@ -1,0 +1,56 @@
+{% extends "layout.html" %}
+{% block content %}
+{% include "partials/settings_tabs.html" %}
+{% if error %}
+<div class="alert" data-variant="destructive" role="alert">
+  <h2>Key not added</h2>
+  <section><p>{{ error }}</p></section>
+</div>
+{% endif %}
+<div class="section">
+  <header><h2>Account</h2><form method="post" action="/logout" hx-boost="false"><button type="submit" class="btn" data-variant="outline" data-size="sm">Sign out</button></form></header>
+<dl class="kv">
+  <div><dt>User</dt><dd>{{ user.name }}</dd></div>
+  <div><dt>Email</dt><dd>{{ user.email }}</dd></div>
+  <div><dt>Command line</dt><dd>{{ ssh_hint }}</dd></div>
+</dl>
+</div>
+<section class="section">
+  <header><h2>Theme</h2></header>
+  <div class="switch-row">
+    <span class="text"><b>Dark mode</b><span>Follows your system until you set it.</span></span>
+    <button type="button" class="btn theme-toggle" data-variant="outline" data-size="icon" aria-label="Toggle dark mode" data-tooltip="Toggle dark mode" data-side="left" onclick="window.basecoat.theme.toggle()">
+      <span class="sun"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/></svg></span>
+      <span class="moon"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.985 12.486a9 9 0 1 1-9.473-9.472c.405-.022.617.46.402.803a6 6 0 0 0 8.268 8.268c.344-.215.825-.004.803.401"/></svg></span>
+    </button>
+  </div>
+</section>
+<section class="section">
+  <header><h2>SSH keys</h2></header>
+  {% if keys %}
+  <div class="table-container">
+    <table class="table">
+      <thead><tr><th>Fingerprint</th><th>Comment</th><th>Added</th><th class="end"><span class="sr-only">Actions</span></th></tr></thead>
+      <tbody>
+        {% for key in keys %}
+        <tr>
+          <td class="mono">{{ key.fingerprint }}</td>
+          <td>{% if key.comment %}{{ key.comment }}{% else %}—{% endif %}</td>
+          <td class="dim">{{ key.added }}</td>
+          <td class="end"><form method="post" action="/settings/account/keys/{{ key.id }}/remove" style="display:inline" onsubmit="return confirm('Remove key {{ key.fingerprint }}?')"><button type="submit" class="btn" data-variant="destructive" data-size="sm">Remove</button></form></td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="hint">No SSH keys yet.</p>
+  {% endif %}
+  <form class="panel" method="post" action="/settings/account/keys">
+    <h3>Add a key</h3>
+    <div class="field"><label for="public_key">Public key</label><textarea class="textarea mono" id="public_key" name="public_key" rows="3" placeholder="ssh-ed25519 AAAA… user@host" required></textarea></div>
+    <div class="field"><label for="comment">Comment (optional)</label><input class="input" id="comment" name="comment" placeholder="work laptop"></div>
+    <div class="actions"><button type="submit" class="btn">Add key</button></div>
+  </form>
+</section>
+{% endblock %}

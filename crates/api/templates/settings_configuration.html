@@ -1,0 +1,63 @@
+{% extends "layout.html" %}
+{% block content %}
+{% include "partials/settings_tabs.html" %}
+
+{% if error %}
+<div class="alert" data-variant="destructive" role="alert">
+  <h2>Not added</h2>
+  <section><p>{{ error }}</p></section>
+</div>
+{% endif %}
+<section class="section">
+  <header><h2>Images</h2></header>
+  {% if images %}
+  <div class="table-container">
+    <table class="table">
+      <thead><tr><th>Name</th><th>Kind</th><th>Source</th><th>Current checksum</th><th>Pinned</th><th>On older versions</th></tr></thead>
+      <tbody>
+        {% for image in images %}
+        <tr>
+          <td class="mono">{{ image.name }}</td>
+          <td>{{ image.kind }}</td>
+          <td class="mono" title="{{ image.source }}">{{ image.source|truncate(48) }}</td>
+          <td class="mono" title="{{ image.current_checksum }}">{{ image.current_checksum|truncate(14) }}</td>
+          <td>{% if image.kind == "oci" %}<span class="muted">source digest tracked</span>{% elif image.pinned_checksum %}<span class="mono" title="{{ image.pinned_checksum }}">{{ image.pinned_checksum|truncate(14) }}</span>{% else %}<span class="muted">no (trust on first use)</span>{% endif %}</td>
+          <td>{{ image.instances_on_older_versions }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <p class="hint">No images yet.</p>
+  {% endif %}
+  {% if image_admin %}
+  <form class="panel" method="post" action="/settings/images">
+    <div><h3>Add bootc OCI image</h3><p class="hint">Pulls the image and builds a disk. Takes a few minutes.</p></div>
+    <div class="fields inline">
+      <div class="field"><label for="oci-name">Allowed image name</label><input class="input mono" id="oci-name" name="name" required pattern="[a-z0-9](?:[a-z0-9\-]{0,61}[a-z0-9])?" placeholder="web-os"></div>
+      <div class="field"><label for="oci-reference">OCI reference</label><input class="input mono" id="oci-reference" name="reference" required placeholder="quay.io/example/web-os@sha256:…"></div>
+      <button type="submit" class="btn">Add image</button>
+    </div>
+  </form>
+  {% endif %}
+</section>
+<section class="section">
+  <header><h2>Database</h2></header>
+  <div class="panel">
+    <p style="margin:0"><span class="muted">Database path: </span><span class="mono">{{ db_path }}</span></p>
+    <p class="hint">A consistent snapshot. Do not copy the database file directly while bentod runs.</p>
+    <div><a class="btn" href="/api/db.sqlite" download hx-boost="false">Download database</a></div>
+  </div>
+</section>
+<section class="section">
+  <header><h2>Defaults for a new VM</h2></header>
+  <dl class="kv">
+    <div><dt>vCPU</dt><dd>{{ defaults.vcpu }}</dd></div>
+    <div><dt>Memory</dt><dd>{{ defaults.memory_mib|mib }}</dd></div>
+    <div><dt>Disk</dt><dd>{{ defaults.disk_gib }} GiB</dd></div>
+    <div><dt>Base domain</dt><dd>{{ base_domain }}</dd></div>
+  </dl>
+  <p class="footnote">Set in <span class="mono">bento.toml</span>.</p>
+</section>
+{% endblock %}

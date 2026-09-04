@@ -1,0 +1,94 @@
+{% extends "layout.html" %}
+{% block content %}
+{% include "partials/vm_header.html" %}
+{% if error %}
+<div class="alert" data-variant="destructive" role="alert">
+  <h2>Not saved</h2>
+  <section><p>{{ error }}</p></section>
+</div>
+{% endif %}
+{% if not vm.mine %}
+<div class="alert" role="status">
+  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+  <h2>You cannot change this VM.</h2>
+  <section><p>It belongs to <span class="mono">{{ vm.owner }}</span>.</p></section>
+</div>
+{% endif %}
+<form class="form" method="post" action="/vm/{{ vm.uuid }}/settings" data-confirm-rename{% if not vm.mine %} inert{% endif %}>
+  <div class="field">
+    <label for="name">VM name</label>
+    <div class="name-field">
+      <input class="input mono" id="name" name="name" value="{{ vm.name }}" data-current="{{ vm.name }}" pattern="[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?" required autocomplete="off">
+      <span class="suffix">.{{ base_domain }}</span>
+    </div>
+    <p class="hint">Renaming breaks links to <span class="mono">{{ vm.name }}.{{ base_domain }}</span> and changes the SSH user name.</p>
+  </div>
+  <div class="fields three">
+    <div class="stepper">
+      <label for="vcpu">vCPU</label>
+      <div class="value"><input id="vcpu" name="vcpu" type="number" min="1" max="64" step="1" value="{{ vm.vcpu }}" required><span class="unit">vCores</span></div>
+      <div class="controls"><button type="button" class="btn" data-variant="ghost" data-size="icon-sm" data-step="down" aria-label="Fewer vCPU">−</button><button type="button" class="btn" data-variant="ghost" data-size="icon-sm" data-step="up" aria-label="More vCPU">+</button></div>
+    </div>
+    <div class="stepper">
+      <label for="memory_gib">Memory</label>
+      <div class="value"><input id="memory_gib" name="memory_gib" type="number" min="0.5" max="256" step="0.5" value="{{ vm.memory_gib|num }}" required><span class="unit">GiB</span></div>
+      <div class="controls"><button type="button" class="btn" data-variant="ghost" data-size="icon-sm" data-step="down" aria-label="Less memory">−</button><button type="button" class="btn" data-variant="ghost" data-size="icon-sm" data-step="up" aria-label="More memory">+</button></div>
+    </div>
+    <div class="stepper">
+      <label for="disk_gib">Storage</label>
+      <div class="value"><input id="disk_gib" name="disk_gib" type="number" min="{{ vm.disk_gib }}" max="4096" step="1" value="{{ vm.disk_gib }}" required><span class="unit">GiB, grows only</span></div>
+      <div class="controls"><button type="button" class="btn" data-variant="ghost" data-size="icon-sm" data-step="down" aria-label="Less storage">−</button><button type="button" class="btn" data-variant="ghost" data-size="icon-sm" data-step="up" aria-label="More storage">+</button></div>
+    </div>
+  </div>
+  <p class="hint">Takes effect after a restart. The disk can only grow.</p>
+  <div>
+    <label class="switch-row" for="public">
+      <span class="text"><b>Make VM public</b><span>When enabled, users can visit <span class="mono">{{ vm.name }}.{{ base_domain }}</span> without authentication.</span></span>
+      <input class="input" type="checkbox" role="switch" id="public" name="public"{% if vm.visibility == "public" %} checked{% endif %}>
+    </label>
+    <div class="switch-row">
+      <label class="text" for="http_port"><b>HTTP port</b><span>Where <span class="mono">{{ vm.url }}</span> forwards to.</span></label>
+      <input class="input mono" id="http_port" name="http_port" type="number" min="1" max="65535" value="{{ vm.http_port }}" style="width:7rem" required>
+    </div>
+    <label class="switch-row" for="nested">
+      <span class="text"><b>Nested virtualization</b><span>Run VMs inside this VM.</span></span>
+      <input class="input" type="checkbox" role="switch" id="nested" name="nested"{% if vm.nested %} checked{% endif %}>
+    </label>
+    <div class="switch-row">
+      <span class="text"><b>KSM / memory deduplication</b><span>Set at creation.</span></span>
+      <span class="badge" data-variant="secondary">{% if vm.ksm %}on{% else %}off{% endif %}</span>
+    </div>
+  </div>
+  {% if vm.mine %}
+  <div class="actions">
+    <button type="reset" class="btn" data-variant="outline" data-size="icon" aria-label="Reset changes" title="Reset changes"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/></svg></button>
+    <button type="submit" class="btn grow">Save changes</button>
+  </div>
+  {% endif %}
+</form>
+
+{% endblock %}
+{% block dialogs %}
+<dialog id="rename-dialog" class="dialog" aria-labelledby="rename-title" aria-describedby="rename-desc" onclick="if (event.target === this) this.close()">
+  <div>
+    <header>
+      <h2 id="rename-title">Rename {{ vm.name }}?</h2>
+      <p id="rename-desc">Links to <span class="mono">{{ vm.name }}.{{ base_domain }}</span> will break. SSH becomes <span class="mono">ssh <span data-new-name></span>@{{ base_domain }}</span>. The old name is locked for a while.</p>
+    </header>
+    {% if vm.visibility == "public" %}
+    <section>
+      <div class="alert" data-variant="destructive" role="status">
+  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>
+  <h2>This VM is public.</h2>
+  <section><p>Anyone using the old link loses it.</p></section>
+</div>
+    </section>
+    {% endif %}
+    <footer>
+      <button type="button" class="btn" data-variant="ghost" onclick="this.closest('dialog').close()">Cancel</button>
+      <button type="button" class="btn" data-variant="destructive" data-rename-go>Rename and save</button>
+    </footer>
+    <button type="button" class="btn" data-variant="ghost" data-size="icon-sm" aria-label="Close dialog" onclick="this.closest('dialog').close()"><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg></button>
+  </div>
+</dialog>
+{% endblock %}

@@ -520,17 +520,43 @@ The bundle assumes a session and has no sign-in of its own, so a request without
 
 ### 14.1 Stack
 
-Use shadcn/ui. Apply the preset `b3DooLR16I`. Record this identifier in the repository, because the preset is the source of the component tokens.
+The dashboard is server-rendered HTML from the control plane, with
+[Basecoat](https://basecoatui.com) (the Lyra style pack) for components,
+[HTMX](https://htmx.org) for navigation and the few polled fragments, and
+[uPlot](https://github.com/leeoniya/uPlot) for the resource charts.
 
-shadcn/ui needs React, Tailwind CSS, and Radix primitives. This adds a Node build step to a project that is otherwise one Go binary. Resolve the conflict at build time, not at run time:
+Basecoat is the shadcn/ui visual language as plain HTML, CSS, and a small
+amount of vanilla JavaScript, so the dashboard needs no React, no Radix,
+and no Node build: the templates live in `crates/api/templates`, the
+precompiled Basecoat stylesheet and scripts, HTMX, uPlot, the fonts, and
+the branding are checked in under `crates/dashboard/assets`, and
+`rust-embed` puts all of it in the binary. The deployed artifact stays one
+binary with no Node runtime and no build step, which is what the earlier
+"build in CI, embed the bundle" resolution was for.
 
-1. Build the dashboard assets in continuous integration.
-2. Embed the built assets with `go:embed`.
-3. Serve them from the control plane.
+Every page works without JavaScript: navigation is links, every change is
+a form that posts and redirects. HTMX adds polling (the instance table,
+the sidebar list, an instance's state badge), boosted navigation, and a
+redirect header when a session ends under a fragment request. The charts
+are the one JavaScript-only element; a page without them still shows the
+figures as text.
 
-The deployed artifact stays one binary with no Node runtime.
+Keyboard navigation and focus management come from the platform: native
+`<dialog>` and `<details>`, and Basecoat's own handling for the composite
+widgets it ships. Pick lists are Basecoat's `select`, and typed lookups
+its `combobox`; a native `<select>` or `<datalist>` is drawn by the browser
+and cannot be styled. Do not replace a control with a plain `div`. An
+infrastructure tool gets used by keyboard.
 
-Radix supplies keyboard navigation and focus management. Do not replace a Radix primitive with a plain `div`. An infrastructure tool gets used by keyboard.
+Record the versions of Basecoat, HTMX, and uPlot in
+`crates/dashboard/assets/README.md` when updating them. The Catppuccin
+token set for Basecoat is committed in `crates/dashboard/assets/css/app.css`
+(section 19): the upstream theme is a source, not a build input.
+
+Resource charts (host CPU, memory, and storage; per-instance vCPU,
+memory, and disk) read the `Metrics` interface in `crates/api`. Until the
+sampler exists the binary wires a placeholder that generates plausible
+series, and every chart drawn from it carries a "sample data" badge.
 
 ### 14.2 Color
 
@@ -540,7 +566,7 @@ Use Catppuccin. Latte is the light palette. Mocha is the dark palette.
 2. Give the user a manual override.
 3. Store the override in `localStorage`.
 
-The accent color is Mauve. This is a choice, not a requirement of the palette. Change it in one place.
+The accent color is Blue. This is a choice, not a requirement of the palette: on the Latte base it is the highest-contrast Catppuccin color that is not already spoken for (Red is destructive). Change it in one place.
 
 Map instance state to a named Catppuccin color. Use the same name in both palettes.
 
@@ -571,7 +597,7 @@ A table is the primary view. This tool manages a list of machines, and a user co
 
 The instance table shows the name, the observed state, the address, the image, the visibility, and the last use time. Sort by name by default.
 
-Show the quota of the user above the table. Show the used amount and the limit for all four limits in section 6.1.
+Show what the user has provisioned above the table: machines, vCPU, memory, and disk, each against the host's total. There are no per-user quotas (the removal of section 6.1 is tracked in the repository issues).
 
 Every view needs three states beyond the normal one:
 

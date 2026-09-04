@@ -23,6 +23,7 @@ mod landing;
 mod middleware;
 mod oidc;
 mod page;
+pub use page::sign_in_page;
 mod pairing;
 mod session;
 mod token;
@@ -136,6 +137,8 @@ pub struct Service {
     now: Clock,
     session_ttl: Duration,
     login_path: String,
+    /// What the sign-in button names, e.g. the provider's host.
+    provider_name: Option<String>,
 }
 
 /// The provider pair that OIDC login needs. The two are installed and
@@ -174,6 +177,7 @@ impl Service {
             now: Arc::new(OffsetDateTime::now_utc),
             session_ttl: DEFAULT_SESSION_TTL,
             login_path: "/login".to_string(),
+            provider_name: None,
         }
     }
 
@@ -254,6 +258,15 @@ impl Service {
     #[must_use]
     pub fn with_login_path(mut self, path: impl Into<String>) -> Self {
         self.login_path = path.into();
+        self
+    }
+
+    /// Names the identity provider on the sign-in button ("Sign in with
+    /// id.example.org"). Without it the button says "Sign in".
+    #[must_use]
+    pub fn with_provider_name(mut self, name: impl Into<String>) -> Self {
+        let name = name.into();
+        self.provider_name = if name.is_empty() { None } else { Some(name) };
         self
     }
 }
@@ -350,3 +363,28 @@ fn store_error(operation: impl Into<String>, source: BoxError) -> Error {
 
 #[cfg(test)]
 mod test_support;
+
+#[cfg(test)]
+mod provider_name_tests {
+    use super::*;
+    use crate::test_support::new_oidc_service_with_signups;
+
+    #[test]
+    fn the_provider_name_is_escaped_on_the_button() {
+        let test = new_oidc_service_with_signups();
+        let service = test.service.with_provider_name("id.<example>");
+        assert!(
+            service
+                .splash_page()
+                .contains("Sign in with id.&lt;example&gt;")
+        );
+        let plain = Service::new(
+            "b.example",
+            service.users.clone(),
+            service.access.clone(),
+            service.tokens.clone(),
+        )
+        .with_provider_name("");
+        assert!(plain.splash_page().contains(">Sign in</a>"));
+    }
+}

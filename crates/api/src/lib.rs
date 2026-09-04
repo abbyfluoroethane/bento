@@ -1,20 +1,26 @@
-//! The control-plane HTTP API consumed by the dashboard (SPEC section 14).
+//! The control plane's HTTP surface: the JSON API and the server-rendered
+//! dashboard (SPEC section 14).
 //!
 //! The dashboard exposes every operation represented by its section 15
 //! controls, so the API carries instance CRUD and lifecycle actions, rename,
 //! resize, port, visibility, shares, images, SSH keys, whoami, and the database
-//! download of SPEC 12.1.
+//! download of SPEC 12.1. The pages in [`pages`] render the same operations
+//! as HTML over the same adapters; both routers share one [`Config`].
 
 mod instances;
 mod interfaces;
 mod misc;
+mod pages;
+mod placeholder;
 
 pub(crate) use instances::*;
 pub use interfaces::*;
 pub(crate) use misc::*;
+pub use pages::router as pages;
+pub use placeholder::PlaceholderMetrics;
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use std::error::Error as StdError;
 use std::sync::Arc;
@@ -49,15 +55,24 @@ pub struct Config {
 
     /// The documented database path shown to operators (SPEC 12.1).
     pub db_path: String,
+
+    /// Resource measurements behind the dashboard charts.
+    pub metrics: Arc<dyn Metrics>,
+    /// The deployment's base domain, for the `name.<base_domain>` URLs and
+    /// SSH hints the pages show.
+    pub base_domain: String,
+    /// The operator defaults a new instance starts from (SPEC 15 `new`).
+    pub defaults: CreateDefaults,
 }
 
 #[derive(Clone)]
 pub(crate) struct AppState(pub(crate) Arc<Config>);
 
 /// Builds the `/api/` router. It carries every route under its full `/api`
-/// path and can therefore be merged directly with `bento_dashboard::router()`.
-pub fn router(config: Config) -> Router {
-    let state = AppState(Arc::new(config));
+/// path and can therefore be merged directly with the pages router and
+/// `bento_dashboard::router()`.
+pub fn router(config: Arc<Config>) -> Router {
+    let state = AppState(config);
     let routes = Router::new()
         .route("/api/whoami", get(handle_whoami))
         .route("/api/instances", get(list_instances).post(create_instance))
@@ -138,6 +153,30 @@ pub(crate) fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Resp
         body,
     )
         .into_response()
+}
+
+/// The HTTP status and message an error maps to, shared by the JSON
+/// contract and the HTML pages. Structured details (quota, cooldown) are
+/// folded into the message; the JSON mapping keeps them separately.
+pub(crate) fn error_parts(error: &BoxError) -> (StatusCode, String) {
+    if let Some(store_error) = find_error::<StoreError>(error.as_ref()) {
+        return match store_error {
+            StoreError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
+            StoreError::NameTaken => (StatusCode::CONFLICT, "that name is taken".to_string()),
+            StoreError::Quota { .. } => (StatusCode::CONFLICT, store_error.to_string()),
+            StoreError::NameCooldown { name, remaining } => (
+                StatusCode::CONFLICT,
+                format!(
+                    "the name {name} was released by another user and is in cooldown for about {} more",
+                    pages::cooldown_text(remaining.as_secs())
+                ),
+            ),
+        };
+    }
+    if let Some(status_error) = find_error::<StatusError>(error.as_ref()) {
+        return (status_error.http_status(), status_error.to_string());
+    }
+    (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
 }
 
 pub(crate) fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
