@@ -79,7 +79,9 @@ an instance that boots to nothing.
 Rust nightly, pinned by `rust-toolchain.toml`; `rustup` picks it up on
 its own. `make build` produces `target/release/bentod` with the
 dashboard assets embedded, so the deployed artifact is one file and
-needs no Node runtime.
+needs no Node runtime. The same build produces
+`target/release/bento-monitor`, the terminal screen over the units
+(section 6); the host needs it only if you want it.
 
 The build needs a C compiler for the bundled SQLite. It deliberately
 does **not** need cmake or clang: every TLS user is pinned to the `ring`
@@ -400,6 +402,45 @@ Verify:
 bentod reconcile                       # "libvirt and the database agree"
 curl -sI https://bento.example.org/    # dashboard
 ```
+
+### bento-monitor, the terminal screen
+
+Everything in sections 4 and 6 also has a screen. `make build` produces
+`target/release/bento-monitor` beside `bentod` and names both when it
+finishes. Run it on the host:
+
+```
+sudo bento-monitor                     # -config, -binary, and -source override the paths
+```
+
+Run it as root, or as a user who can `sudo` — it adds the `sudo` itself,
+per action. **Do not make it setuid.** The monitor's whole method is to
+run a command the operator chose, in the operator's terminal: setuid root
+would turn `EDITOR`, `-source` (which builds, so `build.rs` runs), and
+`-binary` into a local root shell, and it would drop the authentication
+and the audit line that `sudo` supplies. Where the password prompt is
+unwanted, a sudoers rule that names the `systemctl` commands, or a polkit
+rule on `org.freedesktop.systemd1.manage-units`, gives the same relief
+without the escalation.
+
+Four screens: **Services** drives the three units (start, stop, restart,
+enable, disable, and the journal); **Install** reports each step of
+sections 4 and 6 as done, missing, or waiting on an earlier one, and runs
+the ones that are missing; **Config** shows what `/etc/bento/bento.toml`
+parses to, with the ACME and OIDC secrets reported as set or missing but
+never printed, and runs `fetch-images`, `images`, and `reconcile`;
+**Host** shows the SPEC 4.2 requirement checks, processor, memory, swap,
+free space on the image and storage directories, and the libvirt domains.
+
+The monitor is a shim, not a second control plane. It holds no state, it
+starts no process of its own, and it changes nothing quietly: an action
+first shows the exact command, and the command then runs in your own
+terminal. So `sudo` can still ask for a password, `journalctl -f` scrolls
+as it always does, and what the monitor did is what you would have typed.
+
+Read-only from the start: with no configuration and no units installed,
+every screen still draws, and the Install tab is the list of what is
+missing.
 
 ## 7. Users, quota, and the dashboard
 

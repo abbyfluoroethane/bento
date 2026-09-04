@@ -17,6 +17,7 @@ members = [
     "crates/sshfront",
     "crates/cli",
     "bentod",
+    "bento-monitor",
 ]
 
 [workspace.package]
@@ -62,9 +63,11 @@ hyper = { version = "1.11.0", features = ["http1", "client", "server"] }
 hyper-util = { version = "0.1.20", features = ["tokio", "client", "client-legacy", "server", "http1"] }
 instant-acme = { version = "0.8.5", default-features = false, features = ["ring", "hyper-rustls"] }
 jsonwebtoken = { version = "11.0.0", default-features = false, features = ["use_pem", "rust_crypto"] }
+libc = "0.2.189"
 mime_guess = "2.0.5"
 percent-encoding = "2.3.2"
 rand = "0.10.2"
+ratatui = "0.30.2"
 rcgen = { version = "0.14.9", default-features = false, features = ["ring", "pem"] }
 # `rustls-no-provider`, not `rustls`: the latter pulls aws-lc-rs in. With
 # rustls itself built with exactly the `ring` provider feature and no

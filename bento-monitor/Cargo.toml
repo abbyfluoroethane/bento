@@ -1,0 +1,19 @@
+[package]
+name = "bento-monitor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "bento-monitor"
+path = "src/main.rs"
+
+[dependencies]
+bento-config = { workspace = true }
+bento-hypervisor = { workspace = true }
+bento-types = { workspace = true }
+libc = { workspace = true }
+ratatui = { workspace = true }
+tokio = { workspace = true }
+url = { workspace = true }

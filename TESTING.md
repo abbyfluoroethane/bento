@@ -14,7 +14,10 @@ Bento has two test tiers. Both run on every push, on x86_64 and on arm64.
 Every crate keeps its tests beside the code, in `#[cfg(test)]` modules.
 The host-touching seams have fakes: `bento_hypervisor::Fake` for libvirt,
 injected command runners for `qemu-img` and `xorriso`, and injected clocks
-for anything that expires. Two crates keep golden files —
+for anything that expires. `bento-monitor` follows the same rule from the
+other side: it parses `systemctl show` output and `/proc` text that the
+tests supply, and it builds each command as data and asserts on it rather
+than running it, so a test never touches the host it describes. Two crates keep golden files —
 `crates/cloudinit/testdata` and `crates/hypervisor/testdata` — so a change
 to generated cloud-init data or domain XML has to be stated, not slipped
 in.
