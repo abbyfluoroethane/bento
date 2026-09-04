@@ -87,10 +87,10 @@ to that privileged build.
 
 ## Development quickstart
 
-Rust nightly (see `rust-toolchain.toml`); Node only if you touch the
-dashboard. The build needs a C compiler for the bundled SQLite, but not
-cmake or clang: every TLS user is pinned to the `ring` crypto provider,
-never `aws-lc-rs`.
+Rust nightly (see `rust-toolchain.toml`) and nothing else: the dashboard
+is server-rendered, so there is no Node build. The build needs a C
+compiler for the bundled SQLite, but not cmake or clang: every TLS user
+is pinned to the `ring` crypto provider, never `aws-lc-rs`.
 
 ```
 make build       # target/release/bentod and target/release/bento-monitor
@@ -98,12 +98,12 @@ make monitor     # build and start the terminal screen against this host
 make check       # cargo clippy -D warnings && cargo test --workspace
 make unit        # the in-process tests only
 make e2e         # the end-to-end suite: the real binary, over real sockets
-make dashboard   # rebuild web/dist after changing web/src (npm ci && npm run build)
 ```
 
 `make build` produces two binaries and names both when it finishes:
-`bentod`, the deployment, with the dashboard assets embedded from
-`web/dist`; and `bento-monitor`, the operator's terminal screen over it.
+`bentod`, the deployment, with the dashboard's templates and static
+assets embedded from `crates/api/templates` and `crates/dashboard/assets`;
+and `bento-monitor`, the operator's terminal screen over it.
 
 Everything host-touching (libvirt RPC, qemu-img, xorriso, nft, /dev/kvm)
 sits behind small traits with in-memory fakes, so the full test suite
@@ -127,8 +127,9 @@ concrete type.
   interface (SPEC 10, 15).
 - `crates/proxy`, `crates/tlscert` — HTTP proxy and wildcard TLS
   (SPEC 8, 9).
-- `crates/auth`, `crates/api`, `crates/dashboard`, `web/` — identity,
-  API, and dashboard (SPEC 13, 14).
+- `crates/auth`, `crates/api`, `crates/dashboard` — identity, the JSON
+  API, the server-rendered dashboard pages (`crates/api/src/pages`,
+  `crates/api/templates`), and the dashboard's static assets (SPEC 13, 14).
 
 `crates/hypervisor` speaks the libvirt XDR RPC protocol directly over the
 unix socket rather than binding a C library, so the binary stays

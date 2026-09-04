@@ -9,18 +9,18 @@ use tower::ServiceExt;
 use super::*;
 
 #[derive(Default)]
-struct FakeData {
-    users: HashMap<i64, User>,
-    quotas: HashMap<i64, Quota>,
-    instances: HashMap<String, Instance>,
-    shares: HashMap<String, Vec<Share>>,
-    keys: HashMap<i64, Vec<SshKey>>,
-    images: Vec<Image>,
-    next_key_id: i64,
+pub(crate) struct FakeData {
+    pub(crate) users: HashMap<i64, User>,
+    pub(crate) quotas: HashMap<i64, Quota>,
+    pub(crate) instances: HashMap<String, Instance>,
+    pub(crate) shares: HashMap<String, Vec<Share>>,
+    pub(crate) keys: HashMap<i64, Vec<SshKey>>,
+    pub(crate) images: Vec<Image>,
+    pub(crate) next_key_id: i64,
 }
 
-struct FakeStore {
-    data: Mutex<FakeData>,
+pub(crate) struct FakeStore {
+    pub(crate) data: Mutex<FakeData>,
     dump_bytes: Vec<u8>,
 }
 
@@ -58,6 +58,12 @@ impl Store for FakeStore {
             .find(|user| user.name == name)
             .cloned()
             .ok_or_else(not_found_error)
+    }
+
+    async fn users(&self) -> Result<Vec<User>, BoxError> {
+        let mut users: Vec<User> = self.data.lock().unwrap().users.values().cloned().collect();
+        users.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(users)
     }
 
     async fn quota_for(&self, user_id: i64) -> Result<Quota, BoxError> {
@@ -226,9 +232,9 @@ enum Failure {
     Teapot,
 }
 
-struct FakeLifecycle {
+pub(crate) struct FakeLifecycle {
     store: Arc<FakeStore>,
-    calls: Mutex<Vec<String>>,
+    pub(crate) calls: Mutex<Vec<String>>,
     failure: Mutex<Option<Failure>>,
 }
 
@@ -395,7 +401,7 @@ impl Lifecycle for FakeLifecycle {
     }
 }
 
-struct FakeAuth(Mutex<Option<User>>);
+pub(crate) struct FakeAuth(pub(crate) Mutex<Option<User>>);
 
 #[async_trait]
 impl Authenticator for FakeAuth {
@@ -409,7 +415,7 @@ impl Authenticator for FakeAuth {
 }
 
 #[derive(Default)]
-struct FakeImageAdmin(Mutex<Vec<(String, String)>>);
+pub(crate) struct FakeImageAdmin(pub(crate) Mutex<Vec<(String, String)>>);
 
 #[async_trait]
 impl ImageAdmin for FakeImageAdmin {
@@ -422,7 +428,7 @@ impl ImageAdmin for FakeImageAdmin {
     }
 }
 
-fn user(id: i64, name: &str, email: &str, created_at: i64) -> User {
+pub(crate) fn user(id: i64, name: &str, email: &str, created_at: i64) -> User {
     User {
         id,
         name: name.to_string(),
@@ -433,7 +439,7 @@ fn user(id: i64, name: &str, email: &str, created_at: i64) -> User {
     }
 }
 
-fn instance(
+pub(crate) fn instance(
     uuid: &str,
     name: &str,
     owner_id: i64,
@@ -472,17 +478,19 @@ fn instance(
     }
 }
 
-struct Fixture {
-    store: Arc<FakeStore>,
-    lifecycle: Arc<FakeLifecycle>,
-    auth: Arc<FakeAuth>,
-    image_admin: Arc<FakeImageAdmin>,
-    app: Router,
-    alice: User,
-    bob: User,
+pub(crate) struct Fixture {
+    pub(crate) store: Arc<FakeStore>,
+    pub(crate) lifecycle: Arc<FakeLifecycle>,
+    pub(crate) auth: Arc<FakeAuth>,
+    pub(crate) image_admin: Arc<FakeImageAdmin>,
+    pub(crate) app: Router,
+    /// The server-rendered dashboard over the same fakes.
+    pub(crate) pages: Router,
+    pub(crate) alice: User,
+    pub(crate) bob: User,
 }
 
-fn fixture() -> Fixture {
+pub(crate) fn fixture() -> Fixture {
     let alice = user(1, "alice", "alice@example.com", 1000);
     let bob = user(2, "bob", "bob@example.com", 0);
     let store = Arc::new(FakeStore::default());
@@ -524,32 +532,42 @@ fn fixture() -> Fixture {
     let lifecycle = Arc::new(FakeLifecycle::new(store.clone()));
     let auth = Arc::new(FakeAuth(Mutex::new(Some(alice.clone()))));
     let image_admin = Arc::new(FakeImageAdmin::default());
-    let app = router(Config {
+    let config = Arc::new(Config {
         store: store.clone(),
         lifecycle: lifecycle.clone(),
         auth: auth.clone(),
         is_operator: Some(Arc::new(|user| user.id == 1)),
         image_admin: Some(image_admin.clone()),
         db_path: "/var/lib/bento/bento.db".to_string(),
+        metrics: Arc::new(crate::PlaceholderMetrics),
+        base_domain: "bento.example".to_string(),
+        defaults: CreateDefaults {
+            vcpu: 2,
+            memory_mib: 2048,
+            disk_gib: 20,
+        },
     });
+    let app = router(config.clone());
+    let pages = crate::pages(config);
     Fixture {
         store,
         lifecycle,
         auth,
         image_admin,
         app,
+        pages,
         alice,
         bob,
     }
 }
 
-struct TestResponse {
-    status: StatusCode,
-    headers: axum::http::HeaderMap,
-    body: Vec<u8>,
+pub(crate) struct TestResponse {
+    pub(crate) status: StatusCode,
+    pub(crate) headers: axum::http::HeaderMap,
+    pub(crate) body: Vec<u8>,
 }
 
-async fn request(app: &Router, method: Method, path: &str, body: &str) -> TestResponse {
+pub(crate) async fn request(app: &Router, method: Method, path: &str, body: &str) -> TestResponse {
     let response = app
         .clone()
         .oneshot(
@@ -1204,14 +1222,21 @@ async fn database_download_is_a_consistent_operator_only_snapshot() {
     let response = request(&fixture.app, Method::GET, "/api/db.sqlite", "").await;
     assert_eq!(response.status, StatusCode::FORBIDDEN);
 
-    let app = router(Config {
+    let app = router(Arc::new(Config {
         store: fixture.store.clone(),
         lifecycle: fixture.lifecycle.clone(),
         auth: fixture.auth.clone(),
         is_operator: None,
         image_admin: None,
         db_path: String::new(),
-    });
+        metrics: Arc::new(crate::PlaceholderMetrics),
+        base_domain: "bento.example".to_string(),
+        defaults: CreateDefaults {
+            vcpu: 2,
+            memory_mib: 2048,
+            disk_gib: 20,
+        },
+    }));
     *fixture.auth.0.lock().unwrap() = Some(fixture.alice.clone());
     let response = request(&app, Method::GET, "/api/db.sqlite", "").await;
     assert_eq!(response.status, StatusCode::FORBIDDEN);

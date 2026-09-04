@@ -600,6 +600,9 @@ impl bento_api::Store for ApiStore {
     async fn user_by_name(&self, name: &str) -> Result<User, ApiError> {
         self.0.user_by_name(name).await.map_err(api_store_error)
     }
+    async fn users(&self) -> Result<Vec<User>, ApiError> {
+        self.0.users().await.map_err(api_store_error)
+    }
     async fn quota_for(&self, user_id: i64) -> Result<Quota, ApiError> {
         self.0.quota_for(user_id).await.map_err(api_store_error)
     }

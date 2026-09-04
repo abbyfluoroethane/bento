@@ -1,0 +1,28 @@
+{% extends "layout.html" %}
+{% block content %}
+{% include "partials/vm_header.html" %}
+<div class="table-container">
+  <table class="table facts-table">
+    <tbody>
+      <tr><th scope="row">URL</th><td class="mono"><a href="{{ vm.url }}" target="_blank" rel="noopener">{{ vm.url }}</a></td><th scope="row">Image</th><td class="mono">{{ vm.image }}</td></tr>
+      <tr><th scope="row">SSH</th><td class="mono">{{ vm.ssh }}</td><th scope="row">Resources</th><td class="mono">{{ vm.vcpu }} vCPU · {{ vm.memory_mib|mib }} · {{ vm.disk_gib }} GiB</td></tr>
+      <tr><th scope="row">HTTP port</th><td class="mono">{{ vm.http_port }}</td><th scope="row">Created</th><td class="mono">{{ vm.created }}</td></tr>
+    </tbody>
+  </table>
+</div>
+<div class="charts">
+  <div class="chart-card">
+    <header><h3>vCPU usage</h3><span><span class="badge sample" data-variant="outline"{% if not metrics_placeholder %} hidden{% endif %}>sample data</span> <span class="now"></span></span></header>
+    <div class="chart" data-src="/vm/{{ vm.uuid }}/metrics.json?window=3600" data-series="cpu_pct" data-kind="pct" aria-label="vCPU usage over the last hour"></div>
+  </div>
+  <div class="chart-card">
+    <header><h3>Memory usage</h3><span><span class="badge sample" data-variant="outline"{% if not metrics_placeholder %} hidden{% endif %}>sample data</span> <span class="now"></span></span></header>
+    <div class="chart" data-src="/vm/{{ vm.uuid }}/metrics.json?window=3600" data-series="memory_used_mib" data-kind="mib" data-max="{{ vm.memory_mib }}" aria-label="Memory usage over the last hour"></div>
+  </div>
+  <div class="bar-card">
+    <header><h3>Storage usage</h3><span class="muted small">{% if metrics_placeholder %}<span class="badge sample" data-variant="outline">sample data</span> {% endif %}of {{ vm.disk_gib }} GiB</span></header>
+    {% with bar = storage %}{% include "partials/bar.html" %}{% endwith %}
+  </div>
+</div>
+
+{% endblock %}

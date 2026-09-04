@@ -1,0 +1,353 @@
+/*
+ * Bento dashboard: tokens and layout over Basecoat's Lyra style pack.
+ *
+ * Tokens: catppuccin/shadcn-ui, themes/latte/latte-mauve.css and
+ * themes/mocha/mocha-mauve.css at commit 4435e5c (2025-08-09). That theme
+ * is in the older shadcn format (bare HSL triplets for hsl(var(--x)));
+ * Basecoat 1.x reads var(--x) as a finished color, so every value is
+ * wrapped in hsl() here. This file is the committed token set SPEC 19
+ * asks for; the upstream theme is not a build input.
+ *
+ * Dark mode is Basecoat's `html.dark` class, toggled before first paint
+ * by the inline script in layout.html (SPEC 14.2).
+ *
+ * The accent is Blue: on the Latte base it is the highest-contrast
+ * non-semantic Catppuccin color (about 5:1 as a fill under Base text; the
+ * mauve it replaced sat below that). Text on an accent fill is always Base. It lives in one place per palette:
+ * --primary. Red stays reserved for destructive.
+ */
+
+/* Self-hosted IBM Plex (SPEC 14.3): latin subset, woff2, swap. */
+@font-face { font-family: "IBM Plex Sans"; font-style: normal; font-weight: 400; font-display: swap; src: url("../fonts/ibm-plex-sans-latin-400-normal.woff2") format("woff2"); }
+@font-face { font-family: "IBM Plex Sans"; font-style: normal; font-weight: 500; font-display: swap; src: url("../fonts/ibm-plex-sans-latin-500-normal.woff2") format("woff2"); }
+@font-face { font-family: "IBM Plex Sans"; font-style: normal; font-weight: 600; font-display: swap; src: url("../fonts/ibm-plex-sans-latin-600-normal.woff2") format("woff2"); }
+@font-face { font-family: "IBM Plex Mono"; font-style: normal; font-weight: 400; font-display: swap; src: url("../fonts/ibm-plex-mono-latin-400-normal.woff2") format("woff2"); }
+@font-face { font-family: "IBM Plex Mono"; font-style: normal; font-weight: 500; font-display: swap; src: url("../fonts/ibm-plex-mono-latin-500-normal.woff2") format("woff2"); }
+@font-face { font-family: "IBM Plex Mono"; font-style: normal; font-weight: 600; font-display: swap; src: url("../fonts/ibm-plex-mono-latin-600-normal.woff2") format("woff2"); }
+
+:root {
+  /* Catppuccin Latte, mauve accent */
+  --radius: 0.625rem;
+  --background: hsl(220 23.08% 94.90%);            /* base */
+  --foreground: hsl(234 16.02% 35.49%);            /* text */
+  --card: hsl(220 23.08% 94.90%);
+  --card-foreground: hsl(234 16.02% 35.49%);
+  --popover: hsl(220 23.08% 94.90%);
+  --popover-foreground: hsl(234 16.02% 35.49%);
+  --primary: #1e66f5;                              /* accent: Blue */
+  --primary-foreground: #eff1f5;                   /* base */
+  --secondary: hsl(223 15.91% 82.75%);             /* surface0 */
+  --secondary-foreground: hsl(234 16.02% 35.49%);
+  --muted: hsl(223 15.91% 82.75%);                 /* surface0 */
+  --muted-foreground: hsl(233 12.80% 41.37%);      /* subtext1 */
+  --accent: hsl(223 15.91% 82.75%);
+  --accent-foreground: hsl(234 16.02% 35.49%);
+  --destructive: hsl(347 86.67% 44.12%);           /* red */
+  --border: hsl(225 13.56% 76.86%);                /* surface1 */
+  --input: hsl(225 13.56% 76.86%);
+  --ring: hsl(234 16.02% 35.49%);
+  --sidebar: hsl(218 25.10% 93.73%);               /* mantle */
+  --sidebar-foreground: hsl(234 16.02% 35.49%);
+  --sidebar-primary: #1e66f5;
+  --sidebar-primary-foreground: #eff1f5;
+  --sidebar-accent: hsl(220 23.08% 94.90%);
+  --sidebar-accent-foreground: hsl(234 16.02% 35.49%);
+  --sidebar-border: hsl(225 13.56% 76.86%);
+  --sidebar-ring: hsl(225 13.56% 76.86%);
+  /* Chart series in fixed order: blue (the accent), mauve, teal, peach, green. */
+  --chart-1: #1e66f5;
+  --chart-2: #8839ef;
+  --chart-3: #179299;
+  --chart-4: #fe640b;
+  --chart-5: #40a02b;
+  /* Instance state (SPEC 14.2): always paired with a text label. Latte
+   * Yellow is low contrast on the light base, so the color goes on a dot
+   * or border, never on text. */
+  --state-running: #40a02b;
+  --state-starting: #df8e1d;
+  --state-stopped: #8c8fa1;
+  --state-error: #d20f39;
+  --mantle: #e6e9ef;
+  --crust: #dce0e8;
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --sidebar-width: 15rem;
+  color-scheme: light;
+}
+
+.dark {
+  /* Catppuccin Mocha, mauve accent */
+  --background: hsl(240 21.05% 14.90%);
+  --foreground: hsl(226 63.93% 88.04%);
+  --card: hsl(240 21.05% 14.90%);
+  --card-foreground: hsl(226 63.93% 88.04%);
+  --popover: hsl(240 21.05% 14.90%);
+  --popover-foreground: hsl(226 63.93% 88.04%);
+  --primary: #89b4fa;                              /* accent: Blue */
+  --primary-foreground: #1e1e2e;                   /* base */
+  --secondary: hsl(237 16.24% 22.94%);
+  --secondary-foreground: hsl(226 63.93% 88.04%);
+  --muted: hsl(237 16.24% 22.94%);
+  --muted-foreground: hsl(227 35.29% 80.00%);
+  --accent: hsl(237 16.24% 22.94%);
+  --accent-foreground: hsl(226 63.93% 88.04%);
+  --destructive: hsl(343 81.25% 74.90%);
+  --border: hsl(234 13.21% 31.18%);
+  --input: hsl(234 13.21% 31.18%);
+  --ring: hsl(226 63.93% 88.04%);
+  --sidebar: hsl(240 21.18% 14.12%);
+  --sidebar-foreground: hsl(226 63.93% 88.04%);
+  --sidebar-primary: #89b4fa;
+  --sidebar-primary-foreground: #1e1e2e;
+  --sidebar-accent: hsl(240 21.05% 14.90%);
+  --sidebar-accent-foreground: hsl(226 63.93% 88.04%);
+  --sidebar-border: hsl(234 13.21% 31.18%);
+  --sidebar-ring: hsl(234 13.21% 31.18%);
+  --chart-1: #89b4fa;
+  --chart-2: #cba6f7;
+  --chart-3: #94e2d5;
+  --chart-4: #fab387;
+  --chart-5: #a6e3a1;
+  --state-running: #a6e3a1;
+  --state-starting: #f9e2af;
+  --state-stopped: #7f849c;
+  --state-error: #f38ba8;
+  --mantle: #181825;
+  --crust: #11111b;
+  color-scheme: dark;
+}
+
+/* ------------------------------------------------------------------ */
+/* Base */
+
+html { font-size: 14px; }
+body { background: var(--background); color: var(--foreground); font-family: var(--font-sans); line-height: 1.5; margin: 0; }
+h1, h2, h3, h4, .mono, code, kbd, .table td.mono { font-family: var(--font-mono); }
+.alert > h2, .toast h2, .dialog h2 { font-family: var(--font-sans); }
+h1 { font-size: 1.25rem; font-weight: 600; margin: 0; }
+h2 { font-size: 0.95rem; font-weight: 600; margin: 0; }
+h3 { font-size: 0.85rem; font-weight: 600; margin: 0; }
+/* Links inherit text color, except when they are the button component:
+ * this sheet is unlayered and would otherwise beat Basecoat's .btn color. */
+a:not(.btn) { color: inherit; }
+.muted { color: var(--muted-foreground); }
+.small { font-size: 0.85rem; }
+.tabular { font-variant-numeric: tabular-nums; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { transition: none !important; animation: none !important; } }
+
+/* ------------------------------------------------------------------ */
+/* Shell: sidebar left, content right (from the design drawings) */
+
+.shell { display: flex; min-height: 100vh; }
+.side { flex: none; width: var(--sidebar-width); background: var(--sidebar); color: var(--sidebar-foreground); border-right: 1px solid var(--sidebar-border); position: sticky; top: 0; height: 100vh; height: 100dvh; align-self: flex-start; box-sizing: border-box; }
+.side > nav { display: flex; flex-direction: column; height: 100%; }
+.side > nav > header { padding: 1.25rem 1rem 0.75rem; }
+.side > nav > section { flex: 1; padding: 0 0.75rem; display: grid; gap: 0.75rem; align-content: start; overflow-y: auto; }
+.side > nav > footer { border-top: 1px solid var(--sidebar-border); padding: 0.75rem; }
+/* The wordmark from branding/ is black on transparent; as a mask filled
+ * with the text color it follows Latte and Mocha alike. */
+.wordmark { display: inline-flex; align-items: center; text-decoration: none; color: inherit; }
+.wordmark-img { display: block; height: 1.25rem; aspect-ratio: 722 / 136; background: currentColor; -webkit-mask: url("../branding/wordmark.png") no-repeat left center / contain; mask: url("../branding/wordmark.png") no-repeat left center / contain; }
+.side .btn.new-vm { width: 100%; justify-content: space-between; }
+.vm-group { width: 100%; display: flex; }
+.vm-group > a.btn { flex: 1; justify-content: flex-start; font-weight: 500; }
+.vm-group > a.btn[aria-current="page"] { border-color: var(--primary); box-shadow: inset 2px 0 0 var(--primary); }
+.vm-group > button svg { transition: transform 0.15s; }
+.vm-group > button[aria-expanded="false"] svg { transform: rotate(-90deg); }
+#vm-tree[hidden] { display: none; }
+.vm-list li a { display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 0.6rem; border: 1px solid var(--sidebar-border); text-decoration: none; font-family: var(--font-mono); font-size: 0.85rem; background: var(--background); }
+.vm-list li a:hover { border-color: var(--primary); }
+.vm-list li a[aria-current="page"] { border-color: var(--primary); box-shadow: inset 2px 0 0 var(--primary); }
+.vm-list li a .shared { margin-left: auto; font-family: var(--font-sans); font-size: 0.7rem; color: var(--muted-foreground); }
+.vm-list .none { font-size: 0.8rem; color: var(--muted-foreground); padding: 0.3rem 0.6rem; }
+.account-menu { width: 100%; }
+/* The trigger is the outline button component, opened up to two lines. */
+.account-menu > .btn { width: 100%; height: auto; justify-content: flex-start; gap: 0.6rem; padding: 0.5rem 0.6rem; font-size: 0.9rem; text-align: left; }
+.account-menu > .btn[aria-expanded="true"], .account-menu[data-current] > .btn { border-color: var(--primary); }
+.account-menu > .btn > .who { flex: 1; min-width: 0; font-weight: 400; }
+.account-menu > .btn > .who .mono { display: block; overflow: hidden; text-overflow: ellipsis; }
+.account-menu > .btn > svg { color: var(--muted-foreground); }
+.account-menu [data-popover] { width: 100%; }
+.account-menu [role="menuitem"] { text-decoration: none; }
+.account-menu form { display: contents; }
+.account-menu form button[role="menuitem"] { width: 100%; font: inherit; color: inherit; background: none; border: 0; text-align: left; cursor: pointer; }
+.avatar { width: 1.6rem; height: 1.6rem; border-radius: 999px; background: var(--primary); color: var(--primary-foreground); display: inline-grid; place-items: center; font-family: var(--font-mono); font-weight: 600; font-size: 0.8rem; flex: none; }
+.account-menu .email { display: block; font-size: 0.7rem; color: var(--muted-foreground); overflow: hidden; text-overflow: ellipsis; }
+
+/* The content column fills the space beside the sidebar; each block
+ * inside it is centered and capped at a readable width. */
+.content { flex: 1; min-width: 0; padding: 1.5rem 2rem 4rem; display: grid; gap: 1.25rem; align-content: start; justify-items: center; }
+.content > * { width: 100%; max-width: 64rem; min-width: 0; box-sizing: border-box; }
+.content > header.page { display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
+.mobile-bar { display: none; }
+@media (max-width: 767px) {
+  .content { padding: 1rem 1rem 3rem; }
+  .mobile-bar { display: flex; align-items: center; gap: 0.75rem; }
+}
+
+/* ------------------------------------------------------------------ */
+/* Widgets */
+
+.vm-title { display: flex; align-items: baseline; gap: 0.5rem; flex-wrap: wrap; }
+.vm-title .domain { color: var(--muted-foreground); font-family: var(--font-mono); font-size: 1rem; }
+.vm-meta { display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; font-size: 0.85rem; }
+.vm-meta .address { font-family: var(--font-mono); }
+.tabs > [role="tablist"] a { text-decoration: none; }
+.tabs > [role="tablist"] a[data-variant="destructive"][aria-selected="true"] { color: var(--destructive); }
+.tabs > [role="tablist"] a[data-variant="destructive"]::after { background: var(--destructive); }
+.tabs > [role="tablist"] a[data-variant="destructive"] { color: color-mix(in srgb, var(--destructive) 80%, var(--foreground)); }
+
+.charts { display: grid; gap: 1rem; }
+.chart-card { min-width: 0; border: 1px solid var(--border); padding: 0.75rem 0.75rem 0.5rem; display: grid; grid-template-rows: auto 1fr; gap: 0.5rem; background: var(--card); height: 15rem; box-sizing: border-box; }
+.chart-card > header { display: flex; align-items: baseline; justify-content: space-between; gap: 0.25rem 1rem; flex-wrap: wrap; }
+.chart-card > header h3 { font-size: 0.8rem; font-weight: 500; }
+.chart-card .now { font-family: var(--font-mono); font-size: 0.85rem; font-variant-numeric: tabular-nums; }
+.chart { height: 100%; min-height: 0; min-width: 0; position: relative; overflow: hidden; }
+.chart > .uplot, .chart > .u-wrap { height: 100%; }
+.chart .u-legend { display: none; }
+.uplot, .uplot *, .uplot *::before, .uplot *::after { box-sizing: border-box; }
+.uplot { font-family: var(--font-sans); }
+.u-axis { color: var(--muted-foreground); }
+.chart-empty { color: var(--muted-foreground); font-size: 0.8rem; height: 100%; display: grid; place-items: center; }
+
+.bar-card { border: 1px solid var(--border); padding: 0.75rem; display: grid; gap: 0.4rem; background: var(--card); }
+.bar-card > header { display: flex; justify-content: space-between; align-items: baseline; gap: 0.25rem 1rem; flex-wrap: wrap; }
+.bar-card > header h3 { white-space: nowrap; }
+.bar-card > header > span { text-align: right; }
+.bar-card > header h3 { font-size: 0.8rem; font-weight: 500; }
+.bar { display: flex; height: 1.75rem; border: 1px solid var(--border); overflow: hidden; font-size: 0.8rem; font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.bar > span { display: flex; align-items: center; justify-content: center; min-width: 0; overflow: hidden; white-space: nowrap; }
+.bar > .used { background: color-mix(in srgb, var(--primary) 30%, var(--card)); border-right: 1px solid var(--border); }
+.bar > .free { flex: 1; background: color-mix(in srgb, var(--chart-5) 18%, var(--card)); color: var(--muted-foreground); }
+.bar[data-over] > .used { background: color-mix(in srgb, var(--state-starting) 45%, var(--card)); border-right-color: color-mix(in srgb, var(--state-starting) 80%, transparent); }
+.bar[data-over] > .free { background: color-mix(in srgb, var(--destructive) 30%, var(--card)); color: var(--foreground); }
+.bar-key { display: flex; gap: 1rem; font-size: 0.75rem; color: var(--muted-foreground); }
+.bar-key span { display: inline-flex; align-items: center; gap: 0.35rem; }
+.swatch { width: 0.7rem; height: 0.7rem; border: 1px solid var(--border); display: inline-block; }
+.swatch.left { background: color-mix(in srgb, var(--primary) 30%, var(--card)); }
+.swatch.right { background: color-mix(in srgb, var(--chart-5) 18%, var(--card)); }
+.bar-key[data-over] .swatch.left { background: color-mix(in srgb, var(--state-starting) 45%, var(--card)); }
+.bar-key[data-over] .swatch.right { background: color-mix(in srgb, var(--destructive) 30%, var(--card)); }
+
+.tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.75rem; margin: 0; }
+@media (max-width: 720px) { .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+.tile { border: 1px solid var(--border); background: var(--mantle); padding: 0.75rem; display: grid; gap: 0.5rem; }
+.tile dt { font-size: 0.7rem; color: var(--muted-foreground); text-transform: uppercase; letter-spacing: 0.06em; }
+.tile dd { margin: 0; font-family: var(--font-mono); font-size: 1rem; font-variant-numeric: tabular-nums; }
+.tile dd small { font-size: 0.75rem; color: var(--muted-foreground); }
+.tile .progress > span { background: var(--primary); }
+.tile[data-full] .progress > span { background: var(--destructive); }
+
+.states { display: grid; gap: 0.4rem; border: 1px solid var(--border); padding: 0.75rem; }
+.states-bar { display: flex; height: 6px; gap: 2px; }
+.states-bar span { display: block; }
+.states-legend { display: flex; gap: 1rem; flex-wrap: wrap; font-size: 0.8rem; color: var(--muted-foreground); }
+.states-legend span { display: inline-flex; align-items: center; gap: 0.35rem; }
+.states-legend b { font-family: var(--font-mono); font-weight: 500; color: var(--foreground); }
+.dot { width: 8px; height: 8px; border-radius: 999px; display: inline-block; flex: none; }
+.state-running { background: var(--state-running); }
+.state-starting { background: var(--state-starting); }
+.state-stopped { background: var(--state-stopped); }
+.state-error { background: var(--state-error); }
+.badge.state { border-color: var(--border); gap: 0.35rem; }
+.badge.state .dot { width: 7px; height: 7px; }
+.badge.state[data-state="running"] { border-color: color-mix(in srgb, var(--state-running) 55%, transparent); }
+.badge.state[data-state="starting"] { border-color: color-mix(in srgb, var(--state-starting) 70%, transparent); }
+.badge.state[data-state="stopped"] { border-color: color-mix(in srgb, var(--state-stopped) 55%, transparent); }
+.badge.state[data-state="error"] { border-color: color-mix(in srgb, var(--state-error) 55%, transparent); }
+.badge.sample { border-color: color-mix(in srgb, var(--state-starting) 70%, transparent); color: var(--muted-foreground); }
+
+.section { display: grid; gap: 0.75rem; }
+.section > header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; flex-wrap: wrap; }
+.table-container { border: 1px solid var(--border); }
+.table th, .table td { padding: 0.5rem 0.75rem; text-align: left; }
+.table thead tr { background: var(--mantle); }
+.table thead th { font-size: 0.75rem; color: var(--muted-foreground); font-weight: 500; }
+.table td.mono { font-size: 0.85rem; }
+.table td.dim { color: var(--muted-foreground); }
+.table td.end, .table th.end { text-align: right; }
+.table td a.name { text-decoration: none; font-weight: 500; }
+.table td a.name:hover { text-decoration: underline; }
+.table td .badge { vertical-align: middle; }
+.table .row-shared { margin-left: 0.4rem; }
+
+.panel { border: 1px solid var(--border); background: var(--mantle); padding: 1rem; display: grid; gap: 0.75rem; }
+.panel > h3 { font-size: 0.85rem; }
+.panel p.hint, p.hint { margin: 0; color: var(--muted-foreground); font-size: 0.85rem; }
+.form { display: grid; gap: 1rem; }
+.fields { display: grid; gap: 0.75rem; }
+.fields.three { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.fields.two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.fields.inline { grid-template-columns: 12rem 1fr auto; align-items: end; }
+.fields.with-action { grid-template-columns: 1fr auto; align-items: end; }
+@media (max-width: 720px) { .fields.three, .fields.two, .fields.inline, .fields.with-action { grid-template-columns: 1fr; } }
+.field label { display: block; font-size: 0.8rem; font-weight: 500; margin-bottom: 0.25rem; }
+.field .input, .field .select, .field .textarea, .field .combobox { width: 100%; box-sizing: border-box; }
+.field .select:not(select) > button { width: 100%; justify-content: space-between; }
+.field .combobox > input { width: 100%; }
+.field p.hint { margin-top: 0.3rem; font-size: 0.75rem; }
+.input.mono, .textarea.mono, .select.mono { font-family: var(--font-mono); }
+.name-field { display: flex; align-items: stretch; }
+.name-field .input { flex: 1; min-width: 0; }
+.name-field .suffix { display: flex; align-items: center; padding: 0 0.6rem; border: 1px solid var(--input); border-left: 0; color: var(--muted-foreground); font-family: var(--font-mono); font-size: 0.85rem; background: var(--muted); white-space: nowrap; }
+
+/* Steppers: the drawings' vCPU / Memory / Storage boxes */
+.stepper { border: 1px solid var(--border); background: var(--card); display: grid; grid-template-rows: auto 1fr auto; text-align: center; min-height: 9rem; }
+.stepper > label { font-size: 0.8rem; font-weight: 500; padding: 0.5rem 0.75rem; text-align: left; }
+.stepper .value { display: grid; place-items: center; align-content: center; gap: 0.15rem; }
+.stepper .value input { width: 5rem; text-align: center; font-family: var(--font-mono); font-size: 1.5rem; font-weight: 500; background: transparent; border: 0; color: inherit; padding: 0; -moz-appearance: textfield; }
+.stepper .value input::-webkit-outer-spin-button, .stepper .value input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.stepper .value input:focus-visible { outline: 1px solid var(--ring); }
+.stepper .value .unit { font-size: 0.75rem; color: var(--muted-foreground); }
+.stepper .controls { display: flex; justify-content: space-between; padding: 0.4rem; border-top: 1px solid var(--border); }
+.stepper .controls button { font-size: 1.1rem; }
+
+.switch-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; padding: 0.75rem 0; border-top: 1px solid var(--border); }
+.switch-row:last-of-type { border-bottom: 1px solid var(--border); }
+.switch-row .text { display: grid; gap: 0.1rem; }
+.switch-row .text b { font-weight: 500; font-size: 0.9rem; }
+.switch-row .text span { font-size: 0.8rem; color: var(--muted-foreground); }
+.switch-row .select { min-width: 8rem; }
+.actions { display: flex; gap: 0.5rem; align-items: center; justify-content: flex-end; flex-wrap: wrap; }
+.actions .grow { flex: 1; }
+.danger-list { display: grid; }
+.danger-row { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: 0.9rem 0; border-top: 1px solid var(--border); margin: 0; }
+.danger-row:last-child { border-bottom: 1px solid var(--border); }
+.danger-row .text { display: grid; gap: 0.15rem; }
+.danger-row h3 { font-size: 0.95rem; font-weight: 600; }
+.danger-row p { margin: 0; font-size: 0.85rem; color: var(--muted-foreground); }
+.danger-row .btn { flex: none; min-width: 9rem; }
+.kv { border: 1px solid var(--border); background: var(--mantle); padding: 0.5rem 1rem; margin: 0; }
+.kv div { display: flex; justify-content: space-between; gap: 1rem; padding: 0.35rem 0; font-size: 0.9rem; }
+.kv dt { color: var(--muted-foreground); }
+.kv dd { margin: 0; font-family: var(--font-mono); font-size: 0.85rem; text-align: right; }
+.facts-table th { width: 7rem; font-size: 0.75rem; font-weight: 500; color: var(--muted-foreground); text-transform: uppercase; letter-spacing: 0.06em; white-space: nowrap; background: var(--mantle); }
+.facts-table td { width: 50%; overflow-wrap: anywhere; white-space: normal; }
+.terminal { border: 1px solid var(--border); background: var(--crust); color: var(--foreground); font-family: var(--font-mono); font-size: 0.85rem; padding: 1rem; min-height: 14rem; display: grid; gap: 0.75rem; align-content: start; }
+.terminal pre { margin: 0; white-space: pre-wrap; }
+.user-card summary { list-style: none; cursor: pointer; display: flex; align-items: center; justify-content: space-between; padding: 0.75rem 1rem; font-family: var(--font-mono); font-weight: 500; }
+.user-card summary::-webkit-details-marker { display: none; }
+.user-card summary svg { width: 1rem; height: 1rem; transition: transform 0.15s; }
+.user-card[open] summary svg { transform: rotate(90deg); }
+.user-card { border: 1px solid var(--border); background: var(--card); }
+.user-card > section { padding: 0 1rem 1rem; display: grid; gap: 0.75rem; }
+.user-card .kv { border: 0; background: transparent; padding: 0; }
+.dialog form { display: grid; gap: 0.75rem; }
+.footnote { color: var(--muted-foreground); font-size: 0.75rem; border-top: 1px solid var(--border); padding-top: 0.75rem; }
+.error-page { display: grid; gap: 0.5rem; }
+.error-page .code { font-family: var(--font-mono); font-size: 3rem; color: var(--muted-foreground); line-height: 1; }
+.htmx-request .htmx-indicator { opacity: 1; }
+.htmx-indicator { opacity: 0; transition: opacity 0.2s; }
+
+/* Small screens: the sidebar slides in over the content. */
+@media (max-width: 767px) {
+  .side { position: fixed; inset: 0 auto 0 0; z-index: 40; transform: translateX(-100%); transition: transform 0.2s; box-shadow: 0 0 0 100vmax transparent; }
+  .side.open { transform: none; box-shadow: 0 0 0 100vmax color-mix(in srgb, var(--crust) 60%, transparent); }
+}
+
+/* Basecoat's theme switcher: the bundle carries no `dark:` utilities, so
+ * the icon swap is written out. */
+.theme-toggle .sun { display: none; }
+.dark .theme-toggle .sun { display: inline-flex; }
+.dark .theme-toggle .moon { display: none; }

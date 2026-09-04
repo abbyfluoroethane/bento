@@ -1,0 +1,8 @@
+<div class="bar"{% if bar.over %} data-over{% endif %} role="img" aria-label="{{ bar.left }} {{ bar.left_means }}, {{ bar.right }} {{ bar.right_means }}">
+  <span class="used" style="width:{{ bar.left_pct }}%">{{ bar.left }}</span>
+  <span class="free">{{ bar.right }}</span>
+</div>
+<div class="bar-key"{% if bar.over %} data-over{% endif %}>
+  <span><i class="swatch left" aria-hidden="true"></i>{{ bar.left_means }}</span>
+  <span><i class="swatch right" aria-hidden="true"></i>{{ bar.right_means }}</span>
+</div>

@@ -297,7 +297,8 @@ async fn control_plane_router(
         Arc::new(AuthAccess(app.store.clone())),
         Arc::new(AuthTokens(app.store.clone())),
     )
-    .with_pairings(Arc::new(AuthPairings(app.store.clone())));
+    .with_pairings(Arc::new(AuthPairings(app.store.clone())))
+    .with_provider_name(provider_name(&app.cfg.oidc.issuer));
     if app.cfg.oidc.allow_signup {
         // Wiring the provisioner is what opens signups: without it a login
         // for an unknown identity is refused (SPEC 13).
@@ -324,7 +325,7 @@ async fn control_plane_router(
         );
     }
     let operators = Arc::new(operator_predicate(&app.cfg.operators));
-    let api = bento_api::router(bento_api::Config {
+    let http = Arc::new(bento_api::Config {
         store: Arc::new(ApiStore(app.store.clone())),
         lifecycle: Arc::new(ApiBackend(Backend {
             manager,
@@ -340,7 +341,18 @@ async fn control_plane_router(
         is_operator: Some(Arc::new(move |user| operators.contains(&user.name))),
         image_admin: Some(Arc::new(RuntimeImages(app.image_store()))),
         db_path: app.cfg.db_path.clone(),
+        // Resource charts run on generated figures until the sampler
+        // lands (see the repository issues); every page says so.
+        metrics: Arc::new(bento_api::PlaceholderMetrics),
+        base_domain: app.cfg.base_domain.clone(),
+        defaults: bento_api::CreateDefaults {
+            vcpu: app.cfg.defaults.vcpu,
+            memory_mib: app.cfg.defaults.memory_mib,
+            disk_gib: app.cfg.defaults.disk_gib,
+        },
     });
+    let api = bento_api::router(http.clone());
+    let pages = bento_api::pages(http);
 
     let access_auth = auth.clone();
     let login_auth = auth.clone();
@@ -399,24 +411,47 @@ async fn control_plane_router(
                 async move { auth_response(auth.logout_response(&headers).await) }
             }),
         )
-        // The dashboard bundle assumes a session and has no sign-in of its
-        // own, so a signed-out visitor is answered by the gate instead
-        // (SPEC 13, 14). `layer` covers this router's fallback, which is
-        // every path that resolves to `index.html`.
-        .merge(bento_dashboard::router().layer(axum::middleware::from_fn(
-            move |request: axum::extract::Request, next: axum::middleware::Next| {
-                let auth = dashboard_auth.clone();
-                async move {
-                    if bento_auth::is_dashboard_asset(request.uri().path()) {
-                        return next.run(request).await;
-                    }
-                    match auth.dashboard_gate(request.headers()).await {
-                        Some(response) => auth_response(response),
-                        None => next.run(request).await,
-                    }
-                }
-            },
-        ))))
+        // The dashboard pages assume a session and have no sign-in of
+        // their own, so a signed-out visitor is answered by the gate
+        // instead (SPEC 13, 14). Assets are served to anyone. An HTMX
+        // fragment request whose session ended gets a redirect header
+        // rather than the splash page swapped into a corner of the page.
+        .merge(
+            pages
+                .merge(bento_dashboard::router())
+                .layer(axum::middleware::from_fn(
+                    move |request: axum::extract::Request, next: axum::middleware::Next| {
+                        let auth = dashboard_auth.clone();
+                        async move {
+                            if bento_auth::is_dashboard_asset(request.uri().path()) {
+                                return next.run(request).await;
+                            }
+                            match auth.dashboard_gate(request.headers()).await {
+                                Some(response) if request.headers().contains_key("hx-request") => {
+                                    let _ = response;
+                                    Response::builder()
+                                        .status(http::StatusCode::UNAUTHORIZED)
+                                        .header("hx-redirect", "/")
+                                        .body(Body::empty())
+                                        .expect("static response builds")
+                                }
+                                Some(response) => auth_response(response),
+                                None => next.run(request).await,
+                            }
+                        }
+                    },
+                )),
+        ))
+}
+
+/// The host of the OIDC issuer, for the sign-in button. An issuer that is
+/// not a URL is shown as written; an empty one yields no name.
+fn provider_name(issuer: &str) -> String {
+    issuer
+        .parse::<url::Url>()
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_owned))
+        .unwrap_or_else(|| issuer.trim().to_string())
 }
 
 fn auth_response(response: http::Response<String>) -> Response<Body> {

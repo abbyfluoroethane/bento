@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{% block title %}{{ title }}{% endblock %} · Bento</title>
+<link rel="icon" type="image/svg+xml" href="/assets/branding/favicon.svg">
+<link rel="alternate icon" type="image/png" href="/assets/branding/favicon.png">
+<link rel="stylesheet" href="/assets/css/basecoat-lyra.min.css">
+<link rel="stylesheet" href="/assets/css/uplot.min.css">
+<link rel="stylesheet" href="/assets/css/app.css">
+<script>
+// Apply the theme before first paint: the stored override wins, else the
+// OS preference (SPEC 14.2). The key is Basecoat's, so its theme switcher
+// (window.basecoat.theme) and this script agree.
+(function () {
+  var stored = null;
+  try { stored = localStorage.getItem("themeMode"); } catch (e) {}
+  var dark = stored ? stored === "dark" : window.matchMedia("(prefers-color-scheme: dark)").matches;
+  if (dark) document.documentElement.classList.add("dark");
+})();
+</script>
+</head>
+<body hx-boost="true">
+<div class="shell">
+  <aside id="sidebar" class="side">
+    <nav aria-label="Sidebar">{% include "partials/sidebar.html" %}</nav>
+  </aside>
+  <main class="content">
+    <div class="mobile-bar">
+      <button type="button" class="btn" data-variant="outline" data-size="sm" data-toggle-sidebar aria-controls="sidebar">Menu</button>
+      <a class="wordmark" href="/" aria-label="Bento home"><span class="wordmark-img" role="img" aria-label="~/bento!"></span></a>
+    </div>
+    {% block content %}{% endblock %}
+  </main>
+</div>
+<div id="toaster" class="toaster">{% if toast %}{% include "partials/toast.html" %}{% endif %}</div>
+{% block dialogs %}{% endblock %}
+<script src="/assets/js/htmx.min.js"></script>
+<script src="/assets/js/uplot.min.js"></script>
+<script src="/assets/js/basecoat.min.js" defer></script>
+<script src="/assets/js/toast.min.js" defer></script>
+<script src="/assets/js/dropdown-menu.min.js" defer></script>
+<script src="/assets/js/select.min.js" defer></script>
+<script src="/assets/js/combobox.min.js" defer></script>
+<script src="/assets/js/app.js" defer></script>
+</body>
+</html>

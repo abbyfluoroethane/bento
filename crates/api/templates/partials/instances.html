@@ -1,0 +1,43 @@
+<section id="instances" class="section" hx-get="/fragments/instances" hx-trigger="every 10s" hx-target="this" hx-swap="outerHTML" hx-boost="false">
+  <header>
+    <h2>Instances</h2>
+    <div class="states-legend">
+      <span><i class="dot state-running"></i><b>{{ counts.running }}</b> running</span>
+      <span><i class="dot state-starting"></i><b>{{ counts.starting }}</b> starting</span>
+      <span><i class="dot state-stopped"></i><b>{{ counts.stopped }}</b> stopped</span>
+    </div>
+  </header>
+  {% if instances %}
+  <div class="states-bar" aria-hidden="true">
+    {% if counts.running %}<span class="state-running" style="flex:{{ counts.running }}"></span>{% endif %}
+    {% if counts.starting %}<span class="state-starting" style="flex:{{ counts.starting }}"></span>{% endif %}
+    {% if counts.stopped %}<span class="state-stopped" style="flex:{{ counts.stopped }}"></span>{% endif %}
+  </div>
+  <div class="table-container">
+    <table class="table">
+      <thead><tr><th>Name</th><th>State</th><th>Address</th><th>Image</th><th>Visibility</th><th>Last use</th></tr></thead>
+      <tbody>
+        {% for vm in instances %}
+        <tr>
+          <td class="mono"><a class="name" href="/vm/{{ vm.uuid }}">{{ vm.name }}</a>{% if not vm.mine %}<span class="badge row-shared" data-variant="secondary">shared by {{ vm.owner }}</span>{% endif %}</td>
+          <td><span class="badge state" data-variant="outline" data-state="{{ vm.state }}"><i class="dot state-{{ vm.state }}" aria-hidden="true"></i>{{ vm.state }}</span></td>
+          <td class="mono">{% if vm.address %}{{ vm.address }}{% else %}—{% endif %}</td>
+          <td class="mono">{{ vm.image }}</td>
+          <td>{{ vm.visibility }}</td>
+          <td class="dim">{{ vm.last_seen }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+  <div class="empty">
+    <header>
+      <figure><svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="8" x="2" y="2" rx="2"/><rect width="20" height="8" x="2" y="14" rx="2"/><path d="M6 6h.01"/><path d="M6 18h.01"/></svg></figure>
+      <h2>No VMs yet</h2>
+      <p>Create one, or run <code>ssh {{ base_domain }} new &lt;name&gt;</code>.</p>
+    </header>
+    <footer><a class="btn" data-size="sm" href="/new">New VM</a></footer>
+  </div>
+  {% endif %}
+</section>

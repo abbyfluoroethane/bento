@@ -1,0 +1,29 @@
+{% extends "layout.html" %}
+{% block content %}
+{% include "partials/settings_tabs.html" %}
+
+<div class="section">
+  {% for account in users %}
+  <details class="user-card"{% if loop.first %} open{% endif %}>
+    <summary><span>{{ account.name }} <span class="muted small" style="font-family:var(--font-sans)">{{ account.email }}</span></span><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg></summary>
+    <section>
+      <dl class="kv">
+        <div><dt>VMs</dt><dd>{{ account.instances }}</dd></div>
+        <div><dt>Provisioned vCPU</dt><dd>{{ account.vcpu }} / {{ host_cpu_count }}</dd></div>
+        <div><dt>Provisioned memory</dt><dd>{{ account.memory_mib|mib }} / {{ host_memory_mib|mib }}</dd></div>
+        <div><dt>Provisioned disk</dt><dd>{{ account.disk_gib }} GiB / {{ host_storage_gib }} GiB</dd></div>
+        <div><dt>CPU usage {% if account.placeholder %}<span class="badge sample" data-variant="outline">sample data</span>{% endif %}</dt><dd>{{ account.cpu_pct|pct }}</dd></div>
+        <div><dt>Memory usage {% if account.placeholder %}<span class="badge sample" data-variant="outline">sample data</span>{% endif %}</dt><dd>{{ account.memory_used_mib|mib }}</dd></div>
+        <div><dt>Disk usage {% if account.placeholder %}<span class="badge sample" data-variant="outline">sample data</span>{% endif %}</dt><dd>{{ account.storage_used_gib|gib }}</dd></div>
+      </dl>
+      <div class="actions">
+        <button type="button" class="btn" data-variant="outline" data-size="sm" disabled title="Not available yet">Stop all VMs</button>
+        <button type="button" class="btn" data-variant="destructive" data-size="sm" disabled title="Not available yet">Delete all VMs</button>
+      </div>
+    </section>
+  </details>
+  {% else %}
+  <p class="hint">No accounts yet.</p>
+  {% endfor %}
+</div>
+{% endblock %}

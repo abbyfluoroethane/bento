@@ -1,5 +1,0 @@
-# Dependencies are restored with `npm install`.
-node_modules/
-
-# dist/ is deliberately NOT ignored: the built assets are committed so the
-# Rust build (rust-embed, in crates/dashboard) never needs a Node runtime.

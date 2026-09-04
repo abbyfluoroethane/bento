@@ -10,14 +10,18 @@ async-trait.workspace = true
 axum.workspace = true
 bento-store.workspace = true
 bento-types.workspace = true
+minijinja = "2"
 russh.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 time.workspace = true
+tracing.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+bento-auth.workspace = true
+bento-dashboard.workspace = true
 http-body-util.workspace = true
 tower.workspace = true

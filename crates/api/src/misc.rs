@@ -194,18 +194,14 @@ pub(crate) struct ImageJson {
     pub(crate) instances_on_older_versions: i64,
 }
 
-pub(crate) async fn list_images(
-    State(state): State<AppState>,
-    Extension(_user): Extension<User>,
-) -> Response {
-    let images = match state.0.store.images().await {
-        Ok(images) => images,
-        Err(error) => return mapped_error(error),
-    };
-    let instances = match state.0.store.instances().await {
-        Ok(instances) => instances,
-        Err(error) => return mapped_error(error),
-    };
+/// Every allowlisted image with how many instances still hold an older
+/// version (SPEC 5.1, the `images` command). Shared by the JSON route and
+/// the configuration page.
+pub(crate) async fn images_with_counts(
+    state: &AppState,
+) -> Result<Vec<ImageJson>, crate::BoxError> {
+    let images = state.0.store.images().await?;
+    let instances = state.0.store.instances().await?;
     let current: std::collections::HashMap<&str, &str> = images
         .iter()
         .map(|image| {
@@ -224,7 +220,7 @@ pub(crate) async fn list_images(
             *older.entry(instance.image_name).or_default() += 1;
         }
     }
-    let response: Vec<ImageJson> = images
+    Ok(images
         .into_iter()
         .map(|image| ImageJson {
             instances_on_older_versions: older.get(&image.name).copied().unwrap_or_default(),
@@ -235,8 +231,17 @@ pub(crate) async fn list_images(
             pinned_checksum: image.pinned_checksum.unwrap_or_default(),
             current_checksum: image.current_checksum.unwrap_or_default(),
         })
-        .collect();
-    json_response(StatusCode::OK, &response)
+        .collect())
+}
+
+pub(crate) async fn list_images(
+    State(state): State<AppState>,
+    Extension(_user): Extension<User>,
+) -> Response {
+    match images_with_counts(&state).await {
+        Ok(response) => json_response(StatusCode::OK, &response),
+        Err(error) => mapped_error(error),
+    }
 }
 
 #[derive(Debug, Deserialize)]

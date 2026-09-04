@@ -16,7 +16,6 @@
 use http::header::HeaderValue;
 use http::{HeaderMap, StatusCode};
 
-use crate::page::{escape, page};
 use crate::session::host_cookie;
 use crate::{Service, append_cookie, cookie_value, html_response, redirect_response};
 
@@ -69,21 +68,12 @@ impl Service {
         response
     }
 
-    /// The page a visitor with no session anywhere gets.
+    /// The page a visitor with no session anywhere gets: the wordmark on
+    /// the accent, and one button. It carries its own styling, since it
+    /// is served without a session; the wordmark and fonts come from the
+    /// dashboard's ungated assets.
     pub(crate) fn splash_page(&self) -> String {
-        let domain = escape(&self.base_domain);
-        page(
-            "Sign in",
-            &format!(
-                r#"<h1><span aria-hidden="true">&#127857;</span> bento</h1>
-<p>Small virtual machines on one host, with a web dashboard and an
-<code>ssh</code> command line.</p>
-<p class="actions"><a class="button" href="/login">Sign in</a></p>
-<p class="muted">Signing in creates your account the first time. To use the
-command line afterwards, run <code>ssh {domain}</code> and open the link it
-prints to attach your SSH key.</p>"#
-            ),
-        )
+        crate::page::sign_in_page(self.provider_name.as_deref(), &self.base_domain)
     }
 
     /// The splash, plus the cookie that stops the probe repeating. The
@@ -141,6 +131,7 @@ pub fn is_dashboard_asset(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::page::splash;
     use crate::test_support::{
         FakeClock, TEST_EPOCH, new_oidc_service, new_oidc_service_with_signups, new_test_service,
     };
@@ -231,11 +222,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_splash_names_the_deployment_and_escapes_it() {
+    async fn the_splash_shows_the_wordmark_and_names_the_provider() {
         let test = new_oidc_service_with_signups();
         let body = test.service.splash_page();
-        assert!(body.contains("ssh bento.example.org"), "{body}");
-        assert!(body.contains(r#"href="/login""#));
+        assert!(body.contains("wordmark.png"), "{body}");
+        assert!(body.contains(r#"href="/login">Sign in</a>"#));
+        assert!(
+            splash("Sign in with id.example", "b.example").contains(">Sign in with id.example</a>")
+        );
     }
 
     /// Signing out of Bento leaves the provider's session alone, so a

@@ -1,0 +1,39 @@
+<header>
+  <a class="wordmark" href="/" aria-label="Bento home"><span class="wordmark-img" role="img" aria-label="~/bento!"></span></a>
+</header>
+<section>
+  <a class="btn new-vm" href="/new"{% if path == "/new" %} aria-current="page"{% endif %}>New VM <span aria-hidden="true">+</span></a>
+  <div class="vm-list">
+    <div role="group" aria-label="Virtual machines" class="button-group vm-group">
+      <a class="btn" data-variant="outline" href="/"{% if path == "/" %} aria-current="page"{% endif %}>Virtual Machines</a>
+      <button type="button" class="btn" data-variant="outline" data-size="icon" aria-label="Show or hide the VM list" aria-expanded="true" aria-controls="vm-tree" data-vm-tree-toggle>
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
+      </button>
+    </div>
+    <div id="vm-tree">
+      <ul id="vm-list" hx-get="/fragments/sidebar" hx-select="#vm-list" hx-target="this" hx-swap="outerHTML" hx-trigger="every 15s" hx-boost="false">
+        {% for vm in vms %}
+        <li><a href="/vm/{{ vm.uuid }}"{% if path|startswith("/vm/" ~ vm.uuid) %} aria-current="page"{% endif %}><i class="dot state-{{ vm.state }}" aria-hidden="true"></i>{{ vm.name }}{% if vm.shared %}<span class="shared">shared</span>{% endif %}</a></li>
+        {% else %}
+        <li class="none">No VMs yet.</li>
+        {% endfor %}
+      </ul>
+    </div>
+  </div>
+</section>
+<footer>
+  <div class="dropdown-menu account-menu" id="account-menu"{% if path|startswith("/settings") %} data-current{% endif %}>
+    <button type="button" class="btn" data-variant="outline" id="account-menu-trigger" aria-haspopup="menu" aria-controls="account-menu-menu" aria-expanded="false" aria-label="Account menu for {{ user.name }}">
+      <span class="avatar" aria-hidden="true">{{ user.name[:1]|upper }}</span>
+      <span class="who"><span class="mono">{{ user.name }}</span><span class="email">{{ user.email }}</span></span>
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m7 15 5 5 5-5"/><path d="m7 9 5-5 5 5"/></svg>
+    </button>
+    <div id="account-menu-popover" data-popover data-side="top" aria-hidden="true">
+      <div role="menu" id="account-menu-menu" aria-labelledby="account-menu-trigger">
+        <a role="menuitem" href="/settings"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>Settings</a>
+        <hr role="separator">
+        <form method="post" action="/logout" hx-boost="false"><button type="submit" role="menuitem"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>Sign out</button></form>
+      </div>
+    </div>
+  </div>
+</footer>

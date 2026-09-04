@@ -117,3 +117,29 @@ satisfies the check that the host claims a KVM device.
 That stub is also the boundary of what CI can do. A tier that boots real
 guests can never run on the hosted arm64 runners, and would need a
 self-hosted runner or a machine with working KVM.
+
+## Dashboard in a browser
+
+The pages are covered by in-process tests in `crates/api/src/pages/tests.rs`
+over the same fakes as the API. For a look at the real thing, and for the
+JavaScript-only parts (charts, dialogs, the account menu, HTMX polling),
+serve the pages over those fakes and drive them with Playwright:
+
+```
+BENTO_DEV_PORT=18080 cargo test -p bento-api dev_server -- --nocapture   # leave running
+# To restart after a change, stop only the listener; a bare `lsof -ti tcp:18080`
+# also matches browsers connected to it:
+#   lsof -ti tcp:18080 -sTCP:LISTEN | xargs kill
+cd /tmp && npm init -y && npm install playwright                            # once
+node /path/to/bento/crates/dashboard/dev/check.js                          # from that directory
+```
+
+`check.js` writes `shots/*.png` (every page, Latte and Mocha, desktop and
+phone) and `shots/report.txt`, which lists console errors, failed
+requests, horizontal overflow, and the result of each scripted
+interaction: the account menu, boosted navigation, the state-badge poll,
+the steppers, creating a machine, the rename confirmation, the typed
+delete, the theme picker, keyboard access, and the phone sidebar.
+
+The dev server also honors `BENTO_PAGE_DUMP=<dir>` on the `dump_pages_for_preview`
+test, which writes each rendered page to a file without serving anything.

@@ -68,6 +68,8 @@ impl StatusError {
 pub trait Store: Send + Sync + 'static {
     async fn user_by_id(&self, id: i64) -> Result<User, BoxError>;
     async fn user_by_name(&self, name: &str) -> Result<User, BoxError>;
+    /// Every account, sorted by name.
+    async fn users(&self) -> Result<Vec<User>, BoxError>;
     async fn quota_for(&self, user_id: i64) -> Result<Quota, BoxError>;
     async fn usage_for(&self, user_id: i64) -> Result<Usage, BoxError>;
 
@@ -157,3 +159,70 @@ pub trait Authenticator: Send + Sync + 'static {
 
 /// The operator-only route predicate supplied by the binary.
 pub type OperatorPredicate = Arc<dyn Fn(&User) -> bool + Send + Sync>;
+
+/// One sample of a time series: Unix seconds and the value at that time.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct Point {
+    pub at: i64,
+    pub value: f64,
+}
+
+/// Host-wide resource figures for the dashboard's front page.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct HostMetrics {
+    /// CPU busy time as a percentage of all cores, oldest first.
+    pub cpu_pct: Vec<Point>,
+    /// Memory in use on the host, oldest first.
+    pub memory_used_mib: Vec<Point>,
+    pub memory_total_mib: i64,
+    /// Real bytes on the storage volume, not virtual disk size.
+    pub storage_used_gib: f64,
+    pub storage_total_gib: i64,
+    /// Logical CPUs on the host, the ceiling for provisioned vCPUs.
+    pub cpu_count: i64,
+    /// `true` while the figures are generated rather than measured.
+    pub placeholder: bool,
+}
+
+/// Resource figures for one instance.
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct InstanceMetrics {
+    /// Guest CPU time as a percentage of the instance's vCPUs, oldest first.
+    pub cpu_pct: Vec<Point>,
+    /// Guest memory in use, oldest first.
+    pub memory_used_mib: Vec<Point>,
+    /// Real size of the overlay disk, not its virtual size.
+    pub storage_used_gib: f64,
+    pub placeholder: bool,
+}
+
+/// Aggregate figures for one user's instances, for the operator page.
+#[derive(Debug, Clone, Copy, Default, serde::Serialize)]
+pub struct UserMetrics {
+    pub cpu_pct: f64,
+    pub memory_used_mib: i64,
+    pub storage_used_gib: f64,
+    pub placeholder: bool,
+}
+
+/// Resource measurements behind the dashboard charts. The binary wires a
+/// sampler; until one exists, [`crate::PlaceholderMetrics`] generates
+/// plausible figures so the pages can be built and reviewed.
+#[async_trait]
+pub trait Metrics: Send + Sync + 'static {
+    async fn host(&self, window: std::time::Duration) -> Result<HostMetrics, BoxError>;
+    async fn instance(
+        &self,
+        uuid: &str,
+        window: std::time::Duration,
+    ) -> Result<InstanceMetrics, BoxError>;
+    async fn user(&self, user_id: i64) -> Result<UserMetrics, BoxError>;
+}
+
+/// The operator's defaults for a new instance, shown in the form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CreateDefaults {
+    pub vcpu: u32,
+    pub memory_mib: i64,
+    pub disk_gib: i64,
+}
