@@ -15,6 +15,7 @@ mod dump;
 mod hosts;
 mod images;
 mod instances;
+mod migrate;
 mod names;
 mod pairings;
 mod shares;
@@ -118,10 +119,12 @@ impl Store {
         F: Fn() -> OffsetDateTime + Send + Sync + 'static,
     {
         let path = path.as_ref().to_path_buf();
-        let conn = tokio::task::spawn_blocking(move || open_connection(&path)).await??;
+        let now: Clock = Arc::new(now);
+        let clock = Arc::clone(&now);
+        let conn = tokio::task::spawn_blocking(move || open_connection(&path, clock)).await??;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
-            now: Arc::new(now),
+            now,
         })
     }
 
@@ -176,51 +179,17 @@ impl Store {
     }
 }
 
-fn open_connection(path: &Path) -> Result<Connection> {
-    let conn = Connection::open(path)?;
+fn open_connection(path: &Path, now: Clock) -> Result<Connection> {
+    let mut conn = Connection::open(path)?;
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", true)?;
     conn.busy_timeout(Duration::from_millis(5000))?;
+    // The baseline creates a new database and leaves an existing one
+    // alone; the numbered migrations carry it the rest of the way
+    // (MULTI-NODE 16).
     conn.execute_batch(SCHEMA_SQL)?;
-    migrate_image_sources(&conn)?;
+    migrate::apply(&mut conn, now)?;
     Ok(conn)
-}
-
-/// Adds the version 1.1 image-source columns to databases created by 0.9.
-/// SQLite has no portable `ADD COLUMN IF NOT EXISTS`, so inspect first.
-fn migrate_image_sources(conn: &Connection) -> Result<()> {
-    fn has_column(conn: &Connection, table: &str, column: &str) -> rusqlite::Result<bool> {
-        let mut statement = conn.prepare(&format!("PRAGMA table_info({table})"))?;
-        let names = statement.query_map([], |row| row.get::<_, String>(1))?;
-        for name in names {
-            if name? == column {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-    if !has_column(conn, "images", "kind")? {
-        conn.execute_batch(
-            "ALTER TABLE images ADD COLUMN kind TEXT NOT NULL DEFAULT 'qcow2' \
-             CHECK (kind IN ('qcow2', 'oci'));",
-        )?;
-    }
-    if !has_column(conn, "image_versions", "source_digest")? {
-        conn.execute_batch("ALTER TABLE image_versions ADD COLUMN source_digest TEXT;")?;
-    }
-    if !has_column(conn, "image_versions", "kind")? {
-        conn.execute_batch(
-            "ALTER TABLE image_versions ADD COLUMN kind TEXT NOT NULL DEFAULT 'qcow2' \
-             CHECK (kind IN ('qcow2', 'oci')); \
-             UPDATE image_versions SET kind = 'oci' WHERE source_digest IS NOT NULL;",
-        )?;
-    }
-    conn.execute_batch(
-        "INSERT OR IGNORE INTO image_source_versions (image_name, source_digest, checksum) \
-         SELECT image_name, source_digest, checksum FROM image_versions \
-         WHERE source_digest IS NOT NULL;",
-    )?;
-    Ok(())
 }
 
 fn format_time(value: OffsetDateTime) -> rusqlite::Result<String> {
