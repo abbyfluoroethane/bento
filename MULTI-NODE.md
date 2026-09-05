@@ -78,24 +78,28 @@ The multi-node MVP does not provide:
 - a distributed block store or shared filesystem;
 - more than eight simultaneously owned network slots;
 - transparent Ethernet broadcast or multicast across runners;
-- automatic creation or administration of a LAN, WireGuard, or Tailscale
-  network;
+- automatic creation or general administration of a LAN, WireGuard, or
+  Tailscale network beyond the required route and ownership-ACL mutations;
 - an underlay whose routes Bento cannot program on each participant;
 - a resumable, controller-driven cross-runner transfer job;
+- a consistent distributed backup with runner quiescence and coordinated
+  storage snapshots;
 - a frontend that runs on a machine other than the controller;
 - placement across unlike CPU architectures;
-- placement of a nested-virtualization instance on a runner with an
+- placement of an instance that uses `host-passthrough` on a runner with an
   incompatible CPU.
 
 The control plane remains a deliberate single point of coordination. Existing
 guests continue running when it is down, but lifecycle operations, the public
 frontends, and state convergence are unavailable.
 
-Three of these non-goals have a known later shape. High availability builds on
+Four of these non-goals have a known later shape. High availability builds on
 the section 11 fencing rules. A resumable transfer job replaces the
-operator-directed move in section 13.3. A separable frontend needs its own
-certificate role and its own path to the database. None of them changes an
-MVP invariant, so none of them requires a redesign to add.
+operator-directed move in section 13.3. A consistent distributed backup uses
+a deployment quiesce protocol, runner manifests, and a snapshot backend. A
+separable frontend needs its own certificate role and its own path to the
+database. None of them changes an MVP invariant, so none of them requires a
+redesign to add.
 
 ## 4. Terms
 
@@ -291,27 +295,36 @@ user bridge handles the locally owned slot and only remote slots need underlay
 routes.
 
 Each user network has a durable desired generation. A change to its bridge,
-slot routes, proxy ARP, firewall policy, or participant set increments this
-generation. The controller stores the exact participant set for that
-generation, and it divides that set into blocking and converging participants.
+slot routes, proxy ARP, firewall policy, underlay ownership ACL, or participant
+set increments this generation. The controller stores the exact participant
+set for that generation. The snapshot assigns each participant one of two
+roles: blocking or converging.
 
-The blocking participants are the destination runner and the controller
-machine, which carries the frontends. Placement waits for both to store an
-acknowledgement. A blocking participant acknowledges only after it has applied
-and verified the complete generation. Without the destination runner the
-instance has no working bridge or policy. Without the controller machine the
-instance has no route from the public frontends, which is the failure a user
-sees immediately.
+A blocking participant must apply and verify the complete generation before
+the operation can cross its network barrier. For placement or a slot move, the
+blocking participants are the destination runner, the runner-role agent on the
+controller machine, and each underlay ownership-ACL participant changed by the
+generation. Without the destination runner, the instance has no working
+bridge or policy. Without the controller-machine runner, the public frontends
+have no route. Without the ownership ACL, the underlay can drop traffic from
+the new owner after every Bento machine acknowledges. This failure produces
+the same black-hole signature as a stale runner route.
 
-The converging participants are the other healthy runners that already host an
-instance for the user. They apply the same generation asynchronously and
-record their acknowledgement when they finish. Placement does not wait for
-them. A missing converging acknowledgement means that one guest cannot reach
-another guest of the same user across runners until convergence completes. It
-never permits cross-user reach, because every runner's policy denies a
-destination outside the ingress bridge's own user prefix. Section 21
-reconciles a converging participant that falls behind, and section 20 reports
-one that stays behind.
+A converging participant applies the generation asynchronously. The
+converging participants are the other enabled runners that already host an
+instance for the user. Placement does not wait for them. A missing converging
+acknowledgement means that one guest cannot reach another guest of the same
+user across runners until convergence completes. It never permits cross-user
+reach, because every runner's policy denies a destination outside the ingress
+bridge's own user prefix.
+
+A durable network-convergence worker applies generations to both participant
+roles. It is separate from the operator-facing reconcile command in section
+21. It records the applied generation for each participant. Each apply is
+idempotent. The worker retries a failed apply with backoff. After the
+configured maximum number of attempts, it stops automatic retries for that
+participant and raises an operator alarm. An operator action can clear the
+alarm and restart the attempts after the cause is corrected.
 
 A later health failure does not invalidate a completed placement. It does
 prevent new placement that depends on a new unacknowledged generation from a
@@ -371,7 +384,7 @@ Bento requires the same properties from either underlay:
 1. Stable runner endpoint addresses.
 2. Bidirectional unicast reachability between controller and runners.
 3. Bidirectional unicast reachability among runners.
-4. The ability to install or externally configure routes for runner slots.
+4. The ability for Bento to install routes for runner slots.
 5. Preservation of guest source addresses between runners.
 6. An MTU and path-MTU behavior that carries guest traffic reliably.
 7. A way to restrict controller-to-runner management traffic.
@@ -394,18 +407,21 @@ slots it owns. It never advertises a whole user `/24` when other runners own
 parts of that `/24`.
 
 The routed VPN must preserve original guest source addresses. Tailscale subnet
-routers use SNAT by default, so a Tailscale deployment of this design must use
-Linux subnet routers with subnet-route SNAT disabled and must provide the
-corresponding return routes. Product defaults are not assumed to satisfy the
-underlay requirements.
+routers use SNAT by default. A supported Tailscale MVP profile uses Linux
+subnet routers with subnet-route SNAT disabled. It preconfigures `autoApprovers`
+for every Bento slot route and enables route acceptance on every Linux peer.
+Advertised routes otherwise require approval, and Linux peers do not accept
+them by default. Disabling SNAT alone is insufficient.
 
 The data plane between runners does not authenticate IP packets. A supported
 LAN underlay is an administratively isolated segment. Its switches, routers,
 and host filters enforce anti-spoofing for runner endpoint addresses and the
 guest prefixes routed through each runner. An unisolated or shared network
 must use an authenticated tunnel whose peer identities and route ACLs enforce
-the same source ownership. This protection is required configuration, not an
-assumption that a LAN is trusted.
+the same source ownership. Bento updates the supported LAN, WireGuard, or
+Tailscale ownership ACL when slot ownership changes. This mutation is part of
+the user network generation. This protection is required configuration, not
+an assumption that a LAN is trusted.
 
 The data model records runner endpoints and slot ownership, not product-specific
 VPN identifiers.
@@ -493,13 +509,18 @@ The controller owns:
 - placement and capacity reservations;
 - desired instance state and per-object generations;
 - the controller lease and epoch;
-- user network generations, participant sets, and acknowledgements;
+- user network generations, participant sets, roles, and acknowledgements;
 - the operator image allowlist;
 - global content-addressed image-version metadata;
 - orchestration and unwind decisions;
 - public HTTP and SSH routing data;
 - runner health and observed-state freshness;
+- the durable network-convergence worker and its alarms;
 - reconciliation reports across all runners.
+
+The controller does not mutate its machine's routes, proxy ARP, or
+frontend-source policy directly. It sends the desired generation to the
+required runner-role agent on that machine.
 
 ### 10.2 Runner
 
@@ -507,12 +528,13 @@ The runner owns host-local execution:
 
 - the local Unix libvirt connection;
 - KVM, architecture, nested-virtualization, KSM, and host requirement checks;
+- libvirt CPU contract extraction and compatibility comparison;
 - per-runner image paths, readiness, verification times, and errors;
 - `qemu-img` overlay creation and resize;
 - cloud-init seed creation and deletion;
 - domain definition and lifecycle actions;
 - per-user libvirt networks;
-- proxy-ARP and route convergence;
+- proxy-ARP, route, and underlay ownership-ACL convergence;
 - the local nftables table;
 - domain inventory and observed state;
 - local storage usage and capacity observations.
@@ -521,11 +543,18 @@ The runner does not open SQLite and does not make placement or authorization
 decisions. It performs only authenticated controller requests and local
 reconciliation for objects assigned to its host ID.
 
+The controller machine always runs a runner-role agent. This requirement also
+applies when the machine owns zero slots and hosts no guests. The agent
+converges routes, proxy ARP, and frontend-source policy through the same runner
+protocol. It acknowledges the same user network generation. The section 8.2
+barrier needs an acknowledgement from the controller machine, and a runner is
+the component that produces it.
+
 User registration commits the user and `/24` centrally. Ensuring the new user
 network on runners is convergent work and does not make OIDC signup depend on
 every runner being reachable. The current network generation records each
-required participant. Placement starts only after the complete acknowledgement
-set in section 8.2 is durable.
+required participant and its role. Placement uses the blocking-participant
+barrier defined in section 8.2.
 
 ### 10.3 Why use a runner service
 
@@ -538,6 +567,9 @@ handling.
 A `bentod runner` subcommand reuses Bento's existing local implementations and
 puts one authenticated, idempotent boundary around privileged host work. It
 also avoids exposing libvirt's remote service on the underlay.
+
+A separate privileged route adapter inside `bentod serve` is rejected. It
+would duplicate the runner convergence path and the runner reconcile path.
 
 The existing `bento_lifecycle::Runner` trait is the local command executor. It
 is renamed to `CommandRunner`. The word "runner" is reserved for the new
@@ -636,7 +668,8 @@ At minimum the protocol supports:
 - health and capabilities;
 - local domain and image inventory;
 - ensure/remove image version;
-- ensure user network, routes, and firewall policy;
+- ensure user network, routes, underlay ownership ACL, and firewall policy;
+- compare a CPU definition for a specified emulator and machine;
 - provision, start, stop, reboot, redefine, and remove instance;
 - resize overlay;
 - finish first boot;
@@ -654,14 +687,15 @@ A runner is eligible when:
 
 1. it is enabled and healthy;
 2. it owns at least one active slot;
-3. it supports the requested architecture and nested-virtualization setting,
-   and holds a current libvirt CPU verdict when the instance is nested;
+3. it supports the persisted instance and image-version architecture and the
+   requested nested-virtualization setting, and holds a current libvirt CPU
+   verdict when the domain XML uses `host-passthrough`;
 4. it has the selected image version ready locally;
 5. configured or observed capacity can accept the requested vCPU, memory, and
    virtual disk reservation; and
 6. one of its slots has a free address in the user's `/24`; and
-7. the complete participant set has acknowledged the user's current network
-   generation.
+7. the blocking-participant barrier in section 8.2 is satisfied for the
+   user's current network generation.
 
 The initial placement policy chooses the eligible runner with the lowest
 reserved-memory ratio, then lowest reserved-vCPU ratio, then stable host ID.
@@ -670,31 +704,58 @@ placement selection may occur before the write transaction only as a plan.
 The transaction that inserts the provisioning row revalidates global quota,
 runner capacity, address availability, active slot ownership, the slot state,
 the `(slot_id, host_id)` owner relation, image readiness, CPU compatibility,
-and the network acknowledgement set. It stores `slot_id` on the instance.
-Failure of any check retries placement from a new snapshot.
+and the section 8.2 blocking-participant barrier. It stores `slot_id` on the
+instance. Failure of any check retries placement from a new snapshot.
 
 Configured memory capacity is multiplied by the runner's overcommit ratio.
 Disk placement uses a configured allocatable limit or a conservative observed
 free-space threshold. Virtual disk quota remains based on virtual size as in
 version 1.
 
-Bento does not model CPU features itself. A nested instance uses
-`host-passthrough`, so its CPU contract is the source host's actual CPU
-definition. Bento stores that definition with the instance at creation. To
-test a destination, the controller sends the stored definition to the
-destination runner. That runner asks its local libvirt to compare the
-definition against its own capabilities, and returns the verdict. Bento stores
-the verdict, not a derived class. libvirt owns the CPU-features model, stays
-correct as hardware and microcode change, and is the same code that would
-refuse the domain at start time.
+Bento persists architecture on the instance row and the image-version row.
+At creation, it copies the image-version architecture to the instance row.
+The values must agree. A destination runner uses the persisted architecture
+when it renders domain XML. It must not substitute its own architecture.
 
-A destination is eligible for a nested instance only when its stored verdict
-for that instance says the destination CPU is identical or a superset. A
-missing or stale verdict is not eligibility; the controller requests a fresh
-comparison. Before a slot transfer starts, Bento collects a verdict for every
-nested instance in the slot and reserves memory, disk, address, and image
-capacity for every instance in it. One refusal rejects the complete transfer
-plan.
+Bento does not model CPU features itself. The CPU admission gate applies to
+every instance whose domain XML uses `host-passthrough`. This includes every
+AArch64 guest that uses the current XML renderer, whether nesting is enabled
+or not. `host-passthrough` is a mode, not a concrete CPU definition. The source
+runner extracts a concrete `cpu` element from libvirt capabilities and Bento
+stores its digest and definition as the instance CPU contract.
+
+Bento captures this contract at instance creation, when a resize enables
+nesting, and before any start under a changed source capability generation.
+Starting the destination XML asks for the destination's own host CPU. libvirt
+does not compare it with a stored source definition. Bento therefore performs
+a separate admission comparison before start.
+
+The destination runner calls `virConnectCompareHypervisorCPU`. The call uses
+the destination emulator, architecture, machine type, virtualization type,
+and stored CPU definition. It returns `IDENTICAL`, `SUPERSET`, or
+`INCOMPATIBLE`. `virConnectCompareCPU` is a weaker fallback. It does not model
+one specific QEMU and machine combination. The fallback is allowed only when
+the deployment explicitly accepts this weaker gate. The file
+`crates/hypervisor/src/rpc.rs` has no comparison procedure today. The narrow
+libvirt seam must be extended.
+
+Bento caches the verdict on the tuple `(CPU definition digest, destination
+host, destination capability generation, emulator, architecture, machine
+type, virtualization type)`. The runner derives a capability fingerprint from
+its concrete host CPU capabilities, microcode, firmware, kernel, KVM, QEMU,
+and libvirt observations. The controller increments the durable destination
+capability generation when this fingerprint changes. It also increments the
+generation after a destination reboot or runner reconnect, even when the
+fingerprint is unchanged.
+
+A microcode, firmware, kernel, KVM, QEMU, or libvirt change invalidates the
+verdict. A source CPU definition change, a nested-mode transition, a
+destination reboot, or a destination reconnect also invalidates it. A missing
+or stale verdict is not eligibility. A destination is eligible only when the
+current verdict is `IDENTICAL` or `SUPERSET`. Before a slot transfer starts,
+Bento collects a current verdict for every instance in the slot whose XML uses
+`host-passthrough`. It reserves memory, disk, address, and image capacity for
+every instance. One refusal rejects the complete transfer plan.
 
 An operator can disable placement on a runner without stopping its instances.
 Draining is an explicit stronger state that also prepares its slots for
@@ -768,21 +829,12 @@ transfer with progress in the database. Nothing in the MVP phases prevents it.
 
 ### 13.4 Backup
 
-A consistent deployment backup uses a quiesce protocol. The controller takes
-a deployment backup lock that blocks placement and every mutating lifecycle,
-image, network, and maintenance operation. Each enabled runner finishes its
-current durable step, flushes local files, enters read-only quiescence, and
-returns a storage snapshot generation and manifest. The operator backup
-backend snapshots each runner directory and returns the snapshot reference.
-The controller records every runner generation, manifest digest, and snapshot
-reference in the SQLite backup checkpoint. It then creates the SQLite backup
-while the lock remains held. Only this complete set is one recovery point.
-
-If any required runner or snapshot backend cannot acknowledge, Bento does not
-label the result consistent. An explicit best-effort backup may still copy the
-SQLite database and runner directories. It is crash-consistent and may combine
-different times. Its report marks every missing or unmatched runner generation
-and lists the content-addressed image versions required by the overlays.
+The MVP backup is explicit and best effort. It copies the SQLite database and
+runner directories without a distributed quiesce protocol. The result is
+crash-consistent and may combine different times. Its report marks each
+missing runner and lists the content-addressed image versions required by the
+overlays. Bento does not label the result a consistent deployment recovery
+point. Section 3 describes the later consistent-backup shape.
 
 ## 14. Lifecycle orchestration
 
@@ -795,8 +847,8 @@ Create is a controller-owned saga:
 3. In the placement transaction described in section 12, claim the name and
    address and insert a provisioning row with `host_id`, `slot_id`, and desired
    generation.
-4. Ensure the exact image version and wait for the complete user network
-   acknowledgement set.
+4. Ensure the exact image version and satisfy the blocking-participant barrier
+   in section 8.2 for the user network generation.
 5. Ask the runner to create the overlay and seed, define the domain, clear
    autostart, and start it.
 6. Record the observed running state.
@@ -843,8 +895,8 @@ and restores desired-running instances in runner-local batches.
 
 The controller performs this handshake after either side restarts. Before a
 restarted runner is healthy, it also converges current user network, route,
-firewall, certificate, and image state. An unreachable runner does not block
-restore on healthy runners.
+proxy-ARP, underlay ownership-ACL, firewall, certificate, and image state. An
+unreachable runner does not block restore on healthy runners.
 
 ## 15. State, health, and partial failure
 
@@ -861,6 +913,19 @@ When a runner becomes unreachable:
 - no slot is reassigned automatically;
 - no domain or database row is deleted automatically.
 
+A runner also has a `degraded-network` state. It enters this state when an
+applicable user network generation does not converge within the configured
+bound or when its network-convergence worker raises an alarm. Host health means
+that the runner is reachable and converged within this bound. A
+`degraded-network` runner is not healthy or placement-eligible, even when its
+health RPC succeeds. Existing instance state remains visible, with the network
+degradation attached.
+
+This state prevents a stale peer from reading as healthy. A stale peer can
+keep an old more-specific route. Its proxy ARP can continue to answer because
+that route exists. Traffic then goes to a fenced empty runner and is
+black-holed while the instance still reads running.
+
 The public frontends use the same reachability state. HTTP returns a generic
 503 response when the target runner is unreachable. The response does not name
 the runner or reveal placement. SSH fails promptly with a generic temporary
@@ -869,10 +934,10 @@ timeout. HTTP and the SSH data connection continue to dial the guest address
 through the routing plane. They do not tunnel through a runner RPC. Only SSH
 auto-start uses the runner lifecycle protocol.
 
-The host record tracks at least enabled state, placement state, endpoint,
-protocol version, architecture, last successful contact, and last error.
-Ephemeral health may live in control-plane memory, but enough durable identity
-and configuration must survive restart.
+The host record tracks at least enabled state, placement state, network health
+state, endpoint, protocol version, architecture, last successful contact, and
+last error. Ephemeral health may live in control-plane memory, but enough
+durable identity and configuration must survive restart.
 
 State polling and reconciliation are host-scoped. A domain seen on runner A is
 compared only with rows whose `host_id` is A. Reports identify the runner for
@@ -891,13 +956,17 @@ The exact migration may evolve during implementation, but the model needs:
 - a persisted deployment runner prefix (`24` through `27`);
 - the controller epoch, lease holder, and lease expiry;
 - host endpoint, enablement, placement state, certificate identity, and
-  capability observations;
-- the stored CPU definition of each nested instance, and the per-host libvirt
-  comparison verdict for it, with the capability generation it was taken from;
+  capability fingerprint, durable capability generation, and observations;
+- persisted architecture on each instance row and image-version row;
+- the stored CPU definition and digest of each instance whose XML uses
+  `host-passthrough`, and each cached per-host libvirt comparison verdict with
+  all fields in the section 12 cache tuple;
 - runner-slot rows with stable slot numbers, `active`, `draining`, or `moving`
   state, active owner, ownership epoch, source, destination, and operation ID;
-- user network desired generations, participant snapshots, desired-state
-  digests, and participant acknowledgements;
+- user network desired generations, participant snapshots with each
+  participant's blocking or converging role, desired-state digests, underlay
+  ownership-ACL state, participant applied generations, acknowledgements,
+  attempt counts, next-attempt times, and alarms;
 - global image-version source and checksum metadata without local paths;
 - per-runner image-version path, readiness, verified time, and error;
 - per-instance `slot_id`, desired generation and digest, provisioning and
@@ -906,8 +975,8 @@ The exact migration may evolve during implementation, but the model needs:
 - per-runner resource reservations or queries that calculate them by
   `host_id`;
 - prefix-change and slot-move phase, source, destination, participant list,
-  transfer digest, route acknowledgements, and last error; and
-- backup checkpoints and their runner snapshot generations.
+  each instance's pre-maintenance desired power state, transfer digest, route
+  and ownership-ACL acknowledgements, and last error.
 
 `instances.host_id` remains the placement key and `instances.slot_id` records
 the bounded allocator that supplied the address. A schema constraint permits
@@ -941,17 +1010,23 @@ generation, snapshots every participant and affected instance, and changes
 each affected slot from `active` to `draining`. The same transaction reserves
 destination capacity for every affected instance. While the lock is held,
 Bento rejects allocation, create, start, restart, resize, rename, remove,
-first-boot cleanup, automatic convergence mutations, and a second maintenance
-operation for an affected slot. Stop is allowed only as a recorded phase of
-the maintenance plan.
+first-boot cleanup, automatic convergence mutations outside the maintenance
+operation, and a second maintenance operation for an affected slot. Stop is
+allowed only as a recorded phase of the maintenance plan.
+
+A deployment-wide prefix change uses a full participant barrier. It is a
+different barrier from the placement barrier in section 8.2. Every participant
+must switch allocator prefix together. A prefix change cannot expose two
+allocator prefixes, so blocking and converging roles do not relax this full
+barrier.
 
 A slot has one of three durable states. `active` permits normal placement and
 lifecycle work. `draining` keeps the source owner authoritative but permits no
 new allocation. `moving` permits only the persisted source, destination, and
 operation generation to act. The operation row persists its phase, source,
-destination, old and new ownership epochs, participant list, reservations,
-per-instance transfer digest, route generation and acknowledgements, retry
-count, and last error.
+destination, old and new ownership epochs, participant snapshot and roles,
+reservations, per-instance transfer digest, route and ownership-ACL generation
+and acknowledgements, retry count, and last error.
 
 ### 17.1 Increasing the number of slots
 
@@ -970,38 +1045,42 @@ old slot 1 -> new slots 2 and 3, both initially on old owner 1
 While the prefix-change lock remains held, Bento renders the finer routes and
 increments each affected user network generation. It commits the new
 deployment prefix as active and releases the lock only after the complete
-participant sets acknowledge those generations. Failure leaves the durable
-operation pending and ordinary work blocked. It does not expose a mixture of
-allocator prefixes.
+participant sets satisfy the full prefix-change barrier. Failure leaves the
+durable operation pending and ordinary work blocked. It does not expose a
+mixture of allocator prefixes.
 
 Adding capacity then requires freeing and reassigning a child slot. If the
 child contains instances, the move acquires the same deployment-wide lock and
 Bento runs these durable phases:
 
 1. Change the child to `draining`, block conflicting work, and verify all
-   destination reservations and libvirt CPU verdicts.
+   destination reservations and required libvirt CPU verdicts. Record each
+   instance's pre-maintenance desired power state.
 2. Stop every instance on the source and record its stopped generation.
 3. Change the child to `moving`. Transfer and verify every disk and required
    image. Store each digest before continuing.
 4. Undefine every source domain. The source durably fences the old slot
-   ownership epoch and rejects every later request that names it. If the source
+   ownership epoch. The fence rejects domain define, domain start, and stale
+   lifecycle work that names the old epoch. It permits only operation-scoped
+   source cleanup named by this durable moving-slot operation. If the source
    cannot acknowledge, require an external power, network, and storage fence.
    Certificate revocation is not sufficient.
 5. In one transaction, assign a higher ownership epoch to the destination,
    change affected `host_id` values, and create a new user network generation
-   with its exact participant set.
-6. Apply and acknowledge the destination bridge, proxy ARP, firewall policy,
-   and controller-machine routes for that generation. Peer routes converge as
-   in section 8.2 and do not block the phase.
-7. Define and restore instances on the destination according to their desired
-   power state.
+   with its exact participant set and new underlay ownership ACL.
+6. Apply the destination bridge, proxy ARP, firewall policy, routes, and
+   underlay ownership ACL through the durable network-convergence worker.
+   Satisfy the blocking-participant barrier defined in section 8.2.
+7. Define each instance on the destination and restore its recorded
+   pre-maintenance desired power state.
 8. Change the slot to `active`, release the maintenance reservations, and
-   remove source storage only after explicit verification or operator choice.
+   remove source storage through the operation-scoped cleanup permission only
+   after explicit verification or operator choice.
 
 The destination runner may stage transferred storage before phase 4. It must
 not define or start a domain until the old ownership epoch is durably fenced,
 the source runner is fenced, the new ownership transaction is committed, and
-every network participant acknowledges the new generation. This order also
+the blocking-participant barrier in section 8.2 is satisfied. This order also
 rejects a late start from the old controller epoch.
 
 The maintenance plan names every affected instance and estimates bytes to
@@ -1021,17 +1100,20 @@ destination can run. Slot evacuation therefore requires downtime for affected
 instances unless a future live-migration design adds storage and fencing
 guarantees.
 
-Before the source fence, rollback restarts the source. After the source fence,
-every rollback uses a higher ownership epoch. After the ownership commit,
-rollback is another fenced slot move back to the source. The operation stores
-a durable phase so controller restart cannot forget which side is
-authoritative.
+Before the source fence, rollback restores each source instance to its recorded
+pre-maintenance desired power state. It does not start an instance that was
+desired-stopped before maintenance. After the source fence, every rollback
+uses a higher ownership epoch. After the ownership commit, rollback is another
+fenced slot move back to the source. The operation stores a durable phase so
+controller restart cannot forget which side is authoritative.
 
 Each phase is idempotent and has a phase-specific retry and rollback. Failure
 during drain or transfer removes verified destination staging and returns the
-slot to `active` on the source. Failure after the source fence never clears an
-old fence. Rollback assigns a higher ownership epoch to the source, reconverges
-and acknowledges that route generation, and then restores source domains.
+slot to `active` on the source. It restores each instance to its recorded
+pre-maintenance desired power state. Failure after the source fence never
+clears an old fence. Rollback assigns a higher ownership epoch to the source,
+reconverges and acknowledges that route and ownership-ACL generation, and then
+restores source domains to their recorded pre-maintenance desired power states.
 Failure after the ownership commit remains `moving` with all instances down
 until route convergence can retry. Rollback after that commit is a new fenced
 move with another higher ownership epoch. Failure of final source cleanup is
@@ -1083,6 +1165,10 @@ controller_address = "10.0.0.10"
 oci_builder = "runner-a"
 
 [[runners]]
+name = "controller-runner"
+endpoint = "https://10.0.0.10:10443"
+
+[[runners]]
 name = "runner-a"
 endpoint = "https://10.0.0.21:10443"
 
@@ -1097,13 +1183,20 @@ Setup validates every controller, runner endpoint, listener, and route
 next-hop address against the whole private range. A host remains inactive
 until this validation succeeds. Setup also requires the underlay isolation
 mode, underlay interface, authenticated frontend sources, runner listener
-address, host-firewall policy, and designated OCI builder.
+address, host-firewall policy, ownership-ACL adapter, and designated OCI
+builder. The controller machine always has an enrolled runner entry and runs
+its runner-role agent. It may own zero slots and host no guests.
+
+The supported Tailscale profile requires preconfigured automatic route
+approval and route acceptance on every Linux peer. Setup rejects a profile
+that depends on manual approval during a slot move.
 
 The runbook distinguishes:
 
 - direct LAN routing;
 - routes managed on each host;
 - WireGuard/Tailscale-style routed VPNs;
+- supported automatic underlay ownership-ACL updates;
 - unsupported routing by an external LAN router; and
 - unsupported overlapping whole-`/24` advertisements.
 
@@ -1112,13 +1205,15 @@ The runbook distinguishes:
 Operator output includes:
 
 - runner name, endpoint, slot ownership, enabled/draining state, architecture,
-  protocol version, and last contact;
+  protocol version, health or `degraded-network` state, and last contact;
 - reserved and configured vCPU, memory, and disk capacity;
 - image readiness by runner;
-- user network generation and missing participant acknowledgements;
+- user network generation, participant role, applied generation, missing
+  acknowledgements, retry exhaustion, and active convergence alarms;
 - controller lease, certificate expiry, revocation, and CA rollover state;
 - stale instance counts;
-- route, bridge, proxy-ARP, firewall, domain, and database reconciliation;
+- route, bridge, proxy-ARP, underlay ownership-ACL, firewall, domain, and
+  database reconciliation;
 - slot-drain and prefix-change plans.
 
 User-facing `ls` and the dashboard need not expose placement by default, but
@@ -1129,8 +1224,11 @@ generation, and request ID to every distributed lifecycle action.
 
 ## 21. Reconciliation
 
-Reconciliation remains report-only unless an operator invokes a narrowly
-defined repair action. It checks, per runner:
+The durable network-convergence worker in section 8.2 performs automatic
+network application. It is not the reconcile command. Reconciliation remains
+report-only unless an operator invokes a narrowly defined repair action. The
+repair action can restart an alarmed network convergence attempt. Reconcile
+checks, per runner:
 
 1. Database rows against libvirt domains by UUID.
 2. Assigned overlays and seeds against instance rows.
@@ -1140,9 +1238,15 @@ defined repair action. It checks, per runner:
 6. Proxy-ARP settings on Bento bridges.
 7. nftables policy against the rendered desired snapshot.
 8. Frontend routes against slot ownership.
-9. User network participant acknowledgements against the desired generation.
-10. Runner durable generations and outcomes against pending controller work.
-11. Global image checksums against per-runner readiness records.
+9. LAN, WireGuard, or Tailscale ownership ACLs against slot ownership.
+10. User network participant roles, applied generations, and acknowledgements
+    against the desired generation.
+11. Runner durable generations and outcomes against pending controller work.
+12. Global image checksums against per-runner readiness records.
+
+The controller-machine runner is a normal reconcile target. Its route,
+proxy-ARP, and frontend-source policy checks use the same runner protocol even
+when it owns no slots and hosts no guests.
 
 An unreachable runner produces one reachability finding and stale dependent
 checks, not a false list of missing domains and files.
@@ -1155,24 +1259,29 @@ checks, not a false list of missing domains and files.
 3. Rename `bento_lifecycle::Runner` to `CommandRunner`, add a host registry,
    and dispatch existing lifecycle actions by `host_id`.
 4. Implement `bentod runner` with certificate roles, mutual TLS, durable
-   generation and outcome storage, and local host checks.
+   generation and outcome storage, and local host checks. Require its runner
+   role on the controller machine.
 5. Move overlay, seed, domain XML, image presence, and libvirt operations
    behind the runner boundary.
-6. Add slot-aware address allocation and placement reservations.
-7. Implement durable network generations, route convergence, proxy ARP, and
-   the multi-node nftables policy; validate with two real runners.
+6. Persist instance and image-version architecture. Add slot-aware address
+   allocation and placement reservations. Extend the narrow libvirt seam with
+   CPU capability extraction and `virConnectCompareHypervisorCPU` admission.
+7. Implement durable network generations, the bounded network-convergence
+   worker, route convergence, proxy ARP, underlay ownership-ACL mutation, and
+   the multi-node nftables policy. Validate with two real runners.
 8. Validate the same route abstraction over one supported routed VPN setup.
 9. Keep HTTP and SSH data connections on routed guest addresses. Dispatch only
    SSH auto-start and CLI/API lifecycle actions by `host_id`.
 10. Add the designated OCI builder, exact artifact distribution, per-runner
     image synchronization, and same-runner copy.
-11. Add stale health, reconnect restore, and host-scoped reconciliation.
+11. Add stale health, `degraded-network` health, reconnect restore, convergence
+    alarms, and host-scoped reconciliation.
 12. Add runner drain and prefix-subdivision planning.
 13. Add stopped-overlay transfer and slot evacuation.
 
-Each step keeps the one-host configuration working. The controller machine may
-run a loopback runner during the transition so single-host and multi-host use
-the same orchestration path.
+Each step keeps the one-host configuration working. The controller machine
+runs its required runner role during the transition so single-host and
+multi-host use the same orchestration path.
 
 ## 23. Test and acceptance plan
 
@@ -1184,11 +1293,16 @@ clock seams. Add deterministic tests for:
 - address exhaustion per slot;
 - placement transaction races;
 - network-generation blocking barriers and asynchronous peer convergence;
+- idempotent network convergence, retry backoff, retry exhaustion, alarms, and
+  `degraded-network` health;
+- stale more-specific routes and proxy ARP cannot remain healthy after the
+  convergence bound;
 - private-range overlap rejection for every infrastructure address;
 - host-scoped polling, restore, and reconcile;
 - nftables rendering for local, remote-same-user, frontend, cross-user, and
   internet traffic;
-- route snapshots for LAN and routed-VPN backends;
+- route and ownership-ACL snapshots for LAN and routed-VPN backends;
+- automatic Tailscale route approval and Linux route acceptance;
 - controller epoch fencing, generation ordering, outcome replay, and old
   database restore;
 - certificate role, expiry, rotation, revocation, and CA rollover handling;
@@ -1196,9 +1310,15 @@ clock seams. Add deterministic tests for:
 - runner loss without false stopped states;
 - HTTP 503 and prompt SSH failure without placement disclosure;
 - designated-builder artifact verification and per-runner image state;
+- persisted architecture without destination substitution;
+- host-passthrough CPU contract capture, capability generations, cache
+  invalidation, the weaker `virConnectCompareCPU` fallback, and all three
+  `virConnectCompareHypervisorCPU` verdicts;
 - slot subdivision and merge plans;
-- prefix-lock races and retry or rollback from every slot-move phase;
-- consistent and explicitly best-effort backup reports;
+- prefix-lock races, ownership-ACL barriers, and retry or rollback from every
+  slot-move phase;
+- crash-consistent best-effort backup reports that do not claim a consistent
+  deployment recovery point;
 - old single-host database migration.
 
 Live acceptance requires at least two libvirt runners and covers:
@@ -1263,7 +1383,7 @@ the unicast behavior Bento needs with less state.
 
 ## 25. External behavior relied upon
 
-The design relies on four documented Linux/libvirt behaviors:
+The design relies on five documented Linux, libvirt, and Tailscale behaviors:
 
 1. libvirt `forward mode="open"` sends guest traffic through the host routing
    stack without adding libvirt firewall rules, leaving policy to Bento:
@@ -1275,9 +1395,18 @@ The design relies on four documented Linux/libvirt behaviors:
    applies after the route decision; nftables sets and maps can express the
    desired address and port policy:
    <https://www.netfilter.org/projects/nftables/manpage.html>.
-4. Tailscale subnet routers use SNAT by default and support preserving source
-   addresses on Linux by disabling subnet-route SNAT:
+4. Tailscale subnet routers use SNAT by default. Advertised routes require
+   approval or matching `autoApprovers`, and Linux peers must enable route
+   acceptance. Linux subnet routers can preserve source addresses by disabling
+   subnet-route SNAT:
    <https://tailscale.com/docs/features/subnet-routers>.
+5. libvirt `virConnectCompareHypervisorCPU` compares a concrete CPU definition
+   with one emulator, architecture, machine type, and virtualization type. Its
+   result distinguishes identical, superset, and incompatible CPUs.
+   `virConnectCompareCPU` is the weaker host-only comparison. Host capabilities
+   expose the concrete CPU data used for the stored contract:
+   <https://libvirt.org/html/libvirt-libvirt-host.html> and
+   <https://libvirt.org/formatcaps.html>.
 
 These are implementation dependencies and must be revalidated in the live
 acceptance environment, especially when the underlay uses policy routing.
