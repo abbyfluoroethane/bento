@@ -407,6 +407,7 @@ fn instance(
         visibility,
         created_at: test_time(),
         last_seen_at: None,
+        slot: None,
     }
 }
 

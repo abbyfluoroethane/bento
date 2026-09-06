@@ -1,11 +1,53 @@
 //! The pages over the same fakes as the API tests.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use tower::ServiceExt;
 
-use crate::tests::{TestResponse, fixture};
+use crate::tests::{TestResponse, fixture, fixture_with_metrics};
+
+#[derive(Debug)]
+struct TwoHostMetrics;
+
+fn host_metrics(host_id: i64, host_name: &str, memory_total_mib: i64) -> crate::HostMetrics {
+    crate::HostMetrics {
+        host_id,
+        host_name: host_name.to_string(),
+        memory_total_mib,
+        storage_total_gib: host_id,
+        cpu_count: host_id,
+        ..crate::HostMetrics::default()
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::Metrics for TwoHostMetrics {
+    async fn hosts(&self, _window: Duration) -> Result<Vec<crate::HostMetrics>, crate::BoxError> {
+        // Machine 1 is the one the fixture instances sit on. Machine 12
+        // holds nothing, which is what makes the per-machine figures
+        // visible.
+        Ok(vec![
+            host_metrics(1, "runner-a.example.org", 8 * 1024),
+            host_metrics(12, "runner-b.example.org", 32 * 1024),
+        ])
+    }
+
+    async fn instance(
+        &self,
+        _uuid: &str,
+        _window: Duration,
+    ) -> Result<crate::InstanceMetrics, crate::BoxError> {
+        Ok(crate::InstanceMetrics::default())
+    }
+
+    async fn user(&self, _user_id: i64) -> Result<crate::UserMetrics, crate::BoxError> {
+        Ok(crate::UserMetrics::default())
+    }
+}
 
 async fn get(app: &Router, path: &str) -> TestResponse {
     send(app, Method::GET, path, "", false).await
@@ -79,6 +121,33 @@ async fn home_lists_machines_and_host_figures() {
 }
 
 #[tokio::test]
+async fn home_draws_every_machine_and_counts_each_ones_own_guests() {
+    let fx = fixture_with_metrics(Arc::new(TwoHostMetrics));
+    let response = get(&fx.pages, "/").await;
+    assert_eq!(response.status, StatusCode::OK);
+    let body = text(&response);
+    assert!(body.contains("runner-a.example.org CPU usage"));
+    assert!(body.contains("runner-b.example.org CPU usage"));
+    // The ampersand is escaped in the attribute, as HTML needs. The
+    // browser hands the decoded URL to fetch.
+    assert!(body.contains("/metrics/host.json?host=1&amp;window=3600"));
+    assert!(body.contains("/metrics/host.json?host=12&amp;window=3600"));
+    // Every machine gets its own card, not only the first
+    // (MULTI-NODE 12).
+    assert!(body.contains("runner-a.example.org memory provisioning"));
+    assert!(body.contains("runner-b.example.org memory provisioning"));
+    // Capacity belongs to a machine. The two fixture guests are on
+    // machine 1, so machine 12 must read as empty rather than inherit
+    // the deployment total (SPEC 6.1).
+    assert!(body.contains("3 GiB of 8 GiB"), "machine 1 holds both guests");
+    assert!(body.contains("0 MiB of 32 GiB"), "machine 12 holds none");
+    // A ceiling names one machine, so two machines get none: adding
+    // them would name a machine that does not exist (MULTI-NODE 20).
+    assert!(!body.contains("<small>/"), "no deployment total");
+    assert!(body.contains("provisioned, across every machine"));
+}
+
+#[tokio::test]
 async fn fragments_render_without_the_shell() {
     let fx = fixture();
     let response = get(&fx.pages, "/fragments/instances").await;
@@ -111,6 +180,28 @@ async fn metrics_json_is_column_oriented_and_flagged() {
     fx.auth.0.lock().unwrap().replace(fx.bob.clone());
     assert_eq!(
         get(&fx.pages, "/vm/uuid-web/metrics.json").await.status,
+        StatusCode::NOT_FOUND
+    );
+}
+
+#[tokio::test]
+async fn host_metrics_selects_a_runner_and_maps_unknown_ids() {
+    let fx = fixture_with_metrics(Arc::new(TwoHostMetrics));
+
+    let response = get(&fx.pages, "/metrics/host.json?window=600").await;
+    assert_eq!(response.status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(json["memory_total_mib"], 8 * 1024);
+
+    let response = get(&fx.pages, "/metrics/host.json?host=12&window=600").await;
+    assert_eq!(response.status, StatusCode::OK);
+    let json: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(json["memory_total_mib"], 32 * 1024);
+
+    assert_eq!(
+        get(&fx.pages, "/metrics/host.json?host=99&window=600")
+            .await
+            .status,
         StatusCode::NOT_FOUND
     );
 }

@@ -3,7 +3,7 @@ use bento_network::GuestNetwork;
 use bento_types::{DesiredState, ImageKind, Instance, State, Visibility};
 
 use crate::fs::copy_file;
-use crate::manager::{AddressView, parse_prefix};
+use crate::manager::parse_prefix;
 use crate::new::seed;
 use crate::{Error, Manager, NewRequest, Result};
 
@@ -54,13 +54,30 @@ impl Manager {
                 )));
             }
         }
+        // A copy stays on its source's machine, because copying an
+        // overlay is a local file copy (MULTI-NODE 13.3). Copying one
+        // between machines is a transfer with its own verification, which
+        // is the slot-move workflow of section 17 and not this.
+        if source.host_id != self.host_id {
+            return Err(Error::operation(format!(
+                "lifecycle: cp {}: it runs on another machine, and copying \
+                 between machines is not implemented",
+                source.name
+            )));
+        }
         let subnet = parse_prefix(&request.owner.subnet).map_err(|error| {
             Error::operation(format!(
                 "lifecycle: user {} has a bad subnet {:?}: {error}",
                 request.owner.name, request.owner.subnet
             ))
         })?;
-        let address = bento_network::allocate_address(&AddressView(self.store.clone()), subnet)
+        let (address, slot) =
+            crate::manager::allocate_in_owned_slot(&self.store, request.host_id, subnet).await?;
+        // A copy stays on its source's machine, so it is weighed against
+        // that machine's ceiling (MULTI-NODE 12, 13.3).
+        let capacity = self
+            .store
+            .host_capacity(request.host_id)
             .await
             .map_err(Error::caused)?;
         let uuid = (self.new_uuid)();
@@ -84,17 +101,20 @@ impl Manager {
             visibility: Visibility::Off,
             created_at: (self.now)().to_offset(time::UtcOffset::UTC),
             last_seen_at: None,
+            // A copy stays on the source's runner (MULTI-NODE 13.3), but
+            // it gets its own address, so it records the slot that address
+            // came from rather than the source's. The two differ when the
+            // source's slot is full and the machine owns another.
+            slot: Some(slot),
         };
         self.store
-            .create_instance(instance.clone(), self.cooldown, self.capacity)
+            .create_instance(instance.clone(), self.cooldown, capacity)
             .await
             .map_err(crate::actions::external)?;
         if let Err(error) =
             copy_file(&self.overlay_path(source_uuid), &self.overlay_path(&uuid)).await
         {
-            return Err(self
-                .unwind_new(&instance, Box::new(error), false, false)
-                .await);
+            return Err(self.unwind_copy(&instance, Box::new(error)).await);
         }
         if request.disk_gib > source.disk_gib
             && let Err(error) = self
@@ -102,14 +122,12 @@ impl Manager {
                 .resize_overlay(&self.overlay_path(&uuid), request.disk_gib)
                 .await
         {
-            return Err(self.unwind_new(&instance, error, true, false).await);
+            return Err(self.unwind_copy(&instance, error).await);
         }
         let guest = match GuestNetwork::new(subnet, address, Some(&self.dns)) {
             Ok(guest) => guest,
             Err(error) => {
-                return Err(self
-                    .unwind_new(&instance, Box::new(error), true, false)
-                    .await);
+                return Err(self.unwind_copy(&instance, Box::new(error)).await);
             }
         };
         let cloud_seed = seed(
@@ -123,20 +141,16 @@ impl Manager {
             .build(&cloud_seed, &self.seed_iso_path(&uuid))
             .await
         {
-            return Err(self.unwind_new(&instance, error, true, false).await);
+            return Err(self.unwind_copy(&instance, error).await);
         }
         let xml = match self.domain_xml(&instance, &request.owner, true) {
             Ok(xml) => xml,
             Err(error) => {
-                return Err(self
-                    .unwind_new(&instance, Box::new(error), true, true)
-                    .await);
+                return Err(self.unwind_copy(&instance, Box::new(error)).await);
             }
         };
         if let Err(error) = self.hyp.create(&xml).await {
-            return Err(self
-                .unwind_new(&instance, Box::new(error), true, true)
-                .await);
+            return Err(self.unwind_copy(&instance, Box::new(error)).await);
         }
         instance.state = State::Running;
         if let Err(error) = self.store.set_observed_state(&uuid, State::Running).await {

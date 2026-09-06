@@ -9,7 +9,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 mod duration;
 pub use duration::{GoDuration, parse_go_duration};
@@ -22,6 +22,14 @@ pub mod defaults {
     pub const IMAGE_DIR: &str = "/var/lib/bento/images";
     pub const STORAGE_DIR: &str = "/var/lib/bento/storage";
     pub const DB_PATH: &str = "/var/lib/bento/bento.db";
+    /// The runner listens on loopback until the operator sets an underlay
+    /// address (MULTI-NODE 11.1).
+    pub const RUNNER_LISTEN: &str = "127.0.0.1:10443";
+    /// Durable runner fencing state (MULTI-NODE 11.3).
+    pub const RUNNER_FENCE_DB: &str = "/var/lib/bento/runner.db";
+    /// The runner fails closed when the clocks differ by more than this
+    /// value (MULTI-NODE 11.3).
+    pub const RUNNER_MAX_CLOCK_SKEW: Duration = Duration::from_secs(60);
     /// SPEC 5.3: no overcommit.
     pub const OVERCOMMIT_RATIO: f64 = 1.0;
     /// SPEC 7.2.
@@ -144,9 +152,86 @@ pub struct Config {
     pub acme: Acme,
     pub oidc: Oidc,
     pub bootc: Bootc,
+    pub runner: Runner,
+
+    /// The runner endpoints the controller may call (MULTI-NODE 11.2).
+    pub runners: Vec<RunnerEntry>,
 
     /// The operator image allowlist (SPEC 5.1).
     pub images: Vec<ImageEntry>,
+}
+
+/// Settings for the runner service on this machine.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct Runner {
+    /// The underlay address for the runner management listener.
+    pub listen: String,
+    /// The SQLite file that holds durable fencing state.
+    pub fence_db: String,
+    /// The allowed difference between the controller and runner clocks.
+    pub max_clock_skew: GoDuration,
+}
+
+/// One runner endpoint known to the controller.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RunnerEntry {
+    pub name: String,
+    /// Where the controller sends management requests (MULTI-NODE 11.2).
+    pub endpoint: String,
+    /// The next hop other machines use to reach this machine's guest
+    /// slots (MULTI-NODE 8.5).
+    ///
+    /// It defaults to the host part of `endpoint`, which on a LAN is the
+    /// machine's LAN address and is what a two-machine deployment wants.
+    /// Setting it separately moves guest traffic onto a tunnel, such as
+    /// a WireGuard or Tailscale address, while management traffic stays
+    /// where it is. Management and guest data do not have to share a
+    /// path, so they are two settings.
+    pub underlay: String,
+}
+
+impl RunnerEntry {
+    /// The next hop for this machine's slot routes.
+    ///
+    /// Returns an error rather than a guess when neither `underlay` nor a
+    /// usable `endpoint` host is present. A wrong next hop produces a
+    /// black hole that looks exactly like a healthy runner
+    /// (MULTI-NODE 8.3), so it must fail at startup instead.
+    pub fn underlay_address(&self) -> Result<std::net::Ipv4Addr, String> {
+        if !self.underlay.is_empty() {
+            return self
+                .underlay
+                .parse()
+                .map_err(|_| format!("underlay {:?} is not an IPv4 address", self.underlay));
+        }
+        let host = endpoint_host(&self.endpoint)
+            .ok_or_else(|| format!("endpoint {:?} has no host part", self.endpoint))?;
+        host.parse().map_err(|_| {
+            format!(
+                "endpoint host {host:?} is not an IPv4 address; set `underlay` for runner {:?}",
+                self.name
+            )
+        })
+    }
+}
+
+/// Extracts the host part of `http://10.0.0.97:10443`. It does not parse
+/// a full URL: the endpoint is operator-written and only ever names a
+/// scheme, a host, and a port.
+fn endpoint_host(endpoint: &str) -> Option<&str> {
+    let rest = endpoint
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(endpoint);
+    let rest = rest.split('/').next()?;
+    let host = match rest.rsplit_once(':') {
+        Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
+        _ => rest,
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    (!host.is_empty()).then_some(host)
 }
 
 /// The listen addresses of the three processes.
@@ -282,7 +367,19 @@ impl Default for Config {
             acme: Acme::default(),
             oidc: Oidc::default(),
             bootc: Bootc::default(),
+            runner: Runner::default(),
+            runners: Vec::new(),
             images: Vec::new(),
+        }
+    }
+}
+
+impl Default for Runner {
+    fn default() -> Self {
+        Self {
+            listen: defaults::RUNNER_LISTEN.to_owned(),
+            fence_db: defaults::RUNNER_FENCE_DB.to_owned(),
+            max_clock_skew: GoDuration(defaults::RUNNER_MAX_CLOCK_SKEW),
         }
     }
 }
@@ -312,7 +409,7 @@ impl Default for Defaults {
 }
 
 /// An IPv4 network in CIDR form, as `private_range` carries it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ipv4Prefix {
     pub addr: std::net::Ipv4Addr,
     pub bits: u8,
@@ -414,6 +511,10 @@ impl Config {
                 self.restore_batch_size
             )));
         }
+        validate_runner_listen(&self.runner.listen)?;
+        if self.runner.max_clock_skew.std().is_zero() {
+            return Err(invalid("runner: max_clock_skew must be positive"));
+        }
         let prefix = parse_prefix(&self.private_range)
             .map_err(|e| invalid(format!("private_range: {e}")))?;
         if prefix.bits > 24 {
@@ -421,6 +522,29 @@ impl Config {
                 "private_range must be /24 or wider to hold user /24s, got /{}",
                 prefix.bits
             )));
+        }
+        // Every runner endpoint and every route next hop must sit outside
+        // the whole private range, including /24s no user holds yet
+        // (MULTI-NODE 8.5). An underlay address inside the range would
+        // make a slot route recursive: the route to reach the runner
+        // would point through the runner.
+        for entry in &self.runners {
+            let underlay = entry
+                .underlay_address()
+                .map_err(|e| invalid(format!("runner {:?}: {e}", entry.name)))?;
+            let endpoint = endpoint_host(&entry.endpoint)
+                .and_then(|host| host.parse::<std::net::Ipv4Addr>().ok());
+            for (what, address) in [("underlay", Some(underlay)), ("endpoint", endpoint)] {
+                let Some(address) = address else { continue };
+                if prefix_contains(prefix, address) {
+                    return Err(invalid(format!(
+                        "runner {:?} {what} {address} is inside private_range {}; \
+                         management and next-hop addresses must sit outside the guest \
+                         range or their own routes become recursive",
+                        entry.name, self.private_range
+                    )));
+                }
+            }
         }
         if self.listen.proxy_port_min > self.listen.proxy_port_max {
             return Err(invalid(format!(
@@ -495,6 +619,34 @@ impl Config {
     }
 }
 
+fn validate_runner_listen(listen: &str) -> Result<(), Error> {
+    let empty_host = listen.is_empty() || listen.starts_with(':');
+    let bare_wildcard = matches!(listen, "0.0.0.0" | "::");
+    if empty_host || bare_wildcard {
+        return Err(invalid(
+            "runner listen must bind one underlay address, not a wildcard; a wildcard exposes the management port on user bridges (MULTI-NODE 11.1)",
+        ));
+    }
+
+    let address = match listen.parse::<SocketAddr>() {
+        Ok(address) => address,
+        Err(_) if listen.parse::<IpAddr>().is_ok() => {
+            return Err(invalid("runner listen must include a port"));
+        }
+        Err(_) => {
+            return Err(invalid(format!(
+                "runner listen {listen:?} is not an IP address with a port"
+            )));
+        }
+    };
+    if address.ip().is_unspecified() {
+        return Err(invalid(
+            "runner listen must bind one underlay address, not a wildcard; a wildcard exposes the management port on user bridges (MULTI-NODE 11.1)",
+        ));
+    }
+    Ok(())
+}
+
 fn pinned_oci_reference(reference: &str) -> bool {
     reference
         .rsplit_once("@sha256:")
@@ -518,6 +670,16 @@ pub fn resolve_listen_addr(addr: &str) -> Result<SocketAddr, String> {
         .map_err(|_| format!("{addr:?} is not a listen address"))
 }
 
+/// Whether an IPv4 prefix covers an address.
+fn prefix_contains(prefix: Ipv4Prefix, address: std::net::Ipv4Addr) -> bool {
+    let mask: u32 = match prefix.bits {
+        0 => 0,
+        bits @ 1..=32 => u32::MAX << (32 - bits),
+        _ => return false,
+    };
+    (u32::from(address) & mask) == (u32::from(prefix.addr) & mask)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -534,6 +696,10 @@ mod tests {
         assert_eq!(cfg.cooldown(), Duration::from_secs(24 * 3600));
         assert_eq!(cfg.restore_batch_size, 4);
         assert_eq!(cfg.private_range, "10.100.0.0/16");
+        assert_eq!(cfg.runner.listen, "127.0.0.1:10443");
+        assert_eq!(cfg.runner.fence_db, "/var/lib/bento/runner.db");
+        assert_eq!(cfg.runner.max_clock_skew.std(), Duration::from_secs(60));
+        assert!(cfg.runners.is_empty());
         assert_eq!(cfg.listen.http, "127.0.0.1:10080");
         assert_eq!(cfg.listen.https, ":443");
         assert_eq!(cfg.listen.ssh, ":22");
@@ -684,6 +850,145 @@ pinned_checksum = "sha256-deadbeef"
              [[images]]\nname = \"a\"\nurl = \"https://x/b\"",
             "duplicate",
         );
+    }
+
+    #[test]
+    fn runner_listener_rejects_wildcards() {
+        for listen in ["0.0.0.0:10443", "[::]:10443", ":10443", "::", ""] {
+            parse_err(
+                &format!("base_domain = \"bento.example.org\"\n[runner]\nlisten = {listen:?}"),
+                "wildcard exposes the management port on user bridges",
+            );
+        }
+    }
+
+    #[test]
+    fn runner_listener_requires_a_port() {
+        parse_err(
+            "base_domain = \"bento.example.org\"\n[runner]\nlisten = \"10.0.0.97\"",
+            "runner listen must include a port",
+        );
+    }
+
+    #[test]
+    fn runner_listener_accepts_an_underlay_address() {
+        let cfg = Config::parse(
+            "base_domain = \"bento.example.org\"\n[runner]\nlisten = \"10.0.0.97:10443\"\nfence_db = \"/srv/bento/runner.db\"\nmax_clock_skew = \"45s\"",
+        )
+        .unwrap();
+        assert_eq!(cfg.runner.listen, "10.0.0.97:10443");
+        assert_eq!(cfg.runner.fence_db, "/srv/bento/runner.db");
+        assert_eq!(cfg.runner.max_clock_skew.std(), Duration::from_secs(45));
+    }
+
+    #[test]
+    fn underlay_defaults_to_the_endpoint_host() {
+        let cfg = Config::parse(
+            r#"
+base_domain = "b.example"
+[[runners]]
+name = "tsukasa"
+endpoint = "http://10.0.0.97:10443"
+
+[[runners]]
+name = "on-a-tunnel"
+endpoint = "http://10.0.0.98:10443"
+underlay = "100.110.234.123"
+"#,
+        )
+        .unwrap();
+        // Management and guest data need not share a path.
+        assert_eq!(
+            cfg.runners[0].underlay_address().unwrap(),
+            std::net::Ipv4Addr::new(10, 0, 0, 97)
+        );
+        assert_eq!(
+            cfg.runners[1].underlay_address().unwrap(),
+            std::net::Ipv4Addr::new(100, 110, 234, 123)
+        );
+    }
+
+    #[test]
+    fn underlay_inside_the_private_range_is_refused() {
+        // MULTI-NODE 8.5: a next hop inside the guest range makes the
+        // route to reach it point through itself.
+        let error = Config::parse(
+            r#"
+base_domain = "b.example"
+private_range = "10.100.0.0/16"
+[[runners]]
+name = "wrong"
+endpoint = "http://10.100.4.9:10443"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("recursive"), "{error}");
+
+        // The endpoint is checked as well as the underlay. A management
+        // address inside the guest range is reachable only through the
+        // routes Bento is about to install, which is the same trap.
+        let error = Config::parse(
+            r#"
+base_domain = "b.example"
+private_range = "10.100.0.0/16"
+[[runners]]
+name = "wrong"
+endpoint = "http://10.100.4.9:10443"
+underlay = "10.0.0.97"
+"#,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("endpoint"), "{error}");
+
+        // Both outside the range is the accepted shape.
+        assert!(
+            Config::parse(
+                r#"
+base_domain = "b.example"
+private_range = "10.100.0.0/16"
+[[runners]]
+name = "ok"
+endpoint = "http://10.0.0.97:10443"
+underlay = "100.110.234.123"
+"#,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_runner_with_no_usable_address_is_refused_at_startup() {
+        for body in [
+            "name = \"a\"\nendpoint = \"http://runner.example.org:10443\"",
+            "name = \"a\"\nendpoint = \"\"",
+            "name = \"a\"\nendpoint = \"http://10.0.0.9:1\"\nunderlay = \"not-an-address\"",
+        ] {
+            let text = format!("base_domain = \"b.example\"\n[[runners]]\n{body}\n");
+            assert!(Config::parse(&text).is_err(), "accepted:\n{text}");
+        }
+    }
+
+    #[test]
+    fn runner_endpoints_parse() {
+        let cfg = Config::parse(
+            r#"
+base_domain = "bento.example.org"
+
+[[runners]]
+name = "runner-a.example.org"
+endpoint = "http://10.0.0.10:10443"
+
+[[runners]]
+name = "runner-b.example.org"
+endpoint = "http://10.0.0.97:10443"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.runners.len(), 2);
+        assert_eq!(cfg.runners[0].name, "runner-a.example.org");
+        assert_eq!(cfg.runners[1].endpoint, "http://10.0.0.97:10443");
     }
 
     #[test]

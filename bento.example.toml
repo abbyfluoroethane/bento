@@ -82,6 +82,25 @@ operators = []
 # address as well, because these listeners have no TLS of their own.
 #tls = "acme"
 
+[runner]
+# Runner management listener (MULTI-NODE 11.1). Set this to this
+# machine's protected LAN or routed VPN address. Never use a wildcard.
+#listen = "192.168.50.10:10443"
+# Durable controller epoch and request outcomes (MULTI-NODE 11.3).
+#fence_db = "/var/lib/bento/runner.db"
+# Stop when the controller and runner clocks differ by more than this.
+#max_clock_skew = "60s"
+
+# Runner endpoints that the controller may call (MULTI-NODE 11.2).
+#[[runners]]
+#name = "runner-a.example.org"
+#endpoint = "http://192.168.50.10:10443"
+
+# Add one table for each other runner.
+#[[runners]]
+#name = "runner-b.example.org"
+#endpoint = "http://192.168.50.11:10443"
+
 # The shape of a `new` without flags (SPEC 15). An empty image selects
 # the first [[images]] entry below.
 [defaults]

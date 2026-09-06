@@ -22,22 +22,34 @@ pub(crate) async fn run_sshd(config: &Path, _args: &[OsString]) -> Result<()> {
 
 async fn sshd_inner(app: &App) -> Result<()> {
     let hypervisor = app.connect_libvirt().await?;
-    let manager = app.manager(hypervisor.clone())?;
 
     // One host key for every connection means rename and name reuse do not
     // produce known_hosts warnings (SPEC 10).
     let host_key = ensure_key(&key_path(app, HOST_KEY_FILE), "bento-host")?;
     let frontend_key = ensure_key(&key_path(app, FRONTEND_KEY_FILE), "bento-frontend")?;
     let frontend_public = authorized_key_line(frontend_key.public_key(), "bento-frontend")?;
-    let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .unwrap_or_else(|_| "localhost".to_owned())
-        .trim()
-        .to_owned();
+    // The machine ID is the key and the hostname is a label. Reading the
+    // transient kernel hostname as the key gave one machine a second row
+    // every time NetworkManager renamed it (MULTI-NODE 16).
+    let machine_id = bento_hostinfo::read_machine_id()
+        .map_err(|error| anyhow::anyhow!("machine identity: {error}"))?;
     let host = app
         .store
-        .ensure_host(hostname, &app.cfg.libvirt_uri)
+        .ensure_host(
+            machine_id,
+            bento_hostinfo::read_hostname(),
+            &app.cfg.libvirt_uri,
+        )
         .await
         .map_err(|error| anyhow::anyhow!("hosts row: {error}"))?;
+    // The frontend creates instances, and placement can put one on
+    // another machine. It is not the controller, so it names the lease
+    // the controller holds rather than taking one (MULTI-NODE 11.3).
+    let manager = app.manager_with_runners(
+        hypervisor.clone(),
+        host.id,
+        Some(crate::runners::InstanceSync::following(app.store.clone())),
+    )?;
 
     // CLI mutations reload the whole table immediately (SPEC 6.3), rather
     // than waiting for the control-plane convergence tick.
@@ -46,6 +58,7 @@ async fn sshd_inner(app: &App) -> Result<()> {
         app.plan,
         Arc::new(NftApplier::default()),
         PortRange { from: 0, to: 0 },
+        host.id,
     ));
     let lifecycle = Arc::new(CliBackend(Backend {
         manager: manager.clone(),

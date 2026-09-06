@@ -6,8 +6,11 @@ mod adapters;
 mod firewall;
 mod keys;
 mod metrics;
+mod netstate;
 mod ops;
 mod proxyd;
+mod runnerd;
+mod runners;
 mod serve;
 mod setup;
 mod sshd;
@@ -21,11 +24,12 @@ use std::path::PathBuf;
 
 const DEFAULT_CONFIG_PATH: &str = "/etc/bento/bento.toml";
 
-const COMMANDS: [(&str, &str); 7] = [
+const COMMANDS: [(&str, &str); 11] = [
     (
         "serve",
         "run the control plane: database, policy, dashboard",
     ),
+    ("runner", "run the host runner service on the underlay"),
     (
         "proxy",
         "run the HTTP proxy on port 443 and ports 3000-9999",
@@ -36,12 +40,24 @@ const COMMANDS: [(&str, &str); 7] = [
         "download, verify, and store allowlisted images",
     ),
     (
+        "sync-images",
+        "pull current allowlisted images onto every enabled runner",
+    ),
+    (
         "reconcile",
         "report disagreements between libvirt and the database",
     ),
     (
         "dump-db",
         "write a consistent database copy with the backup API",
+    ),
+    (
+        "restore-db",
+        "replace the database from a copy, keeping one of what it replaced",
+    ),
+    (
+        "slots",
+        "show runner slots, change the slot prefix, or give a slot away",
     ),
     (
         "images",
@@ -80,12 +96,16 @@ async fn run(args: Vec<OsString>) -> i32 {
     };
     let result = match name {
         "serve" => serve::run_serve(&config_path, command_args).await,
+        "runner" => runnerd::run_runner(&config_path, command_args).await,
         "proxy" => proxyd::run_proxy(&config_path, command_args).await,
         "sshd" => sshd::run_sshd(&config_path, command_args).await,
         "fetch-images" => ops::run_fetch_images(&config_path, command_args).await,
+        "sync-images" => ops::run_sync_images(&config_path, command_args).await,
         "reconcile" => ops::run_reconcile(&config_path, command_args).await,
         "dump-db" => ops::run_dump_db(&config_path, command_args).await,
+        "restore-db" => ops::run_restore_db(&config_path, command_args).await,
         "images" => ops::run_images(&config_path, command_args).await,
+        "slots" => ops::run_slots(&config_path, command_args).await,
         _ => {
             eprintln!("bentod: unknown command {name:?}\n");
             usage(&mut io::stderr());
@@ -157,11 +177,14 @@ mod tests {
             (vec![], 2),
             (vec!["frobnicate"], 2),
             (vec!["serve"], 1),
+            (vec!["runner"], 1),
             (vec!["proxy"], 1),
             (vec!["sshd"], 1),
             (vec!["fetch-images"], 1),
+            (vec!["sync-images"], 1),
             (vec!["reconcile"], 1),
             (vec!["dump-db"], 1),
+            (vec!["restore-db"], 1),
             (vec!["images"], 1),
             (vec!["-config", "/nonexistent/x.toml", "serve"], 1),
             (vec!["-nope"], 2),

@@ -1,9 +1,9 @@
 use bento_cloudinit::Seed;
 use bento_network::GuestNetwork;
-use bento_types::{DesiredState, ImageKind, Instance, State, User, Visibility};
+use bento_types::{DesiredState, ImageKind, Instance, Placing, State, User, Visibility};
 
 use crate::fs::remove_file;
-use crate::manager::{AddressView, parse_prefix};
+use crate::manager::parse_prefix;
 use crate::{Error, Manager, Result};
 
 /// The one account cloud-init creates in every instance (SPEC 5.2). A fixed
@@ -15,7 +15,11 @@ pub const GUEST_USER: &str = "bento";
 pub struct NewRequest {
     pub name: String,
     pub owner: User,
-    /// The one host in version 1 (SPEC sections 12 and 17).
+    /// The machine that received the request.
+    ///
+    /// It is used only when the deployment has one machine that can take
+    /// an instance. With more than one, placement chooses, and this is
+    /// ignored (MULTI-NODE 12).
     pub host_id: i64,
     /// Owner public keys installed by cloud-init (SPEC 5.2).
     pub ssh_keys: Vec<String>,
@@ -63,6 +67,18 @@ impl Manager {
             .current_checksum
             .filter(|value| !value.is_empty())
             .ok_or_else(|| Error::NoImageVersion(request.image_name.clone()))?;
+        let missing = self
+            .store
+            .hosts_missing_image(&request.image_name, &checksum)
+            .await
+            .map_err(Error::caused)?;
+        if !missing.is_empty() {
+            let verb = if missing.len() == 1 { "is" } else { "are" };
+            return Err(Error::FleetImageNotReady {
+                image_name: request.image_name.clone(),
+                missing: format!("{} {verb} not ready", missing.join(", ")),
+            });
+        }
         let image_version = self.store.image_version(&checksum).await.map_err(|error| {
             Error::operation(format!("lifecycle: image version {checksum:?}: {error}"))
         })?;
@@ -72,15 +88,15 @@ impl Manager {
                 request.owner.name, request.owner.subnet
             ))
         })?;
-        let address = bento_network::allocate_address(&AddressView(self.store.clone()), subnet)
-            .await
-            .map_err(Error::caused)?;
+        let host_id = self.place(&request).await?;
+        let (address, slot) =
+            crate::manager::allocate_in_owned_slot(&self.store, host_id, subnet).await?;
         let uuid = (self.new_uuid)();
         let mut instance = Instance {
             uuid: uuid.clone(),
             name: request.name.clone(),
             owner_id: request.owner.id,
-            host_id: request.host_id,
+            host_id,
             image_name: request.image_name.clone(),
             base_checksum: checksum.clone(),
             state: State::Stopped,
@@ -96,51 +112,57 @@ impl Manager {
             visibility: Visibility::Off,
             created_at: (self.now)().to_offset(time::UtcOffset::UTC),
             last_seen_at: None,
+            // The address came from a slot this machine owns, so the
+            // address alone says where the instance runs (MULTI-NODE 7.2).
+            slot: Some(slot),
         };
-        self.store
-            .create_instance(instance.clone(), self.cooldown, self.capacity)
+        // The ceiling of the machine the instance will run on, not this
+        // one. They are the same on a deployment with one machine
+        // (MULTI-NODE 12).
+        let capacity = self
+            .store
+            .host_capacity(host_id)
             .await
             .map_err(Error::caused)?;
-        let overlay = self.overlay_path(&uuid);
-        if let Err(error) = self
-            .images
-            .create_overlay(&checksum, &overlay, request.disk_gib)
+        self.store
+            .create_instance(instance.clone(), self.cooldown, capacity)
             .await
-        {
-            return Err(self.unwind_new(&instance, error, false, false).await);
-        }
+            .map_err(Error::caused)?;
         let guest = match GuestNetwork::new(subnet, address, Some(&self.dns)) {
             Ok(guest) => guest,
             Err(error) => {
-                return Err(self
-                    .unwind_new(&instance, Box::new(error), true, false)
-                    .await);
+                return Err(self.unwind_new(&instance, Box::new(error)).await);
             }
         };
-        let seed = seed(
-            &instance,
-            &request,
-            &guest,
-            image_version.kind != ImageKind::Oci,
-        );
-        if let Err(error) = self.iso.build(&seed, &self.seed_iso_path(&uuid)).await {
-            return Err(self.unwind_new(&instance, error, true, false).await);
-        }
-        let xml = match self.domain_xml(&instance, &request.owner, true) {
-            Ok(xml) => xml,
-            Err(error) => {
-                return Err(self
-                    .unwind_new(&instance, Box::new(error), true, true)
-                    .await);
-            }
+        let network = match self.user_network_name(&request.owner) {
+            Ok(name) => name,
+            Err(error) => return Err(self.unwind_new(&instance, Box::new(error)).await),
         };
-        if let Err(error) = self.hyp.create(&xml).await {
-            return Err(self
-                .unwind_new(&instance, Box::new(error), true, true)
-                .await);
-        }
-        instance.state = State::Running;
-        if let Err(error) = self.store.set_observed_state(&uuid, State::Running).await {
+        let spec = crate::manager::ProvisionSpec {
+            host_id,
+            instance: instance.clone(),
+            network,
+            seed: seed(
+                &instance,
+                &request,
+                &guest,
+                image_version.kind != ImageKind::Oci,
+            ),
+            // A bootc image bakes its packages in, so it needs no seed
+            // drive for the guest agent (SPEC 5.2).
+            with_seed_iso: true,
+            start: true,
+        };
+        // The machine that will run the instance builds it. It cleans up
+        // its own partial work; only the row is left for this side to
+        // remove, because a controller cannot delete a file on another
+        // machine (MULTI-NODE 13.1).
+        let observed = match self.fleet.provision(&spec).await {
+            Ok(state) => state,
+            Err(error) => return Err(self.unwind_new(&instance, error).await),
+        };
+        instance.state = observed;
+        if let Err(error) = self.store.set_observed_state(&uuid, observed).await {
             self.log.warn(&format!(
                 "new: observed state not recorded; poller will catch up: {error}"
             ));
@@ -150,20 +172,88 @@ impl Manager {
         Ok(instance)
     }
 
-    pub(crate) async fn unwind_new(
-        &self,
-        instance: &Instance,
-        cause: crate::DynError,
-        overlay: bool,
-        iso: bool,
-    ) -> Error {
+    /// Chooses the machine for a new instance (MULTI-NODE 12).
+    ///
+    /// A deployment with one machine that can take an instance keeps
+    /// using it, which is what version 1 did and what a single-machine
+    /// deployment still is. Placement would otherwise make every create
+    /// depend on a health poll such a deployment need not run.
+    async fn place(&self, request: &NewRequest) -> Result<i64> {
+        let placeable = self.store.placeable_hosts().await.map_err(Error::caused)?;
+        if placeable <= 1 {
+            return Ok(request.host_id);
+        }
+        self.store
+            .choose_host(Placing {
+                vcpu: i64::from(request.vcpu),
+                memory_mib: request.memory_mib,
+                disk_gib: request.disk_gib,
+                // An image version carries no architecture of its own:
+                // the allowlist URL names one build, and the controller
+                // fetched it for the architecture it runs. Bento runs
+                // only KVM guests of the host's architecture, so a
+                // machine that does not match cannot boot this image
+                // whatever room it has (MULTI-NODE 12).
+                arch: Some(std::env::consts::ARCH.to_owned()),
+            })
+            .await
+            .map_err(Error::caused)
+    }
+
+    /// The libvirt network of an owner, by the deterministic name every
+    /// machine derives from the subnet index (SPEC 6.2).
+    pub(crate) fn user_network_name(&self, owner: &User) -> Result<String> {
+        let subnet = parse_prefix(&owner.subnet).map_err(|error| {
+            Error::operation(format!(
+                "lifecycle: user {} has a bad subnet {:?}: {error}",
+                owner.name, owner.subnet
+            ))
+        })?;
+        let index = self.plan.index(subnet).map_err(|error| {
+            Error::operation(format!(
+                "lifecycle: subnet {}/{} outside the private range: {error}",
+                subnet.addr, subnet.bits
+            ))
+        })?;
+        Ok(bento_network::UserNetwork::new(self.plan, index as isize)
+            .map_err(Error::caused)?
+            .name)
+    }
+
+    /// Removes the row and the local files of a copy that failed.
+    ///
+    /// A copy is built on this machine, so this side made the files and
+    /// this side removes them. That is the difference from
+    /// [`Manager::unwind_new`], where the files are on the machine that
+    /// tried to build the instance.
+    pub(crate) async fn unwind_copy(&self, instance: &Instance, cause: crate::DynError) -> Error {
         let mut errors = vec![cause.to_string()];
-        if iso && let Err(error) = (self.delete_iso)(self.seed_iso_path(&instance.uuid)).await {
+        if let Err(error) = (self.delete_iso)(self.seed_iso_path(&instance.uuid)).await {
             errors.push(format!("unwind seed iso: {error}"));
         }
-        if overlay && let Err(error) = remove_file(&self.overlay_path(&instance.uuid)).await {
+        if let Err(error) = remove_file(&self.overlay_path(&instance.uuid)).await {
             errors.push(format!("unwind overlay: {error}"));
         }
+        if let Err(error) = self.store.delete_instance(&instance.uuid).await {
+            errors.push(format!("unwind instance row: {error}"));
+        }
+        self.log
+            .warn(&format!("cp: failed, partial work unwound: {cause}"));
+        Error::operation(format!(
+            "lifecycle: cp {}: {}",
+            instance.name,
+            errors.join(": ")
+        ))
+    }
+
+    /// Removes the row of an instance that could not be built.
+    ///
+    /// The files are not removed here. The machine that tried to build
+    /// the instance removed its own partial work before it reported the
+    /// failure, and it is the only side that can: a controller cannot
+    /// delete a file on another machine (MULTI-NODE 13.1).
+    pub(crate) async fn unwind_new(&self, instance: &Instance, cause: crate::DynError) -> Error {
+        let mut errors = vec![cause.to_string()];
         if let Err(error) = self.store.delete_instance(&instance.uuid).await {
             errors.push(format!("unwind instance row: {error}"));
         }

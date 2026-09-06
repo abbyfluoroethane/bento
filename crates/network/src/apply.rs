@@ -89,6 +89,79 @@ impl Applier for NftApplier {
     }
 }
 
+/// Names the other nftables tables that also filter the forward hook.
+///
+/// nftables runs every base chain at a hook. An `accept` in one chain
+/// only ends that chain; the packet still meets the next one, and a
+/// `drop` or `reject` anywhere is final. So Bento's table cannot make a
+/// packet pass that another table rejects.
+///
+/// This matters only once guest traffic crosses machines
+/// (MULTI-NODE 8.4). A guest packet then arrives on the underlay
+/// interface and has to be forwarded onto a user bridge, and a
+/// host firewall that rejects it produces the same signature as a
+/// missing route: the guest sees nothing, and every Bento rule looks
+/// right. Naming the table turns that into a message an operator can
+/// act on.
+pub async fn foreign_forward_filters(path: &str) -> Result<Vec<String>> {
+    let path = if path.is_empty() { "nft" } else { path };
+    let output = Command::new(path)
+        .args(["-j", "list", "chains"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .output()
+        .await
+        .map_err(|error| {
+            Error::Apply(Box::new(NftApplyError {
+                cause: error.to_string(),
+                output: String::new(),
+            }))
+        })?;
+    if !output.status.success() {
+        return Err(Error::Apply(Box::new(NftApplyError {
+            cause: output.status.to_string(),
+            output: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        })));
+    }
+    Ok(parse_forward_filters(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+/// Reads `nft -j list chains` and returns the `family table chain` of
+/// every forward-hook base chain outside Bento's own table.
+fn parse_forward_filters(json: &str) -> Vec<String> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
+        return Vec::new();
+    };
+    let Some(items) = value.get("nftables").and_then(|v| v.as_array()) else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for item in items {
+        let Some(chain) = item.get("chain") else {
+            continue;
+        };
+        if chain.get("hook").and_then(|v| v.as_str()) != Some("forward") {
+            continue;
+        }
+        let table = chain.get("table").and_then(|v| v.as_str()).unwrap_or("");
+        if table == BENTO_TABLE {
+            continue;
+        }
+        let family = chain.get("family").and_then(|v| v.as_str()).unwrap_or("");
+        let name = chain.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        found.push(format!("{family} {table} {name}"));
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// The one table Bento owns (SPEC 6.3).
+const BENTO_TABLE: &str = "bento";
+
 /// Renders the ruleset and applies it as one atomic full-table reload
 /// (SPEC 6.3). Call this on every change to network policy. A partial
 /// rule update leaves a window with the wrong policy.
@@ -119,6 +192,42 @@ mod tests {
             } else {
                 Ok(())
             }
+        }
+    }
+
+    #[test]
+    fn foreign_forward_chains_are_named_and_bentos_own_is_not() {
+        // Taken from a Fedora machine running firewalld and libvirt.
+        let json = r#"{"nftables":[
+          {"metainfo":{"version":"1.1.1"}},
+          {"chain":{"family":"ip","table":"libvirt_network","name":"forward",
+                    "handle":1,"type":"filter","hook":"forward","prio":0,"policy":"accept"}},
+          {"chain":{"family":"ip","table":"filter","name":"FORWARD",
+                    "handle":2,"type":"filter","hook":"forward","prio":0,"policy":"accept"}},
+          {"chain":{"family":"inet","table":"bento","name":"forward",
+                    "handle":3,"type":"filter","hook":"forward","prio":0,"policy":"drop"}},
+          {"chain":{"family":"inet","table":"bento","name":"output",
+                    "handle":4,"type":"filter","hook":"output","prio":0,"policy":"accept"}},
+          {"chain":{"family":"inet","table":"firewalld","name":"filter_FORWARD",
+                    "handle":5,"type":"filter","hook":"forward","prio":10,"policy":"accept"}}
+        ]}"#;
+        assert_eq!(
+            parse_forward_filters(json),
+            [
+                "inet firewalld filter_FORWARD",
+                "ip filter FORWARD",
+                "ip libvirt_network forward",
+            ],
+            "Bento's own forward chain must not be reported, and other tables must be"
+        );
+    }
+
+    #[test]
+    fn unreadable_chain_output_names_nothing_rather_than_failing() {
+        // The check is advice. It must never stop a machine applying its
+        // network just because the listing could not be read.
+        for text in ["", "not json", "{}", r#"{"nftables":{}}"#] {
+            assert!(parse_forward_filters(text).is_empty(), "{text:?}");
         }
     }
 

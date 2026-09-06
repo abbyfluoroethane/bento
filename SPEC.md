@@ -461,16 +461,26 @@ Use SQLite with write-ahead logging.
 | `users` | `id`, `name`, `email`, `oidc_subject`, `subnet`, `created_at` |
 | `ssh_keys` | `id`, `user_id`, `public_key`, `fingerprint`, `comment`, `created_at` |
 | `pairings` | `id`, `token_hash`, `public_key`, `fingerprint`, `comment`, `created_at`, `expires_at`, `linked_user_id` |
-| `hosts` | `id`, `name`, `libvirt_uri`, `created_at` |
+| `hosts` | `id`, `machine_id`, `name`, `libvirt_uri`, `endpoint`, `underlay`, `enabled`, `placement`, `created_at` |
 | `images` | `name`, `url`, `kind`, `pinned_checksum`, `current_checksum` |
 | `image_versions` | `checksum`, `image_name`, `path`, `size`, `kind`, `source_digest`, `fetched_at` |
 | `image_source_versions` | `image_name`, `source_digest`, `checksum` |
-| `instances` | `uuid`, `name`, `owner_id`, `host_id`, `image_name`, `base_checksum`, `state`, `desired_state`, `address`, `mac`, `vcpu`, `memory`, `disk`, `nested`, `ksm`, `http_port`, `visibility`, `created_at`, `last_seen_at` |
+| `instances` | `uuid`, `name`, `owner_id`, `host_id`, `slot`, `image_name`, `base_checksum`, `state`, `desired_state`, `address`, `mac`, `vcpu`, `memory`, `disk`, `nested`, `ksm`, `http_port`, `visibility`, `created_at`, `last_seen_at` |
 | `shares` | `instance_uuid`, `user_id`, `created_at` |
 | `released_names` | `name`, `previous_owner_id`, `released_at` |
 | `tokens` | `id`, `user_id`, `hash`, `expires_at` |
+| `deployment` | `id`, `runner_prefix` |
+| `controller_lease` | `id`, `holder_id`, `epoch`, `expires_at` |
+| `runner_slots` | `slot`, `state`, `owner_host_id`, `ownership_epoch`, `source_host_id`, `destination_host_id`, `operation_id` |
+| `schema_migrations` | `version`, `name`, `applied_at` |
 
 The `uuid` column is the primary key of `instances`. The `name` column has a unique index. Section 7.2 gives the reason for the split.
+
+**The `hosts` table splits identity from name the same way.** The `machine_id` column holds the value systemd writes to `/etc/machine-id` at first boot. It has a unique index and it is the identity of the machine. The `name` column holds the hostname, which is a label. Do not key a host on the hostname the kernel reports: that is the transient hostname, and NetworkManager or a DHCP lease can change it while the machine stays the same. Bento did key on it once, and each change made a second row for the one machine, which spread the instances of that machine across rows that all described it. The column is nullable for one reason: a database written before the column existed carries a row that no machine has claimed, and the machine claims it at the next startup. The `endpoint` column says where the controller reaches that machine's runner service, and `underlay` says where other machines send that machine's guest traffic. They are separate because management and guest data need not share a path: a deployment can keep management on the LAN and carry guest traffic over a tunnel by changing one of them (MULTI-NODE 8.5). A machine with no `underlay` receives no route from anyone, so it is left unrouted rather than reached at a guessed address.
+
+**Three tables serve more than one host.** Version 1 has one host and uses them at their smallest setting, which keeps one code path for both shapes. `deployment` holds the runner prefix, which says how many slots a user `/24` divides into; a `/24` is one slot, which is what version 1 is. `runner_slots` says which host owns each slot; version 1 has slot 0, owned by its one host. `controller_lease` holds the lease and its epoch, and only its holder may drive a host. MULTI-NODE.md sections 7, 11, and 16 give the full model. Triggers on `instances` refuse a row whose `slot` is owned by a different host. Placement chooses the machine for a new instance when more than one could take it, and the address it allocates comes from a slot that machine owns, so the address alone says where the instance runs. Acting on an instance follows the same rule: starting, stopping, rebooting, renaming, and removing all reach the machine that holds the domain. A deployment with no slot at all takes slot 0 for the first machine that starts, because every address belongs to slot 0 at a `/24` and only one machine can be running them; without that a new deployment could place nothing, since allocation asks which slot the machine owns. Any existing slot row stops it, so a second machine never claims a slot this way.
+
+`schema.sql` is the baseline that creates a new database. Every change after that baseline is one numbered migration, applied in order and recorded in `schema_migrations`. A migration inspects before it mutates, and it runs in one transaction with the row that records it, so a failure records nothing. Never edit a migration that has shipped; add the next number.
 
 **The `shares` table keys on a UUID, not on a name.** A share keyed on a name remains after a delete and grants access to the next instance with that name.
 
@@ -499,6 +509,7 @@ Bento does these three things instead:
 1. Store the database at one documented path. The default path is `/var/lib/bento/bento.db`. Print this path in the startup log and show it on the dashboard.
 2. Give the operator a "Download database" control on the dashboard and a `dump-db` subcommand. Both write a consistent copy with the SQLite backup API. Do not copy the file directly. A write-ahead log makes a direct copy unsafe.
 3. Document that the instance disks live in the storage directory. The operator backs up that directory. An overlay is useless without its backing file, so the backup must also cover the image directory.
+4. Give the operator a `restore-db` subcommand that puts a copy back. It copies the current database aside before it replaces it, so a restore of the wrong file is still recoverable. It then applies the schema migrations the copy has not had, so a copy taken on an older build comes back usable. The operator stops the three units first: a restore replaces the whole database and does not coordinate with a running writer.
 
 ## 13. Identity
 
@@ -624,7 +635,9 @@ A table is the primary view. This tool manages a list of machines, and a user co
 
 The instance table shows the name, the observed state, the address, the image, the visibility, and the last use time. Sort by name by default.
 
-Show what the user has provisioned above the table: machines, vCPU, memory, and disk, each against the host's total. There are no per-user limits, only the host capacity of section 6.1.
+Show what the user has provisioned above the table: machines, vCPU, memory, and disk. There are no per-user limits, only the host capacity of section 6.1. Show each against the host's total when the deployment has one host. With more than one host, show the figure alone: capacity belongs to a host, and a total added across hosts names a host that does not exist (MULTI-NODE 20). The host cards below the table then carry the capacity, one host at a time.
+
+Show one card for each host: its processor chart, its memory chart, and its provisioning bars. A card counts only the instances that host holds. A host the controller cannot reach keeps its card, with the size it last reported and no new points.
 
 Every view needs three states beyond the normal one:
 

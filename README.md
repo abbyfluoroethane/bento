@@ -11,6 +11,7 @@ everything.
 it before you change anything. [MULTI-NODE.md](MULTI-NODE.md) is the
 proposed, not-yet-implemented design for more than one VM runner.
 [DEPLOYING.md](DEPLOYING.md) is the runbook for a new host.
+[KNOWN-ISSUES.md](KNOWN-ISSUES.md) lists what is broken and not yet fixed.
 
 ## Screenshots
 
@@ -60,8 +61,10 @@ bentod sshd     # SSH frontend and CLI: port 22
 
 `serve` owns the database. Back it up with `bentod dump-db`, never with a
 file copy, together with the image and storage directories (SPEC 12.1).
-`bentod reconcile` reports disagreements between libvirt and the database
-and changes nothing. `bentod images` lists the images.
+`bentod restore-db` puts a copy back, with the units stopped; it keeps a
+copy of the database it replaces. `bentod reconcile` reports
+disagreements between libvirt and the database and changes nothing.
+`bentod images` lists the images.
 
 **`bento-monitor`** is a terminal screen for the same work. It installs
 the binary, the directories, the configuration, and the units. It starts,

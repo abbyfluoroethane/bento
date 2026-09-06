@@ -16,5 +16,9 @@ bento-hypervisor = { workspace = true }
 bento-types = { workspace = true }
 libc = { workspace = true }
 ratatui = { workspace = true }
+time = { workspace = true }
 tokio = { workspace = true }
 url = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

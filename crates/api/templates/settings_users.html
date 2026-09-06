@@ -9,9 +9,9 @@
     <section>
       <dl class="kv">
         <div><dt>VMs</dt><dd>{{ account.instances }}</dd></div>
-        <div><dt>Provisioned vCPU</dt><dd>{{ account.vcpu }} / {{ host_cpu_count }}</dd></div>
-        <div><dt>Provisioned memory</dt><dd>{{ account.memory_mib|mib }} / {{ host_memory_mib|mib }}</dd></div>
-        <div><dt>Provisioned disk</dt><dd>{{ account.disk_gib }} GiB / {{ host_storage_gib }} GiB</dd></div>
+        <div><dt>Provisioned vCPU</dt><dd>{{ account.vcpu }}{% if host_cpu_count %} / {{ host_cpu_count }}{% endif %}</dd></div>
+        <div><dt>Provisioned memory</dt><dd>{{ account.memory_mib|mib }}{% if host_memory_mib %} / {{ host_memory_mib|mib }}{% endif %}</dd></div>
+        <div><dt>Provisioned disk</dt><dd>{{ account.disk_gib }} GiB{% if host_storage_gib %} / {{ host_storage_gib }} GiB{% endif %}</dd></div>
         <div><dt>CPU usage {% if account.placeholder %}<span class="badge sample" data-variant="outline">sample data</span>{% endif %}</dt><dd>{{ account.cpu_pct|pct }}</dd></div>
         <div><dt>Memory usage {% if account.placeholder %}<span class="badge sample" data-variant="outline">sample data</span>{% endif %}</dt><dd>{{ account.memory_used_mib|mib }}</dd></div>
         <div><dt>Disk usage {% if account.placeholder %}<span class="badge sample" data-variant="outline">sample data</span>{% endif %}</dt><dd>{{ account.storage_used_gib|gib }}</dd></div>

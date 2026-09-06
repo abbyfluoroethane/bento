@@ -167,6 +167,7 @@ fn running_instance(name: &str, visibility: Visibility) -> Instance {
         visibility,
         created_at: OffsetDateTime::UNIX_EPOCH,
         last_seen_at: None,
+        slot: None,
     }
 }
 

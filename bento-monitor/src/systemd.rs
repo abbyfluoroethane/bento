@@ -1,4 +1,4 @@
-//! The three systemd units of a Bento host (DEPLOYING.md section 6):
+//! The systemd units of a Bento host (DEPLOYING.md section 6):
 //! their unit-file text, the `systemctl show` reader, and the commands
 //! that act on them.
 
@@ -9,6 +9,7 @@ use crate::run::Cmd;
 pub const SERVE: &str = "bentod-serve.service";
 pub const PROXY: &str = "bentod-proxy.service";
 pub const SSHD: &str = "bentod-sshd.service";
+pub const RUNNER: &str = "bentod-runner.service";
 
 /// One unit of the deployment. The binary holds every process as a
 /// subcommand (SPEC 4), so the units differ only in that subcommand, in
@@ -26,7 +27,7 @@ pub struct Unit {
 
 /// `bentod-serve` owns the database, so it is first in this order and the
 /// other two order themselves after it.
-pub const UNITS: [Unit; 3] = [
+pub const UNITS: [Unit; 4] = [
     Unit {
         name: SERVE,
         subcommand: "serve",
@@ -50,6 +51,16 @@ pub const UNITS: [Unit; 3] = [
         subcommand: "sshd",
         description: "Bento SSH frontend",
         after: &[SERVE],
+        service_lines: &[],
+    },
+    Unit {
+        name: RUNNER,
+        subcommand: "runner",
+        description: "Bento runner service",
+        // It waits for nothing else Bento runs. A machine that only holds
+        // guests runs this unit alone: the control plane, the proxy, and
+        // the SSH frontend live on the controller (MULTI-NODE 19).
+        after: &[],
         service_lines: &[],
     },
 ];

@@ -173,6 +173,8 @@ pub struct Point {
 /// Host-wide resource figures for the dashboard's front page.
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct HostMetrics {
+    pub host_id: i64,
+    pub host_name: String,
     /// CPU busy time as a percentage of all cores, oldest first.
     pub cpu_pct: Vec<Point>,
     /// Memory in use on the host, oldest first.
@@ -214,7 +216,10 @@ pub struct UserMetrics {
 /// the tests and the dashboard preview server.
 #[async_trait]
 pub trait Metrics: Send + Sync + 'static {
-    async fn host(&self, window: std::time::Duration) -> Result<HostMetrics, BoxError>;
+    /// Returns one series per runner, sorted by host ID (MULTI-NODE 20).
+    /// Bento deliberately returns no deployment total. Memory on machines
+    /// that cannot share it does not describe a machine that exists.
+    async fn hosts(&self, window: std::time::Duration) -> Result<Vec<HostMetrics>, BoxError>;
     async fn instance(
         &self,
         uuid: &str,
