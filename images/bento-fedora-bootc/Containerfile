@@ -1,0 +1,106 @@
+# syntax=docker/dockerfile:1
+#
+# Bento's Fedora 44 bootc image: a development box that Bento can convert
+# to a qcow2 and boot as an ordinary instance.
+#
+# Three of the packages below are not conveniences. `validate_bootc_contract`
+# in crates/images/src/fetch.rs refuses an OCI image that lacks a kernel,
+# `cloud-init` with the NoCloud data source, or `qemu-guest-agent`. The base
+# image supplies the kernel; this file supplies the other two. Bento cannot
+# install them on first boot, because a bootc `/usr` is read-only.
+FROM quay.io/fedora/fedora-bootc:44
+
+# Fedora 44 has no unversioned `nodejs` or `npm` package — only nodejs20,
+# nodejs22, and nodejs24. Several of them provide the bare `npm` capability,
+# so name the stream instead of letting dnf pick a provider for us.
+ARG NODEJS_STREAM=nodejs24
+
+# The fingerprint Anthropic publishes for the Claude Code signing key. It is
+# checked below, so a substituted key fails the build instead of being
+# imported.
+ARG CLAUDE_CODE_KEY_FPR=31DDDE24DDFAB679F42D7BD2BAA929FF1A7ECACE
+
+RUN <<EORUN
+set -xeuo pipefail
+
+dnf -y install curl gnupg2
+
+# --- Claude Code repository ------------------------------------------------
+# `dnf install` would import this key on its own, but it would import
+# whatever key the endpoint served. Pin the fingerprint so that gpgcheck
+# means something.
+curl -fsSL https://downloads.claude.ai/keys/claude-code.asc -o /tmp/claude-code.asc
+
+# gpg insists on a writable home directory, and the base image has no
+# /root for it to fall back to. Give it a scratch one.
+GNUPGHOME="$(mktemp -d)"
+export GNUPGHOME
+gpg --show-keys --with-colons /tmp/claude-code.asc \
+  | awk -F: '$1 == "fpr" { print $10 }' \
+  | grep -qx "${CLAUDE_CODE_KEY_FPR}"
+rpm --import /tmp/claude-code.asc
+rm -rf /tmp/claude-code.asc "${GNUPGHOME}"
+unset GNUPGHOME
+
+cat > /etc/yum.repos.d/claude-code.repo <<'EOF'
+[claude-code]
+name=Claude Code
+baseurl=https://downloads.claude.ai/claude-code/rpm/stable
+enabled=1
+gpgcheck=1
+gpgkey=https://downloads.claude.ai/keys/claude-code.asc
+EOF
+
+# --- The Bento image contract ---------------------------------------------
+# cloud-init ships a systemd generator, so it enables itself at boot once
+# ds-identify finds the seed ISO. Nothing here needs to enable it, and hand
+# written symlinks would fight the generator.
+#
+# Bento's seed runs `systemctl enable --now qemu-guest-agent` itself, and
+# knows not to try to install the package for an OCI image.
+dnf -y install cloud-init qemu-guest-agent
+
+# --- Toolchain -------------------------------------------------------------
+# @c-development is the real build-essential equivalent: gcc, gcc-c++, make,
+# glibc-devel, autoconf, automake, binutils, bison, flex, libtool, pkgconf.
+# @development-tools is a different set despite the name — git, patch,
+# subversion, diffutils — and is worth having alongside it.
+dnf -y install @c-development @development-tools
+
+dnf -y install \
+    git \
+    python3 \
+    python3-devel \
+    python3-pip \
+    "${NODEJS_STREAM}" \
+    "${NODEJS_STREAM}-npm"
+
+dnf -y install claude-code
+
+dnf clean all
+
+# Content under /var is written into the disk when image-builder creates it
+# and is never refreshed by a later image. Cache left here would be baked
+# into every instance for the life of the image version.
+rm -rf /var/cache/* /var/log/*
+
+# Package scriptlets leave state in /run and /tmp, which are runtime-only
+# directories on a booted system. bootc lints for it. The builder's own
+# bind mounts also live under /run and refuse to be removed; they are not
+# part of the committed layer, so ignore the failures rather than listing
+# the removable paths and having that list rot.
+rm -rf /run/* /tmp/* 2>/dev/null || :
+
+# Catches the bootc image-spec violations that Bento's own preflight does
+# not look for, including a missing or duplicated kernel.
+#
+# var-tmpfiles is skipped because it walks into /sys and dies on
+# /sys/kernel/security/ima/binary_runtime_measurements when the build is
+# unprivileged, which is an artefact of the builder and not of this image.
+# Drop the --skip if you only ever build rootful.
+bootc container lint --skip var-tmpfiles
+EORUN
+
+# bootc ignores CMD at boot and runs systemd as PID 1. It is set by
+# convention, and so that `podman run` on this image is not surprising.
+CMD ["/sbin/init"]
