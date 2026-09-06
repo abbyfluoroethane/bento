@@ -69,6 +69,9 @@ async fn serve_inner(app: &App) -> Result<()> {
         .await
         .map_err(|error| anyhow::anyhow!("nftables: {error}"))?;
 
+    // The sampler holds the series the dashboard charts read (SPEC
+    // 14.4). The router answers from it, and the task below fills it.
+    let sampler = Arc::new(crate::metrics::Sampler::default());
     let router = control_plane_router(
         app,
         manager.clone(),
@@ -76,6 +79,7 @@ async fn serve_inner(app: &App) -> Result<()> {
         firewall.clone(),
         frontend_public,
         host.id,
+        sampler.clone(),
     )
     .await?;
     let address =
@@ -105,6 +109,28 @@ async fn serve_inner(app: &App) -> Result<()> {
             }
         }
     });
+    let sampling = tokio::spawn({
+        let task = crate::metrics::SamplerTask {
+            sampler: sampler.clone(),
+            store: app.store.clone(),
+            manager: manager.clone(),
+            domains: hypervisor.clone(),
+            storage_dir: app.cfg.storage_dir.clone(),
+        };
+        let cancellation = cancellation.clone();
+        async move {
+            let mut ticker = tokio::time::interval(crate::metrics::INTERVAL);
+            // A tick that arrives late must not start a burst of catch-up
+            // readings: every one of them would measure the same instant.
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                tokio::select! {
+                    _ = cancellation.cancelled() => break,
+                    _ = ticker.tick() => task.tick().await,
+                }
+            }
+        }
+    });
     let convergence = tokio::spawn({
         let store = app.store.clone();
         let plan = app.plan;
@@ -128,6 +154,7 @@ async fn serve_inner(app: &App) -> Result<()> {
     let _ = restore.await;
     let _ = poller.await;
     let _ = convergence.await;
+    let _ = sampling.await;
     drop(manager);
     drop(firewall);
     hypervisor.close().await?;
@@ -290,6 +317,7 @@ async fn control_plane_router(
     firewall: Arc<Firewall>,
     frontend_key: String,
     host_id: i64,
+    sampler: Arc<crate::metrics::Sampler>,
 ) -> Result<Router> {
     let mut auth = bento_auth::Service::new(
         &app.cfg.base_domain,
@@ -341,9 +369,7 @@ async fn control_plane_router(
         is_operator: Some(Arc::new(move |user| operators.contains(&user.name))),
         image_admin: Some(Arc::new(RuntimeImages(app.image_store()))),
         db_path: app.cfg.db_path.clone(),
-        // Resource charts run on generated figures until the sampler
-        // lands (see the repository issues); every page says so.
-        metrics: Arc::new(bento_api::PlaceholderMetrics),
+        metrics: sampler,
         base_domain: app.cfg.base_domain.clone(),
         defaults: bento_api::CreateDefaults {
             vcpu: app.cfg.defaults.vcpu,

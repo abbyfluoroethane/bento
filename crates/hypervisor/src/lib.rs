@@ -14,7 +14,8 @@ pub use check::{
     nested_enabled,
 };
 pub use client::{
-    AutostartClearer, Client, Definer, DomainInfo, Hypervisor, NetworkManager, StopResult,
+    AutostartClearer, Client, Definer, DomainInfo, DomainSample, DomainSampler, Hypervisor,
+    NetworkManager, StopResult,
 };
 pub use error::{ERR_NO_DOMAIN, ERR_NO_NETWORK, Error, LibvirtError};
 pub use fake::{Fake, FakeDomain};

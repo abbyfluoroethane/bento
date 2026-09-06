@@ -3,8 +3,9 @@
 //! chart looks alive and stays continuous across polls, while every
 //! figure is flagged `placeholder` so the page can say so.
 //!
-//! The real sampler is tracked in the repository issues; when it lands it
-//! implements [`Metrics`] and replaces this in `bentod`.
+//! `bentod` wires the real sampler, which reads the host and libvirt.
+//! This one stays for the tests and for the dashboard preview server,
+//! where there is no host to read.
 
 use std::time::Duration;
 

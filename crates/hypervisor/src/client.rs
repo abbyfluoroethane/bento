@@ -29,6 +29,18 @@ pub(crate) struct Network {
     pub(crate) uuid: [u8; 16],
 }
 
+/// One reading of `remote_domain_get_info_ret` (libvirt procedure 35).
+/// Memory is in KiB and processor time is cumulative nanoseconds since
+/// the domain started.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct DomainStats {
+    pub(crate) state: u32,
+    pub(crate) max_mem_kib: u64,
+    pub(crate) memory_kib: u64,
+    pub(crate) vcpus: u32,
+    pub(crate) cpu_time_ns: u64,
+}
+
 #[async_trait]
 pub(crate) trait LibvirtApi: Send + Sync {
     async fn domain_define_xml(&self, xml: &str) -> Result<Domain, ApiError>;
@@ -40,6 +52,13 @@ pub(crate) trait LibvirtApi: Send + Sync {
     async fn domain_set_autostart(&self, domain: &Domain, value: i32) -> Result<(), ApiError>;
     async fn domain_lookup_by_name(&self, name: &str) -> Result<Domain, ApiError>;
     async fn domain_get_state(&self, domain: &Domain, flags: u32) -> Result<(i32, i32), ApiError>;
+    async fn domain_get_info(&self, domain: &Domain) -> Result<DomainStats, ApiError>;
+    async fn domain_memory_stats(
+        &self,
+        domain: &Domain,
+        max_stats: u32,
+        flags: u32,
+    ) -> Result<Vec<(i32, u64)>, ApiError>;
     async fn connect_list_all_domains(
         &self,
         need_results: i32,
@@ -108,6 +127,31 @@ pub trait Hypervisor: Send + Sync {
     async fn list(&self) -> Result<Vec<DomainInfo>, Error>;
     /// Reads one domain's observed state.
     async fn state(&self, name: &str) -> Result<State, Error>;
+}
+
+/// One reading of what a domain is using, for the dashboard charts
+/// (SPEC 14.4).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DomainSample {
+    /// Cumulative processor time since the domain started, in
+    /// nanoseconds. A percentage needs two readings and the time
+    /// between them.
+    pub cpu_time_ns: u64,
+    /// Virtual processors, the divisor that turns processor time into a
+    /// share of the machine rather than of one core.
+    pub vcpus: u32,
+    /// Host memory really backing the guest, in KiB. This is the
+    /// `rss` of the QEMU process, which libvirt reports whether or not
+    /// the guest balloon driver answers. `None` when the domain does
+    /// not report it.
+    pub rss_kib: Option<u64>,
+}
+
+/// Optional capability for reading what a domain is using (SPEC 14.4).
+#[async_trait]
+pub trait DomainSampler: Send + Sync {
+    /// Reads one domain. A domain that is not running has no sample.
+    async fn sample(&self, name: &str) -> Result<Option<DomainSample>, Error>;
 }
 
 /// Optional capability for replacing persistent domain XML.
@@ -356,6 +400,48 @@ impl Hypervisor for Client {
     }
 }
 
+/// `VIR_DOMAIN_MEMORY_STAT_RSS`. See `libvirt-domain.h`.
+const MEMORY_STAT_RSS: i32 = 7;
+/// Enough room for every tag libvirt defines today, with headroom.
+const MEMORY_STAT_MAX: u32 = 32;
+
+#[async_trait]
+impl DomainSampler for Client {
+    async fn sample(&self, name: &str) -> Result<Option<DomainSample>, Error> {
+        let domain = self.lookup(name).await?;
+        let info = self
+            .api
+            .domain_get_info(&domain)
+            .await
+            .map_err(|error| operation_error("read domain info", error))?;
+        // Libvirt state 1 is running. Anything else has no processor
+        // time worth a reading, and asking a stopped domain for memory
+        // statistics is an error rather than an empty answer.
+        if info.state != 1 {
+            return Ok(None);
+        }
+        // A domain that answers no memory statistics is not a failure.
+        // It means the guest driver has not reported, so the chart shows
+        // processor time alone.
+        let rss_kib = match self
+            .api
+            .domain_memory_stats(&domain, MEMORY_STAT_MAX, 0)
+            .await
+        {
+            Ok(stats) => stats
+                .into_iter()
+                .find(|(tag, _)| *tag == MEMORY_STAT_RSS)
+                .map(|(_, value)| value),
+            Err(_) => None,
+        };
+        Ok(Some(DomainSample {
+            cpu_time_ns: info.cpu_time_ns,
+            vcpus: info.vcpus,
+            rss_kib,
+        }))
+    }
+}
+
 #[async_trait]
 impl Definer for Client {
     async fn define(&self, xml: &str) -> Result<(), Error> {
@@ -492,6 +578,10 @@ mod tests {
         net_calls: Vec<String>,
         net_err_on: HashMap<String, InjectedError>,
         define_xml: String,
+        /// What the fake answers for procedures 35 and 159. `None` for
+        /// the memory stats models a guest whose driver never reported.
+        cpu_time_ns: u64,
+        rss_kib: Option<u64>,
     }
 
     impl Default for FakeApiInner {
@@ -508,6 +598,8 @@ mod tests {
                 net_calls: Vec::new(),
                 net_err_on: HashMap::new(),
                 define_xml: String::new(),
+                cpu_time_ns: 1_000_000_000,
+                rss_kib: Some(512 * 1024),
             }
         }
     }
@@ -700,6 +792,46 @@ mod tests {
             Ok((state, 0))
         }
 
+        async fn domain_get_info(&self, domain: &Domain) -> Result<DomainStats, ApiError> {
+            let mut inner = self.lock();
+            Self::call(&mut inner, "info")?;
+            let state = inner
+                .domains
+                .get(&domain.name)
+                .ok_or_else(|| ApiError::Protocol(format!("no such domain {:?}", domain.name)))?
+                .state;
+            Ok(DomainStats {
+                state: state as u32,
+                max_mem_kib: 2 * 1024 * 1024,
+                memory_kib: 2 * 1024 * 1024,
+                vcpus: 2,
+                cpu_time_ns: inner.cpu_time_ns,
+            })
+        }
+
+        async fn domain_memory_stats(
+            &self,
+            domain: &Domain,
+            _max_stats: u32,
+            _flags: u32,
+        ) -> Result<Vec<(i32, u64)>, ApiError> {
+            let mut inner = self.lock();
+            Self::call(&mut inner, "memstats")?;
+            if !inner.domains.contains_key(&domain.name) {
+                return Err(ApiError::Protocol(format!(
+                    "no such domain {:?}",
+                    domain.name
+                )));
+            }
+            // A real answer carries tags the caller does not want, so the
+            // fake does too.
+            let mut stats = vec![(4_i32, 900_u64), (6, 2 * 1024 * 1024)];
+            if let Some(rss) = inner.rss_kib {
+                stats.push((MEMORY_STAT_RSS, rss));
+            }
+            Ok(stats)
+        }
+
         async fn connect_list_all_domains(
             &self,
             _need_results: i32,
@@ -811,6 +943,55 @@ mod tests {
         let mut client = Client::new(api);
         client.sleeper = sleeper.clone();
         (client, sleeper)
+    }
+
+    #[tokio::test]
+    async fn sampler_reads_a_running_domain() {
+        let api = Arc::new(FakeApi::default());
+        api.add("web", DOMAIN_RUNNING);
+        api.lock().cpu_time_ns = 42_000_000_000;
+        api.lock().rss_kib = Some(180_464);
+        let (client, _) = test_client(api.clone());
+
+        let sample = client.sample("web").await.unwrap().expect("a sample");
+        assert_eq!(sample.cpu_time_ns, 42_000_000_000);
+        assert_eq!(sample.vcpus, 2);
+        // The RSS tag is picked out of an answer that carries others.
+        assert_eq!(sample.rss_kib, Some(180_464));
+    }
+
+    #[tokio::test]
+    async fn sampler_skips_a_domain_that_is_not_running() {
+        let api = Arc::new(FakeApi::default());
+        api.add("web", DOMAIN_SHUTOFF);
+        let (client, _) = test_client(api.clone());
+        assert_eq!(client.sample("web").await.unwrap(), None);
+        // A stopped domain is never asked for memory statistics.
+        assert!(!api.lock().calls.iter().any(|call| call == "memstats"));
+    }
+
+    #[tokio::test]
+    async fn a_guest_that_reports_no_memory_still_yields_processor_time() {
+        // The balloon driver is absent or has never pushed statistics.
+        // Processor time comes from the host either way, so the sample
+        // is still worth having (SPEC 14.4).
+        let api = Arc::new(FakeApi::default());
+        api.add("web", DOMAIN_RUNNING);
+        api.lock().rss_kib = None;
+        let (client, _) = test_client(api.clone());
+        let sample = client.sample("web").await.unwrap().expect("a sample");
+        assert_eq!(sample.rss_kib, None);
+        assert!(sample.cpu_time_ns > 0);
+    }
+
+    #[tokio::test]
+    async fn a_memory_stats_failure_does_not_lose_the_whole_sample() {
+        let api = Arc::new(FakeApi::default());
+        api.add("web", DOMAIN_RUNNING);
+        api.fail("memstats", "not supported");
+        let (client, _) = test_client(api.clone());
+        let sample = client.sample("web").await.unwrap().expect("a sample");
+        assert_eq!(sample.rss_kib, None);
     }
 
     #[tokio::test]

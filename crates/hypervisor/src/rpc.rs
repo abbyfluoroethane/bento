@@ -6,7 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::Mutex;
 
-use crate::client::{Domain, LibvirtApi, Network, NetworkApi};
+use crate::client::{Domain, DomainStats, LibvirtApi, Network, NetworkApi};
 use crate::error::{ApiError, LibvirtError};
 use crate::xdr::{Reader, Writer};
 
@@ -27,6 +27,7 @@ const PROC_CONNECT_GET_CAPABILITIES: u32 = 7;
 const PROC_DOMAIN_CREATE: u32 = 9;
 const PROC_DOMAIN_DEFINE_XML: u32 = 11;
 const PROC_DOMAIN_DESTROY: u32 = 12;
+const PROC_DOMAIN_GET_INFO: u32 = 16;
 const PROC_DOMAIN_LOOKUP_BY_NAME: u32 = 23;
 const PROC_DOMAIN_REBOOT: u32 = 27;
 const PROC_DOMAIN_SET_AUTOSTART: u32 = 29;
@@ -37,6 +38,7 @@ const PROC_NETWORK_LOOKUP_BY_NAME: u32 = 46;
 const PROC_NETWORK_SET_AUTOSTART: u32 = 48;
 const PROC_AUTH_LIST: u32 = 66;
 const PROC_AUTH_POLKIT: u32 = 70;
+const PROC_DOMAIN_MEMORY_STATS: u32 = 159;
 const PROC_NETWORK_IS_ACTIVE: u32 = 152;
 const PROC_DOMAIN_GET_STATE: u32 = 212;
 const PROC_DOMAIN_UNDEFINE_FLAGS: u32 = 231;
@@ -315,6 +317,25 @@ fn encode_domain(writer: &mut Writer, domain: &Domain) -> Result<(), ApiError> {
     Ok(())
 }
 
+fn decode_domain_stats(reader: &mut Reader<'_>) -> Result<DomainStats, ApiError> {
+    Ok(DomainStats {
+        state: reader.u32()?,
+        max_mem_kib: reader.u64()?,
+        memory_kib: reader.u64()?,
+        vcpus: reader.u32()?,
+        cpu_time_ns: reader.u64()?,
+    })
+}
+
+fn decode_memory_stats(reader: &mut Reader<'_>) -> Result<Vec<(i32, u64)>, ApiError> {
+    let count = reader.array_len()?;
+    let mut stats = Vec::with_capacity(count);
+    for _ in 0..count {
+        stats.push((reader.i32()?, reader.u64()?));
+    }
+    Ok(stats)
+}
+
 fn decode_domain(reader: &mut Reader<'_>) -> Result<Domain, ApiError> {
     Ok(Domain {
         name: reader.string()?,
@@ -435,6 +456,48 @@ impl LibvirtApi for RpcApi {
         Ok(result)
     }
 
+    /// `remote_domain_get_info_ret` is five fixed fields. XDR has no
+    /// type narrower than four bytes, so `state` and `nr_virt_cpu` each
+    /// occupy a whole word even though libvirt declares them as a char
+    /// and a short.
+    async fn domain_get_info(&self, domain: &Domain) -> Result<DomainStats, ApiError> {
+        let mut writer = Writer::new();
+        encode_domain(&mut writer, domain)?;
+        let payload = self
+            .transport
+            .request(PROC_DOMAIN_GET_INFO, writer.into_inner())
+            .await?;
+        let mut reader = Reader::new(&payload);
+        let stats = decode_domain_stats(&mut reader)?;
+        reader.finish()?;
+        Ok(stats)
+    }
+
+    /// `remote_domain_memory_stats_ret` is a counted array of
+    /// `{ int tag; unsigned hyper val; }`. The tags are the
+    /// `VIR_DOMAIN_MEMORY_STAT_*` values; the caller picks the ones it
+    /// wants and ignores the rest, because which tags a domain answers
+    /// with depends on the guest.
+    async fn domain_memory_stats(
+        &self,
+        domain: &Domain,
+        max_stats: u32,
+        flags: u32,
+    ) -> Result<Vec<(i32, u64)>, ApiError> {
+        let mut writer = Writer::new();
+        encode_domain(&mut writer, domain)?;
+        writer.u32(max_stats);
+        writer.u32(flags);
+        let payload = self
+            .transport
+            .request(PROC_DOMAIN_MEMORY_STATS, writer.into_inner())
+            .await?;
+        let mut reader = Reader::new(&payload);
+        let stats = decode_memory_stats(&mut reader)?;
+        reader.finish()?;
+        Ok(stats)
+    }
+
     async fn connect_list_all_domains(
         &self,
         need_results: i32,
@@ -541,6 +604,55 @@ mod tests {
         }
     }
 
+    /// Builds the bytes libvirt would send, by hand, from the layout in
+    /// `remote_protocol.x`. XDR has no type narrower than four bytes, so
+    /// the `unsigned char` state and the `unsigned short` vcpu count each
+    /// take a whole word.
+    #[test]
+    fn domain_info_is_decoded_from_the_wire_layout() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1_u32.to_be_bytes()); // state: running
+        bytes.extend_from_slice(&2_097_152_u64.to_be_bytes()); // maxMem KiB
+        bytes.extend_from_slice(&1_048_576_u64.to_be_bytes()); // memory KiB
+        bytes.extend_from_slice(&4_u32.to_be_bytes()); // nrVirtCpu
+        bytes.extend_from_slice(&123_456_789_u64.to_be_bytes()); // cpuTime ns
+        assert_eq!(bytes.len(), 32);
+
+        let mut reader = Reader::new(&bytes);
+        let stats = decode_domain_stats(&mut reader).unwrap();
+        reader.finish().unwrap();
+        assert_eq!(
+            stats,
+            DomainStats {
+                state: 1,
+                max_mem_kib: 2_097_152,
+                memory_kib: 1_048_576,
+                vcpus: 4,
+                cpu_time_ns: 123_456_789,
+            }
+        );
+    }
+
+    #[test]
+    fn memory_stats_decode_as_a_counted_array_of_tag_and_value() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&3_u32.to_be_bytes()); // array length
+        for (tag, value) in [(4_i32, 900_u64), (7, 180_464), (9, 1_787_457_032)] {
+            bytes.extend_from_slice(&tag.to_be_bytes());
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        let mut reader = Reader::new(&bytes);
+        let stats = decode_memory_stats(&mut reader).unwrap();
+        reader.finish().unwrap();
+        assert_eq!(stats, [(4, 900), (7, 180_464), (9, 1_787_457_032)]);
+
+        // An empty array is a normal answer from a guest that has not
+        // reported, not a protocol error.
+        let empty = 0_u32.to_be_bytes();
+        let mut reader = Reader::new(&empty);
+        assert!(decode_memory_stats(&mut reader).unwrap().is_empty());
+    }
+
     #[test]
     fn framing_round_trip() {
         let header = Header {
@@ -638,6 +750,32 @@ mod tests {
         assert!(capabilities.contains("<capabilities>"));
         let (domains, count) = api.connect_list_all_domains(1, 0).await.unwrap();
         assert_eq!(domains.len(), count as usize);
+
+        // Procedures 35 and 159 carry 64-bit fields, so a wrong field
+        // width desynchronizes the reply and nothing but a real daemon
+        // shows it. Both are read-only.
+        for domain in &domains {
+            let info = api.domain_get_info(domain).await.unwrap();
+            assert!(info.vcpus >= 1, "{:?} reports no vcpus", domain.name);
+            assert!(
+                info.max_mem_kib >= info.memory_kib,
+                "{:?} reports more memory than its maximum",
+                domain.name
+            );
+            // A running domain has spent processor time. State 1 is
+            // running; a stopped domain has none, and asking it for
+            // memory statistics is an error rather than an empty answer.
+            if info.state != 1 {
+                continue;
+            }
+            assert!(info.cpu_time_ns > 0, "{:?} has no cpu time", domain.name);
+            let stats = api.domain_memory_stats(domain, 32, 0).await.unwrap();
+            // Every tag libvirt defines today is below this. A decode
+            // that lost alignment produces enormous or negative tags.
+            for (tag, _) in &stats {
+                assert!((0..64).contains(tag), "{:?} decoded tag {tag}", domain.name);
+            }
+        }
         api.close().await.unwrap();
     }
 }

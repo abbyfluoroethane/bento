@@ -88,6 +88,12 @@ impl<'a> Reader<'a> {
         Ok(i32::from_be_bytes(bytes))
     }
 
+    /// XDR calls this `unsigned hyper`: eight bytes, big endian.
+    pub(crate) fn u64(&mut self) -> Result<u64, ApiError> {
+        let bytes = self.take(8)?;
+        Ok(u64::from_be_bytes(bytes.try_into().expect("8 bytes")))
+    }
+
     pub(crate) fn fixed_opaque<const N: usize>(&mut self) -> Result<[u8; N], ApiError> {
         let value: [u8; N] = self
             .take(N)?

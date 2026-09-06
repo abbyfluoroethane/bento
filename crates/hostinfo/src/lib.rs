@@ -1,9 +1,11 @@
-//! What the host has: memory and free space on a filesystem.
+//! What the host has: processor time, memory, and free space on a
+//! filesystem.
 //!
-//! Two callers read these numbers for different reasons. `bentod` reads
-//! them once at startup to build the ceiling that a create or a resize is
-//! checked against (SPEC 6.1). `bento-monitor` reads them every frame to
-//! draw the operator screen.
+//! Three callers read these numbers. `bentod` reads memory and the
+//! storage volume once at startup, to build the ceiling that a create or
+//! a resize is checked against (SPEC 6.1). The metrics sampler reads all
+//! of them every 30 seconds for the dashboard charts (SPEC 14.4).
+//! `bento-monitor` reads them every frame to draw the operator screen.
 //!
 //! The parsers take text so that a test can supply a host it does not
 //! have. Only the two `read_*` functions and [`disk_usage`] touch the
@@ -12,6 +14,54 @@
 use std::ffi::CString;
 use std::io;
 use std::path::Path;
+
+/// One reading of the aggregate processor counters of `/proc/stat`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CpuTimes {
+    pub total: u64,
+    pub idle: u64,
+}
+
+/// Reads the `cpu` line, the one that sums every core.
+pub fn parse_cpu(stat: &str) -> Option<CpuTimes> {
+    let line = stat.lines().find(|line| line.starts_with("cpu "))?;
+    let fields: Vec<u64> = line
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|field| field.parse().ok())
+        .collect();
+    if fields.len() < 5 {
+        return None;
+    }
+    // Fields 4 and 5 are idle and iowait. A processor waiting for a disk
+    // is not doing work, so both count as idle.
+    Some(CpuTimes {
+        total: fields.iter().sum(),
+        idle: fields[3] + fields[4],
+    })
+}
+
+/// The busy share between two readings, from 0.0 to 1.0. Returns `None`
+/// while no time has passed, which is the state of the first frame.
+pub fn busy_fraction(before: CpuTimes, after: CpuTimes) -> Option<f64> {
+    let total = after.total.checked_sub(before.total)?;
+    let idle = after.idle.checked_sub(before.idle)?;
+    if total == 0 {
+        return None;
+    }
+    Some((total.saturating_sub(idle) as f64 / total as f64).clamp(0.0, 1.0))
+}
+
+/// Reads `/proc/stat` from the host.
+pub fn read_cpu() -> io::Result<Option<CpuTimes>> {
+    Ok(parse_cpu(&std::fs::read_to_string("/proc/stat")?))
+}
+
+/// Logical processors on the host. This is the number a provisioned vCPU
+/// count is shown against (SPEC 6.1).
+pub fn cpu_count() -> usize {
+    std::thread::available_parallelism().map_or(0, |count| count.get())
+}
 
 /// Memory and swap, in bytes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -103,6 +153,33 @@ pub fn disk_usage(path: &Path) -> io::Result<Disk> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const STAT: &str = "cpu  100 0 50 800 50 0 0 0 0 0\ncpu0 50 0 25 400 25 0 0 0 0 0\nintr 1\n";
+
+    #[test]
+    fn the_aggregate_processor_line_counts_iowait_as_idle() {
+        let times = parse_cpu(STAT).expect("cpu line");
+        assert_eq!(times.total, 1000);
+        assert_eq!(times.idle, 850);
+    }
+
+    #[test]
+    fn the_busy_share_comes_from_the_difference_of_two_readings() {
+        let before = CpuTimes {
+            total: 1000,
+            idle: 850,
+        };
+        let after = CpuTimes {
+            total: 2000,
+            idle: 1600,
+        };
+        assert_eq!(busy_fraction(before, after), Some(0.25));
+        // Two identical readings measure nothing, rather than 0 percent.
+        assert_eq!(busy_fraction(after, after), None);
+        // Counters that went backwards, as they do after a suspend, are
+        // refused instead of wrapping into a huge share.
+        assert_eq!(busy_fraction(after, before), None);
+    }
 
     #[test]
     fn meminfo_reads_in_bytes() {

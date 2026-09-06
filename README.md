@@ -13,8 +13,8 @@ for a new host.
 
 ## Screenshots
 
-The dashboard, over demo data. The charts show sample data until the
-host sampler lands (issue #16).
+The dashboard, over demo data. The charts read the host and libvirt
+every 30 seconds.
 
 ![The front page: provisioned resources, the instance table, and host charts](docs/screenshots/dashboard.png)
 

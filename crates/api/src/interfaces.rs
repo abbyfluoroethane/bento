@@ -208,9 +208,10 @@ pub struct UserMetrics {
     pub placeholder: bool,
 }
 
-/// Resource measurements behind the dashboard charts. The binary wires a
-/// sampler; until one exists, [`crate::PlaceholderMetrics`] generates
-/// plausible figures so the pages can be built and reviewed.
+/// Resource measurements behind the dashboard charts (SPEC 14.1). The
+/// binary wires the sampler that reads the host and libvirt.
+/// [`crate::PlaceholderMetrics`] generates plausible figures instead, for
+/// the tests and the dashboard preview server.
 #[async_trait]
 pub trait Metrics: Send + Sync + 'static {
     async fn host(&self, window: std::time::Duration) -> Result<HostMetrics, BoxError>;

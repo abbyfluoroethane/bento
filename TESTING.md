@@ -40,6 +40,21 @@ Real, in every test:
 * bearer-token authentication, against the stored SHA-256 hash;
 * the whole lifecycle path: the host capacity check, address allocation,
   overlay, seed, domain definition, the state poller, rename, and delete;
+
+The metrics sampler (SPEC 14.1) needs no host. The deltas, the ring
+buffers, and the per-account totals all take readings as arguments, so
+the tests supply them.
+
+Two libvirt procedures cannot work that way, because only a real daemon
+shows a wrong field width. `real_daemon_read_only_codec_validation` in
+`crates/hypervisor` reads procedures 16 and 159 from the local
+`virtqemud`. It carries `#[ignore]`, so run it by hand:
+
+```
+sudo -E cargo test -p bento-hypervisor -- --ignored
+```
+
+It only reads. Run it after any change to the wire format.
 * the bootc conversion path: the order of the Podman steps, the flags each
   one carries, the build cache keyed on the OCI source digest, and the
   operator-only runtime addition to the allowlist;

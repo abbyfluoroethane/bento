@@ -5,6 +5,7 @@
 mod adapters;
 mod firewall;
 mod keys;
+mod metrics;
 mod ops;
 mod proxyd;
 mod serve;

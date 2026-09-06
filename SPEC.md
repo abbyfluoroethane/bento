@@ -564,9 +564,26 @@ token set for Basecoat is committed in `crates/dashboard/assets/css/app.css`
 (section 19): the upstream theme is a source, not a build input.
 
 Resource charts (host CPU, memory, and storage; per-instance vCPU,
-memory, and disk) read the `Metrics` interface in `crates/api`. Until the
-sampler exists the binary wires a placeholder that generates plausible
-series, and every chart drawn from it carries a "sample data" badge.
+memory, and disk) read the `Metrics` interface in `crates/api`. The
+binary wires a sampler that takes one reading every 30 seconds, which is
+the period the charts poll on.
+
+The readings come from three places. The host figures come from
+`/proc/stat`, `/proc/meminfo`, and the storage volume. The processor time
+and the memory of an instance come from libvirt, from procedures 16 and
+159. The disk figure of an instance is the real size of its overlay, not
+the virtual size that section 6.1 counts.
+
+Hold the series in memory, not in the database. The schema is one file
+with no migration step, and a chart of the last day is not worth a write
+every 30 seconds. A restart therefore empties the charts, and they refill
+as the readings arrive. A chart with no readings yet says so.
+
+**A figure that is generated rather than measured must say so.** The
+`Metrics` interface carries a `placeholder` flag, and every chart drawn
+from a flagged figure shows a "sample data" badge. The development
+placeholder that generates plausible series still exists for the tests
+and for the dashboard preview server.
 
 ### 14.2 Color
 

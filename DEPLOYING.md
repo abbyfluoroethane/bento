@@ -478,6 +478,29 @@ Two consequences are easy to miss:
 Raise `overcommit_ratio` to fit more memory than the host has, after
 reading the two conditions in SPEC 5.3.
 
+### The dashboard charts
+
+The charts read the host every 30 seconds: `/proc/stat` for processor
+time, `/proc/meminfo` for memory, and the storage volume for disk. The
+per-instance figures come from libvirt, and the disk figure of an
+instance is the real size of its overlay rather than the virtual size
+that the capacity check counts.
+
+The series live in memory. **A restart of `bentod-serve` empties every
+chart**, and they refill over the following hour. Nothing is lost that
+was not a picture.
+
+Two figures can be missing rather than wrong:
+
+- An instance that is not running has no processor or memory reading.
+- A guest whose balloon driver never reported has no memory reading, so
+  its memory chart stays empty while its processor chart fills. The
+  processor figure comes from the host, so it does not need the guest.
+
+A chart with no readings says "No samples yet." A chart drawn from
+generated figures carries a "sample data" badge; a deployed `bentod`
+never generates them.
+
 ### OIDC
 
 OIDC is how accounts are created, so `bentod serve` needs it configured
