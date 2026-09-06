@@ -110,8 +110,9 @@ impl Manager {
         Ok(())
     }
 
-    /// Changes vCPU, memory, disk, and nesting (SPEC 11.1). Only disk growth
-    /// is supported; quota is checked before any host mutation.
+    /// Changes vCPU, memory, disk, and nesting (SPEC 11.1). Only disk
+    /// growth is supported, and host capacity is checked before any host
+    /// mutation.
     pub async fn resize(&self, request: ResizeRequest) -> Result<ResizeResult> {
         let mut instance = self.store.instance(&request.uuid).await.map_err(external)?;
         if request.vcpu == 0 || request.memory_mib <= 0 || request.disk_gib <= 0 {
@@ -141,6 +142,7 @@ impl Manager {
                 request.memory_mib,
                 request.disk_gib,
                 request.nested,
+                self.capacity,
             )
             .await
             .map_err(external)?;

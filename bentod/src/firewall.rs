@@ -209,6 +209,7 @@ pub(crate) mod tests {
                     last_seen_at: None,
                 },
                 std::time::Duration::from_secs(1),
+                bento_types::Capacity::unbounded(),
             )
             .await
             .unwrap();

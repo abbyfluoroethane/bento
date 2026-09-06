@@ -12,7 +12,7 @@ use bento_hypervisor::{
     StopResult,
 };
 use bento_network::Plan;
-use bento_types::{DesiredState, Image, ImageKind, ImageVersion, Instance, State, User};
+use bento_types::{Capacity, DesiredState, Image, ImageKind, ImageVersion, Instance, State, User};
 use tempfile::TempDir;
 use time::macros::datetime;
 
@@ -33,6 +33,10 @@ struct StoreData {
     create_error: Option<String>,
     resize_error: Option<String>,
     rename_error: Option<String>,
+    /// The capacity the manager handed to the last create or resize. The
+    /// store is the layer that enforces it, so the manager's whole job
+    /// here is to pass its configured value through unchanged.
+    seen_capacity: Option<Capacity>,
 }
 
 #[derive(Default)]
@@ -92,8 +96,10 @@ impl Store for TestStore {
         &self,
         instance: Instance,
         _: Duration,
+        capacity: Capacity,
     ) -> std::result::Result<(), DynError> {
         let mut data = self.data();
+        data.seen_capacity = Some(capacity);
         data.mutations.push(format!("create {}", instance.name));
         if let Some(error) = &data.create_error {
             return Err(boxed(error));
@@ -183,8 +189,10 @@ impl Store for TestStore {
         memory: i64,
         disk: i64,
         nested: bool,
+        capacity: Capacity,
     ) -> std::result::Result<(), DynError> {
         let mut data = self.data();
+        data.seen_capacity = Some(capacity);
         data.mutations.push(format!("resize {uuid}"));
         if let Some(error) = &data.resize_error {
             return Err(boxed(error));
@@ -355,6 +363,13 @@ impl Sleep for TestSleep {
     }
 }
 
+/// A capacity no test instance comes near, so that only a test that
+/// looks for it notices it.
+const TEST_CAPACITY: Capacity = Capacity {
+    memory_mib: 262_144,
+    disk_gib: 4096,
+};
+
 struct Fixture {
     manager: Manager,
     fake: Arc<Fake>,
@@ -391,6 +406,7 @@ fn fixture(with_definer: bool, with_clearer: bool) -> Fixture {
         iso: Some(iso.clone()),
         resizer: Some(resizer.clone()),
         plan: Some(Plan::new("10.77.0.0/16").unwrap()),
+        capacity: TEST_CAPACITY,
         storage_dir: temp.path().to_path_buf(),
         logger: Some(log.clone()),
         nested_enabled: Some(Arc::new(|| (false, "kvm_intel nested is N".into()))),
@@ -578,14 +594,39 @@ async fn new_no_image_version() {
 }
 
 #[tokio::test]
-async fn new_quota_error_stops_everything() {
+async fn new_capacity_error_stops_everything() {
     let f = fixture(false, false);
     let owner = f.store.add_user(1, "a", "10.77.0.0/24");
     f.store.add_image(Some("aa"));
-    f.store.data().create_error = Some("quota exceeded".into());
+    f.store.data().create_error = Some("the host has no room".into());
     assert!(f.manager.create(request(owner, "web")).await.is_err());
     assert!(f.images.calls.lock().unwrap().is_empty());
     assert!(f.fake.calls().is_empty());
+}
+
+#[tokio::test]
+async fn create_and_resize_hand_the_store_the_configured_capacity() {
+    // The store runs the check inside its own transaction, so the only
+    // thing the manager can get wrong is the number it passes (SPEC 6.1).
+    let f = fixture(false, false);
+    let owner = f.store.add_user(1, "a", "10.77.0.0/24");
+    f.store.add_image(Some("aa"));
+    f.manager.create(request(owner, "web")).await.unwrap();
+    assert_eq!(f.store.data().seen_capacity, Some(TEST_CAPACITY));
+
+    f.store.data().seen_capacity = None;
+    let uuid = f.store.data().instances[0].uuid.clone();
+    f.manager
+        .resize(ResizeRequest {
+            uuid,
+            vcpu: 2,
+            memory_mib: 2048,
+            disk_gib: 20,
+            nested: false,
+        })
+        .await
+        .unwrap();
+    assert_eq!(f.store.data().seen_capacity, Some(TEST_CAPACITY));
 }
 
 #[tokio::test]
@@ -803,10 +844,10 @@ async fn resize_nested_rejected_when_host_off() {
 }
 
 #[tokio::test]
-async fn resize_quota_failure_changes_nothing() {
+async fn resize_capacity_failure_changes_nothing() {
     let f = fixture(false, false);
     let instance = setup(&f).await;
-    f.store.data().resize_error = Some("quota".into());
+    f.store.data().resize_error = Some("the host has no room".into());
     assert!(
         f.manager
             .resize(ResizeRequest {

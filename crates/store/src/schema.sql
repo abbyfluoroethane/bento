@@ -18,13 +18,11 @@ CREATE TABLE IF NOT EXISTS users (
     created_at   TEXT    NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS quotas (
-    user_id       INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
-    max_instances INTEGER NOT NULL,
-    max_vcpu      INTEGER NOT NULL,
-    max_memory    INTEGER NOT NULL, -- MiB
-    max_disk      INTEGER NOT NULL  -- GiB, virtual size (SPEC 19)
-);
+-- Bento had a per-user quota table here. Section 6.1 replaced it with a
+-- host capacity check, so the table holds nothing that any code reads.
+-- There is no migration tool, so this statement is how an existing
+-- database loses it. It is safe to run on a database that never had one.
+DROP TABLE IF EXISTS quotas;
 
 CREATE TABLE IF NOT EXISTS ssh_keys (
     id          INTEGER PRIMARY KEY,

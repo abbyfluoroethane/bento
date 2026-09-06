@@ -23,7 +23,6 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use bento_types::Quota;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
@@ -469,9 +468,10 @@ pinned_checksum = "sha256:{checksum}"
     )
 }
 
-/// Creates the account, its quota, and an API token, then closes the
-/// database so `bentod` owns it alone. Returns the token plaintext and
-/// the subnet the store allocated.
+/// Creates the account and an API token, then closes the database so
+/// `bentod` owns it alone. Returns the token plaintext and the subnet
+/// the store allocated. There is no quota to seed: the only ceiling is
+/// the host itself (SPEC 6.1).
 async fn seed_account(db_path: &Path) -> (String, String) {
     let store = bento_store::Store::open(db_path)
         .await
@@ -481,17 +481,6 @@ async fn seed_account(db_path: &Path) -> (String, String) {
         .register_user(USER_NAME, "tester@e2e.test", None, range)
         .await
         .expect("register user");
-    store
-        .set_quota(Quota {
-            user_id: user.id,
-            max_instances: 4,
-            max_vcpu: 8,
-            max_memory_mib: 8192,
-            max_disk_gib: 64,
-        })
-        .await
-        .expect("set quota");
-
     // The store keeps only the hash, so the plaintext exists here and
     // nowhere else (SPEC 13).
     let plaintext = format!("{}e2e-{}", bento_auth::TOKEN_PREFIX, std::process::id());

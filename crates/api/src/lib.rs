@@ -37,7 +37,7 @@ use axum::routing::{any, delete, get, post};
 #[cfg(test)]
 use bento_store::Usage;
 #[cfg(test)]
-use bento_types::{Instance, Quota, Share, SshKey, User, Visibility};
+use bento_types::{Instance, Share, SshKey, User, Visibility};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -125,20 +125,10 @@ struct ErrorBody {
     error: String,
     #[serde(default, skip_serializing_if = "is_zero")]
     cooldown_seconds: i64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    quota: Option<QuotaDetail>,
 }
 
 fn is_zero(value: &i64) -> bool {
     *value == 0
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct QuotaDetail {
-    limit: String,
-    used: i64,
-    requested: i64,
-    max: i64,
 }
 
 pub(crate) fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Response {
@@ -156,14 +146,14 @@ pub(crate) fn json_response<T: Serialize>(status: StatusCode, value: &T) -> Resp
 }
 
 /// The HTTP status and message an error maps to, shared by the JSON
-/// contract and the HTML pages. Structured details (quota, cooldown) are
-/// folded into the message; the JSON mapping keeps them separately.
+/// contract and the HTML pages. The cooldown detail is folded into the
+/// message here; the JSON mapping keeps it separately.
 pub(crate) fn error_parts(error: &BoxError) -> (StatusCode, String) {
     if let Some(store_error) = find_error::<StoreError>(error.as_ref()) {
         return match store_error {
             StoreError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             StoreError::NameTaken => (StatusCode::CONFLICT, "that name is taken".to_string()),
-            StoreError::Quota { .. } => (StatusCode::CONFLICT, store_error.to_string()),
+            StoreError::Capacity { .. } => (StatusCode::CONFLICT, store_error.to_string()),
             StoreError::NameCooldown { name, remaining } => (
                 StatusCode::CONFLICT,
                 format!(
@@ -185,7 +175,6 @@ pub(crate) fn error_response(status: StatusCode, message: impl Into<String>) -> 
         &ErrorBody {
             error: message.into(),
             cooldown_seconds: 0,
-            quota: None,
         },
     )
 }
@@ -211,25 +200,8 @@ pub(crate) fn mapped_error(error: BoxError) -> Response {
             StoreError::NameTaken => {
                 return error_response(StatusCode::CONFLICT, "that name is taken");
             }
-            StoreError::Quota {
-                limit,
-                used,
-                requested,
-                max,
-            } => {
-                return json_response(
-                    StatusCode::CONFLICT,
-                    &ErrorBody {
-                        error: store_error.to_string(),
-                        cooldown_seconds: 0,
-                        quota: Some(QuotaDetail {
-                            limit: limit.clone(),
-                            used: *used,
-                            requested: *requested,
-                            max: *max,
-                        }),
-                    },
-                );
+            StoreError::Capacity { .. } => {
+                return error_response(StatusCode::CONFLICT, store_error.to_string());
             }
             StoreError::NameCooldown { remaining, .. } => {
                 return json_response(
@@ -237,7 +209,6 @@ pub(crate) fn mapped_error(error: BoxError) -> Response {
                     &ErrorBody {
                         error: store_error.to_string(),
                         cooldown_seconds: remaining.as_secs() as i64,
-                        quota: None,
                     },
                 );
             }

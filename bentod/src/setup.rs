@@ -5,13 +5,14 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use bento_config::Config;
 use bento_hypervisor::Client;
 use bento_images::Store as ImageStore;
 use bento_lifecycle::Manager;
 use bento_network::Plan;
 use bento_store::Store;
+use bento_types::Capacity;
 use url::Url;
 
 use crate::adapters::{ImageDb, LifecycleImages, LifecycleStore};
@@ -69,6 +70,13 @@ impl App {
     pub(crate) fn manager(&self, hypervisor: Arc<Client>) -> Result<Arc<Manager>> {
         let dns = self.dns_addrs()?;
         let images = self.image_store();
+        let capacity = host_capacity(&self.cfg)?;
+        tracing::info!(
+            memory_mib = capacity.memory_mib,
+            disk_gib = capacity.disk_gib,
+            overcommit_ratio = self.cfg.overcommit_ratio,
+            "host capacity: the ceiling on create and resize (SPEC 6.1)"
+        );
         Ok(Arc::new(Manager::new(bento_lifecycle::Config {
             hypervisor: Some(hypervisor.clone()),
             definer: Some(hypervisor.clone()),
@@ -77,6 +85,7 @@ impl App {
             images: Some(Arc::new(LifecycleImages(images))),
             iso: Some(Arc::new(bento_cloudinit::Builder::default())),
             plan: Some(self.plan),
+            capacity,
             storage_dir: PathBuf::from(&self.cfg.storage_dir),
             name_cooldown: self.cfg.cooldown(),
             batch_size: self.cfg.restore_batch_size as usize,
@@ -95,6 +104,41 @@ impl App {
                     .with_context(|| format!("config dns {value:?} is not an IP address"))
             })
             .collect()
+    }
+}
+
+const MIB: u64 = 1024 * 1024;
+const GIB: u64 = 1024 * 1024 * 1024;
+
+/// The ceiling that a create or a resize is checked against (SPEC 6.1).
+///
+/// Memory is the host's own total times the operator's overcommit ratio
+/// (SPEC 5.3). Disk is the size of the volume that holds the overlays,
+/// against virtual disk size, so it is a worst case bound rather than a
+/// measurement of real use.
+///
+/// Both numbers are read once. Neither changes while `bentod` runs, and
+/// a failure to read either stops startup rather than silently leaving
+/// the host unbounded.
+fn host_capacity(cfg: &Config) -> Result<Capacity> {
+    let memory = bento_hostinfo::read_memory().context("read /proc/meminfo (SPEC 6.1)")?;
+    if memory.total == 0 {
+        bail!("/proc/meminfo carries no MemTotal, so the host memory ceiling is unknown");
+    }
+    let storage = bento_hostinfo::disk_usage(Path::new(&cfg.storage_dir))
+        .with_context(|| format!("read the storage volume at {}", cfg.storage_dir))?;
+    Ok(capacity_from(
+        memory.total,
+        storage.total,
+        cfg.overcommit_ratio,
+    ))
+}
+
+/// The arithmetic of [`host_capacity`], apart from the host it reads.
+fn capacity_from(memory_bytes: u64, storage_bytes: u64, overcommit_ratio: f64) -> Capacity {
+    Capacity {
+        memory_mib: ((memory_bytes / MIB) as f64 * overcommit_ratio) as i64,
+        disk_gib: (storage_bytes / GIB) as i64,
     }
 }
 
@@ -189,5 +233,43 @@ mod tests {
         assert_eq!(control_url(":8080"), "http://127.0.0.1:8080");
         assert_eq!(bind_host(":443"), "");
         assert_eq!(bind_host("192.0.2.1:443"), "192.0.2.1");
+    }
+
+    #[test]
+    fn capacity_applies_the_overcommit_ratio_to_memory_only() {
+        let memory = 64 * 1024 * MIB; // 64 GiB
+        let storage = 900 * GIB;
+
+        // The default ratio of 1.0 is the host as it is (SPEC 5.3).
+        assert_eq!(
+            capacity_from(memory, storage, 1.0),
+            Capacity {
+                memory_mib: 65_536,
+                disk_gib: 900,
+            }
+        );
+
+        // A higher ratio raises memory. Disk is never overcommitted: the
+        // ceiling is the volume, because a full volume stops every guest
+        // on the host at once.
+        assert_eq!(
+            capacity_from(memory, storage, 1.5),
+            Capacity {
+                memory_mib: 98_304,
+                disk_gib: 900,
+            }
+        );
+    }
+
+    #[test]
+    fn capacity_rounds_down_rather_than_promising_room() {
+        // A volume smaller than one GiB offers no whole GiB, and a
+        // ceiling of zero bounds nothing, so the host check would pass
+        // everything. `host_capacity` is the only caller and it runs on
+        // a real storage volume; this records the edge rather than
+        // claiming it is reachable.
+        let capacity = capacity_from(MIB * 3 / 2, GIB / 2, 1.0);
+        assert_eq!(capacity.memory_mib, 1);
+        assert_eq!(capacity.disk_gib, 0);
     }
 }

@@ -124,6 +124,7 @@ bentod/tests/e2e/       the end-to-end suite
 bento-monitor/          the operator's terminal screen
 crates/types            shared domain types
 crates/config           TOML configuration
+crates/hostinfo         host memory and filesystem readings
 crates/store            SQLite
 crates/hypervisor       libvirt XDR client
 crates/images           the image store and the bootc builder
@@ -219,7 +220,7 @@ Do not add these at all:
 * A C-library binding for libvirt, TLS, or SQLite beyond the bundled SQLite.
 * `aws-lc-rs` in any form.
 * A migration framework. The schema is one SQL file.
-* Per-user quotas. Issue #22 removes them.
+* Per-user quotas. Issue #22 removed them. The only ceiling is the host capacity of SPEC 6.1.
 
 ## 16. Principles
 

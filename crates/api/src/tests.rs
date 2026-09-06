@@ -11,7 +11,6 @@ use super::*;
 #[derive(Default)]
 pub(crate) struct FakeData {
     pub(crate) users: HashMap<i64, User>,
-    pub(crate) quotas: HashMap<i64, Quota>,
     pub(crate) instances: HashMap<String, Instance>,
     pub(crate) shares: HashMap<String, Vec<Share>>,
     pub(crate) keys: HashMap<i64, Vec<SshKey>>,
@@ -64,16 +63,6 @@ impl Store for FakeStore {
         let mut users: Vec<User> = self.data.lock().unwrap().users.values().cloned().collect();
         users.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(users)
-    }
-
-    async fn quota_for(&self, user_id: i64) -> Result<Quota, BoxError> {
-        self.data
-            .lock()
-            .unwrap()
-            .quotas
-            .get(&user_id)
-            .copied()
-            .ok_or_else(not_found_error)
     }
 
     async fn usage_for(&self, user_id: i64) -> Result<Usage, BoxError> {
@@ -226,7 +215,7 @@ impl Store for FakeStore {
 
 #[derive(Clone)]
 enum Failure {
-    Quota,
+    Capacity,
     Cooldown,
     NameTaken,
     Teapot,
@@ -253,11 +242,11 @@ impl FakeLifecycle {
 
     fn error(&self) -> Option<BoxError> {
         match self.failure.lock().unwrap().clone()? {
-            Failure::Quota => Some(Box::new(StoreError::Quota {
-                limit: "memory".to_string(),
+            Failure::Capacity => Some(Box::new(StoreError::Capacity {
+                resource: "memory".to_string(),
                 used: 6144,
                 requested: 4096,
-                max: 8192,
+                limit: 8192,
             })),
             Failure::Cooldown => Some(Box::new(StoreError::NameCooldown {
                 name: "api".to_string(),
@@ -656,25 +645,13 @@ async fn unknown_api_route_is_a_json_404() {
 }
 
 #[tokio::test]
-async fn whoami_reports_identity_quota_usage_and_operator_fields() {
+async fn whoami_reports_identity_usage_and_operator_fields() {
     let fixture = fixture();
-    fixture.store.data.lock().unwrap().quotas.insert(
-        fixture.alice.id,
-        Quota {
-            user_id: 1,
-            max_instances: 5,
-            max_vcpu: 8,
-            max_memory_mib: 8192,
-            max_disk_gib: 100,
-        },
-    );
     let response = request(&fixture.app, Method::GET, "/api/whoami", "").await;
     assert_eq!(response.status, StatusCode::OK);
     let body: WhoamiResponse = decode(&response);
     assert_eq!(body.user.name, "alice");
     assert_eq!(body.user.email, "alice@example.com");
-    assert_eq!(body.quota.as_ref().unwrap().max_instances, 5);
-    assert_eq!(body.quota.as_ref().unwrap().max_disk_gib, 100);
     assert_eq!(body.usage.instances, 1);
     assert_eq!(body.usage.vcpu, 2);
     assert_eq!(body.usage.memory_mib, 2048);
@@ -687,23 +664,13 @@ async fn whoami_reports_identity_quota_usage_and_operator_fields() {
     let body: WhoamiResponse = decode(&response);
     assert!(!body.operator);
     assert!(body.db_path.is_empty());
-    assert!(body.quota.is_none());
-    assert!(!String::from_utf8_lossy(&response.body).contains("db_path"));
+    // The response carries no per-user limit at all (SPEC 6.1).
+    assert!(!String::from_utf8_lossy(&response.body).contains("quota"));
 }
 
 #[tokio::test]
 async fn instance_list_combines_sorts_and_marks_owned_and_shared_rows() {
     let fixture = fixture();
-    fixture.store.data.lock().unwrap().quotas.insert(
-        fixture.alice.id,
-        Quota {
-            user_id: 1,
-            max_instances: 5,
-            max_vcpu: 8,
-            max_memory_mib: 8192,
-            max_disk_gib: 100,
-        },
-    );
     let response = request(&fixture.app, Method::GET, "/api/instances", "").await;
     assert_eq!(response.status, StatusCode::OK);
     let body: InstanceListResponse = decode(&response);
@@ -714,8 +681,8 @@ async fn instance_list_combines_sorts_and_marks_owned_and_shared_rows() {
     assert_eq!(body.instances[0].owner, "bob");
     assert!(!body.instances[1].shared_with_me);
     assert_eq!(body.instances[1].owner, "alice");
-    assert_eq!(body.quota.unwrap().max_instances, 5);
     assert_eq!(body.usage.instances, 1);
+    assert!(!String::from_utf8_lossy(&response.body).contains("quota"));
 }
 
 #[tokio::test]
@@ -781,7 +748,7 @@ async fn create_validates_input_defaults_ksm_and_maps_typed_errors() {
     assert!(instance.ksm);
 
     for (failure, status) in [
-        (Failure::Quota, StatusCode::CONFLICT),
+        (Failure::Capacity, StatusCode::CONFLICT),
         (Failure::Cooldown, StatusCode::CONFLICT),
         (Failure::NameTaken, StatusCode::CONFLICT),
         (Failure::Teapot, StatusCode::IM_A_TEAPOT),
@@ -798,10 +765,15 @@ async fn create_validates_input_defaults_ksm_and_maps_typed_errors() {
         assert_eq!(response.status, status);
         let body: ErrorBody = decode(&response);
         match failure {
-            Failure::Quota => {
-                let detail = body.quota.unwrap();
-                assert_eq!(detail.limit, "memory");
-                assert_eq!(detail.max, 8192);
+            Failure::Capacity => {
+                // The refusal is a plain 409 with a readable message.
+                // The structured per-limit body went with the quota.
+                assert!(
+                    body.error.contains("the host has no room"),
+                    "{}",
+                    body.error
+                );
+                assert!(body.error.contains("memory"), "{}", body.error);
             }
             Failure::Cooldown => {
                 assert_eq!(body.cooldown_seconds, 3 * 3600);

@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use bento_cloudinit::Seed;
 use bento_hypervisor::{AutostartClearer, Definer, DomainSpec, Hypervisor};
 use bento_network::{AddressStore, Ipv4Prefix, Plan, UserNetwork};
-use bento_types::{DesiredState, Image, ImageVersion, Instance, State, User};
+use bento_types::{Capacity, DesiredState, Image, ImageVersion, Instance, State, User};
 use time::OffsetDateTime;
 
 use crate::{Error, QemuImgResizer};
@@ -23,12 +23,13 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// The consumer-side view of the data layer that lifecycle needs.
 #[async_trait]
 pub trait Store: Send + Sync {
-    /// Runs name cooldown, quota checking, and insertion in one transaction
-    /// (SPEC sections 6.1 and 7.2).
+    /// Runs the name cooldown, the host capacity check, and the insert in
+    /// one transaction (SPEC sections 6.1 and 7.2).
     async fn create_instance(
         &self,
         instance: Instance,
         cooldown: Duration,
+        capacity: Capacity,
     ) -> std::result::Result<(), DynError>;
     /// Deletes the row, cascades shares, and releases the name in one
     /// transaction (SPEC 11.1 steps 3 and 4).
@@ -47,7 +48,8 @@ pub trait Store: Send + Sync {
         new_name: &str,
         cooldown: Duration,
     ) -> std::result::Result<(), DynError>;
-    /// Reruns quota checking with the instance's current usage excluded.
+    /// Reruns the capacity check with this instance's current figures
+    /// excluded from the host sums.
     async fn resize(
         &self,
         uuid: &str,
@@ -55,6 +57,7 @@ pub trait Store: Send + Sync {
         memory_mib: i64,
         disk_gib: i64,
         nested: bool,
+        capacity: Capacity,
     ) -> std::result::Result<(), DynError>;
     async fn set_desired_state(
         &self,
@@ -168,6 +171,11 @@ pub struct Config {
     pub iso: Option<Arc<dyn ISOBuilder>>,
     pub resizer: Option<Arc<dyn OverlayResizer>>,
     pub plan: Option<Plan>,
+    /// What the host can hold (SPEC 6.1). The binary reads it once at
+    /// startup. A default value bounds nothing, which is what the tests
+    /// want and what a host whose figures could not be read would get;
+    /// `bentod` refuses to start in that case.
+    pub capacity: Capacity,
     pub storage_dir: PathBuf,
     pub name_cooldown: Duration,
     pub batch_size: usize,
@@ -194,6 +202,7 @@ pub struct Manager {
     pub(crate) iso: Arc<dyn ISOBuilder>,
     pub(crate) resizer: Arc<dyn OverlayResizer>,
     pub(crate) plan: Plan,
+    pub(crate) capacity: Capacity,
     pub(crate) storage_dir: PathBuf,
     pub(crate) cooldown: Duration,
     pub(crate) batch_size: usize,
@@ -252,6 +261,7 @@ impl Manager {
                 .resizer
                 .unwrap_or_else(|| Arc::new(QemuImgResizer::default())),
             plan,
+            capacity: config.capacity,
             storage_dir: config.storage_dir,
             cooldown: nonzero(config.name_cooldown, Duration::from_secs(24 * 60 * 60)),
             batch_size: if config.batch_size == 0 {

@@ -91,6 +91,7 @@ fn scan_share(row: &rusqlite::Row<'_>) -> rusqlite::Result<Share> {
 
 #[cfg(test)]
 mod tests {
+    use bento_types::Capacity;
     use std::time::Duration;
 
     use crate::Error;
@@ -110,7 +111,7 @@ mod tests {
             .unwrap();
         let instance = test_instance(1, "web", &owner, &host);
         store
-            .create_instance(instance.clone(), Duration::ZERO)
+            .create_instance(instance.clone(), Duration::ZERO, Capacity::unbounded())
             .await
             .unwrap();
         store.add_share(&instance.uuid, friend.id).await.unwrap();

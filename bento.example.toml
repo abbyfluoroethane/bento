@@ -22,7 +22,9 @@ base_domain = "bento.example.org"
 #db_path = "/var/lib/bento/bento.db"
 
 # Memory overcommit ratio (SPEC 5.3). 1.0 means no overcommit. Give the
-# host swap or zram before raising this.
+# host swap or zram before raising this. This also sets the memory
+# ceiling on a create or a resize (SPEC 6.1): host memory times this
+# ratio. There is no per-user quota.
 #overcommit_ratio = 1.0
 
 # How long a released instance name is held before another user may take

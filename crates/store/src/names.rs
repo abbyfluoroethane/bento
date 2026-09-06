@@ -127,6 +127,7 @@ fn scan_released_name(row: &rusqlite::Row<'_>) -> rusqlite::Result<ReleasedName>
 
 #[cfg(test)]
 mod tests {
+    use bento_types::Capacity;
     use std::time::Duration;
 
     use time::Duration as TimeDuration;
@@ -164,7 +165,11 @@ mod tests {
                 .await
                 .unwrap();
             store
-                .create_instance(test_instance(1, "web", &owner, &host), COOLDOWN)
+                .create_instance(
+                    test_instance(1, "web", &owner, &host),
+                    COOLDOWN,
+                    Capacity::unbounded(),
+                )
                 .await
                 .unwrap();
             store.delete_instance("uuid-001").await.unwrap();
@@ -189,7 +194,11 @@ mod tests {
         let store = new_test_store().await;
         let (owner, host) = seed_store(&store).await;
         store
-            .create_instance(test_instance(1, "web", &owner, &host), COOLDOWN)
+            .create_instance(
+                test_instance(1, "web", &owner, &host),
+                COOLDOWN,
+                Capacity::unbounded(),
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -208,7 +217,11 @@ mod tests {
             .await
             .unwrap();
         store
-            .create_instance(test_instance(1, "web", &owner, &host), COOLDOWN)
+            .create_instance(
+                test_instance(1, "web", &owner, &host),
+                COOLDOWN,
+                Capacity::unbounded(),
+            )
             .await
             .unwrap();
         store.delete_instance("uuid-001").await.unwrap();
@@ -230,7 +243,11 @@ mod tests {
             .await
             .unwrap();
         store
-            .create_instance(test_instance(1, "old-name", &owner, &host), COOLDOWN)
+            .create_instance(
+                test_instance(1, "old-name", &owner, &host),
+                COOLDOWN,
+                Capacity::unbounded(),
+            )
             .await
             .unwrap();
         store
@@ -253,7 +270,7 @@ mod tests {
 
         let other_instance = test_instance(2, "bob-web", &other, &host);
         store
-            .create_instance(other_instance.clone(), COOLDOWN)
+            .create_instance(other_instance.clone(), COOLDOWN, Capacity::unbounded())
             .await
             .unwrap();
         store.delete_instance(other_instance.uuid).await.unwrap();
@@ -273,7 +290,11 @@ mod tests {
             .await
             .unwrap();
         store
-            .create_instance(test_instance(1, "web", &owner, &host), COOLDOWN)
+            .create_instance(
+                test_instance(1, "web", &owner, &host),
+                COOLDOWN,
+                Capacity::unbounded(),
+            )
             .await
             .unwrap();
         store.delete_instance("uuid-001").await.unwrap();
@@ -281,7 +302,7 @@ mod tests {
 
         let instance = test_instance(2, "web", &other, &host);
         match store
-            .create_instance(instance.clone(), COOLDOWN)
+            .create_instance(instance.clone(), COOLDOWN, Capacity::unbounded())
             .await
             .unwrap_err()
         {
@@ -295,7 +316,11 @@ mod tests {
             Err(Error::NotFound)
         ));
         store
-            .create_instance(test_instance(3, "web", &owner, &host), COOLDOWN)
+            .create_instance(
+                test_instance(3, "web", &owner, &host),
+                COOLDOWN,
+                Capacity::unbounded(),
+            )
             .await
             .unwrap();
     }

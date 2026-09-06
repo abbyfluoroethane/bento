@@ -4,7 +4,7 @@ Version 0.9. Draft.
 
 Bento is a self-hosted platform for Linux virtual machines. A user creates an instance from the command line interface or from the dashboard. Bento publishes the instance on the internet as a subdomain of a domain that the operator owns. An instance exists until the user deletes it.
 
-Bento calls libvirt. Bento implements the parts that libvirt does not provide. These parts are tenancy, quota, addressing, firewall policy, and image supply. Appendix B lists what this decision moved into Bento.
+Bento calls libvirt. Bento implements the parts that libvirt does not provide. These parts are tenancy, capacity, addressing, firewall policy, and image supply. Appendix B lists what this decision moved into Bento.
 
 ## 1. Terms
 
@@ -32,7 +32,7 @@ Bento version 1 does the following:
 - Publish an instance at `$NAME.bento.foid.space` over HTTPS when the user asks for it.
 - Accept SSH connections to each instance through one public port.
 - Support more than one user.
-- Give each user a private network, a fixed address range, and a quota.
+- Give each user a private network and a fixed address range.
 - Restore each instance to its last recorded state after a host reboot.
 
 Bento targets fewer than about 20 users. This number is a design target, not a measured limit.
@@ -51,7 +51,7 @@ Bento does not bill users.
 
 Bento does not use a network database. SQLite is sufficient at the scale in section 2.
 
-**Bento never deletes an instance.** Only the user deletes an instance. Bento has no expiry timer, no grace period, and no idle detection. A quota is the limit on resource use. A clock is not.
+**Bento never deletes an instance.** Only the user deletes an instance. Bento has no expiry timer, no grace period, and no idle detection. The host capacity of section 6.1 is the limit on resource use. A clock is not.
 
 Idle detection is the reason for this rule. Idle detection needs a definition of activity. Every such definition is wrong for some workload. A long build with no network traffic and no SSH session looks idle. A tool that deletes work is worse than a tool that runs out of disk.
 
@@ -221,11 +221,22 @@ Two costs come with this setting:
 
 libvirt has no tenancy concept. Bento implements tenancy.
 
-### 6.1 Quota
+### 6.1 Host capacity
 
-Each user has four limits. These limits are the instance count, the total vCPU count, the total memory, and the total virtual disk size.
+**There is no per-user quota.** Bento gives an account to a person the operator trusts. A limit for each person buys little at that scale. It costs a table, a command, and a number that somebody must keep true. The host is the only ceiling.
 
-Enforce a limit in the control plane. Run the check and the insert in one SQLite transaction. Two concurrent `new` commands must not both pass a check when only one instance fits.
+Refuse a create or a resize that would take more than the host holds. Two rules apply:
+
+1. **Memory.** Add the memory of every instance to the request. The total must not be more than the host memory times the overcommit ratio of section 5.3.
+2. **Disk.** Add the virtual disk size of every instance to the request. The total must not be more than the size of the storage volume.
+
+Both sums count every instance on the host, not the instances of one user. The ceiling is the host. The machine of another user therefore takes room from this one.
+
+**vCPU has no rule.** Processor time is shared. A host can carry more virtual processors than it has cores. A host that runs out of processor time becomes slow. A host that runs out of memory or disk fails. Bento refuses only for the two that fail.
+
+Read the two host figures once at startup, because neither changes while Bento runs. If Bento cannot read one, stop at startup. Do not run with no ceiling.
+
+Enforce the ceiling in the control plane. Run the check and the insert in one SQLite transaction. Two concurrent `new` commands must not both pass a check when only one fits. A resize leaves out the current figures of the instance it changes. An instance can therefore grow into the room it already holds.
 
 Bento accounts against the database. libvirt is authoritative for what exists. The two records can disagree after a crash. The `reconcile` command reports the disagreement:
 
@@ -235,7 +246,7 @@ Bento accounts against the database. libvirt is authoritative for what exists. T
 
 **The `reconcile` command reports and never deletes.** A reconciliation bug that deletes a domain is worse than a row that is wrong. The operator reads the report and corrects the disagreement by hand. At the scale in section 2 this report is short. An automatic cleanup can come later.
 
-Report quota use in the `ls` command and on the dashboard.
+Show what a user has provisioned on the dashboard, against the totals of the host. Do not show it in the `ls` command.
 
 ### 6.2 Networks and addressing
 
@@ -448,7 +459,6 @@ Use SQLite with write-ahead logging.
 | Table | Columns |
 | --- | --- |
 | `users` | `id`, `name`, `email`, `oidc_subject`, `subnet`, `created_at` |
-| `quotas` | `user_id`, `max_instances`, `max_vcpu`, `max_memory`, `max_disk` |
 | `ssh_keys` | `id`, `user_id`, `public_key`, `fingerprint`, `comment`, `created_at` |
 | `pairings` | `id`, `token_hash`, `public_key`, `fingerprint`, `comment`, `created_at`, `expires_at`, `linked_user_id` |
 | `hosts` | `id`, `name`, `libvirt_uri`, `created_at` |
@@ -597,7 +607,7 @@ A table is the primary view. This tool manages a list of machines, and a user co
 
 The instance table shows the name, the observed state, the address, the image, the visibility, and the last use time. Sort by name by default.
 
-Show what the user has provisioned above the table: machines, vCPU, memory, and disk, each against the host's total. There are no per-user quotas (the removal of section 6.1 is tracked in the repository issues).
+Show what the user has provisioned above the table: machines, vCPU, memory, and disk, each against the host's total. There are no per-user limits, only the host capacity of section 6.1.
 
 Every view needs three states beyond the normal one:
 
@@ -621,7 +631,7 @@ The interface runs over SSH. The form is `ssh bento.foid.space <command> [argume
 
 | Command | Action |
 | --- | --- |
-| `ls` | List the instances of the user. Show the state, the address, the quota use, and the last use time. |
+| `ls` | List the instances of the user. Show the state, the address, and the last use time. |
 | `new <name>` | Create an instance. |
 | `rm <name>` | Delete an instance. Ask for confirmation. |
 | `start <name>` | Start a stopped instance. |
@@ -637,7 +647,7 @@ The interface runs over SSH. The form is `ssh bento.foid.space <command> [argume
 | `images` | List the images, their source kinds, current checksums, and how many instances hold an older version. |
 | `images add <name> <oci-reference>` | Operator only. Append and immediately build a bootc OCI image. |
 | `ssh-key` | Add, list, or remove an SSH key. |
-| `whoami` | Show the account and the quota of the user. |
+| `whoami` | Show the account of the user: the name, the email address, and the subnet. |
 
 The `new` command accepts `--image`, `--memory`, `--cpu`, `--disk`, `--nested`, and `--no-ksm`.
 
@@ -649,7 +659,7 @@ A `new` command fails when it names a released name that belongs to another user
 
 1. Write the domain XML template and the libvirt client. Create, start, stop, and delete one hard-coded instance. Do not use the database yet.
 2. Add the content addressed image store, the overlay creation, and the `cloud-init` ISO. An instance now boots with a known address and accepts an SSH key.
-3. Add the database, the users, and the quota check.
+3. Add the database, the users, and the host capacity check.
 4. Add the per-user network, the address manager, and the nftables table.
 5. Add the desired state column and the host reboot restore in section 11.2.
 6. Write the SSH frontend and the command line interface. The system is usable at this point without HTTP.
@@ -682,7 +692,7 @@ Option 1 is simpler. The proxy keeps one routing table and adds no second hop.
 
 Four more items need answers before this ships:
 
-- **Placement.** Bento must select a host for a new instance. A quota that is global and enforced per host needs a placement rule.
+- **Placement.** Bento must select a host for a new instance. The capacity check of section 6.1 measures one host, so a deployment with more than one host needs a placement rule that selects which host to measure.
 - **Copy across hosts.** Storage is local to a host. The `cp` command becomes a transfer.
 - **Image distribution.** The content addressed store in section 5.1 is per host. Each host fetches the same versions, or one host serves the others.
 - **Partial failure.** One unreachable host must not stop the whole deployment. The `ls` command must show a stale state rather than fail.
@@ -741,7 +751,7 @@ A separate public address for each instance removes the user name method in sect
 
 **The cooldown period is a guess.** Section 7.2 sets 24 hours with no evidence. Pick a number and watch for complaints.
 
-**The disk quota counts virtual size, not real size.** A user with a 100 GiB quota can create ten 10 GiB instances that together use 4 GiB on disk. The quota is a worst case bound. Decide whether that is the number to show a user, or whether `ls` shows both numbers.
+**The disk ceiling counts virtual size, not real size.** Ten 10 GiB instances hold 100 GiB against the storage volume of section 6.1, but they can together use 4 GiB on disk. The ceiling is a worst case bound. Decide whether that is the number to show a user, or whether the dashboard shows both numbers.
 
 **The shadcn/ui preset contents are not recorded here.** Section 14.1 names the identifier `b3DooLR16I`. Commit the generated token file to the repository. A preset that lives only in a hosted tool is a dependency that can disappear.
 
@@ -760,7 +770,7 @@ The previous version used Incus. This table records what moved into Bento. Read 
 | Capability | Previous source | Now |
 | --- | --- | --- |
 | Tenancy | Incus projects | Section 6. Bento owns users and isolation. |
-| Quota accounting and enforcement | Incus project limits | Section 6.1. Bento counts and enforces. |
+| Capacity accounting and enforcement | Incus project limits | Section 6.1. Bento counts and enforces against the host. |
 | Network isolation | Incus network ACLs | Section 6.3. Bento writes nftables rules. |
 | Address assignment | Incus bridge with DHCP | Section 6.2. Bento is the address manager. |
 | Image supply, versioning, and caching | Incus image server | Section 5.1. Bento downloads, verifies, and stores by checksum. |

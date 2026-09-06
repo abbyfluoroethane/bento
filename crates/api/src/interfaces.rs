@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use axum::http::{HeaderMap, StatusCode};
 use bento_store::Usage;
-use bento_types::{Instance, Quota, Share, SshKey, User, Visibility};
+use bento_types::{Instance, Share, SshKey, User, Visibility};
 
 /// An error returned through a consumer-side interface.
 pub type BoxError = Box<dyn StdError + Send + Sync + 'static>;
@@ -31,12 +31,16 @@ pub enum StoreError {
     NotFound,
     #[error("store: name is taken by an existing instance")]
     NameTaken,
-    #[error("store: quota exceeded: {limit} limit is {max}, {used} in use, {requested} requested")]
-    Quota {
-        limit: String,
+    /// A create or resize would provision more than the host holds
+    /// (SPEC 6.1). There is no per-user limit to report.
+    #[error(
+        "store: the host has no room: the {resource} limit is {limit}, {used} provisioned, {requested} requested"
+    )]
+    Capacity {
+        resource: String,
         used: i64,
         requested: i64,
-        max: i64,
+        limit: i64,
     },
     #[error(
         "store: name {name:?} was released by another user and is in cooldown for another {remaining:?}"
@@ -70,7 +74,6 @@ pub trait Store: Send + Sync + 'static {
     async fn user_by_name(&self, name: &str) -> Result<User, BoxError>;
     /// Every account, sorted by name.
     async fn users(&self) -> Result<Vec<User>, BoxError>;
-    async fn quota_for(&self, user_id: i64) -> Result<Quota, BoxError>;
     async fn usage_for(&self, user_id: i64) -> Result<Usage, BoxError>;
 
     async fn instance(&self, uuid: &str) -> Result<Instance, BoxError>;

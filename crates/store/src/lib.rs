@@ -43,13 +43,17 @@ pub enum Error {
     /// already rejected.
     #[error("store: token expired")]
     TokenExpired(Box<bento_types::Token>),
-    /// A create or resize would exceed one of the four limits (SPEC 6.1).
-    #[error("store: quota exceeded: {limit} limit is {max}, {used} in use, {requested} requested")]
-    Quota {
-        limit: &'static str,
+    /// A create or resize would provision more than the host holds
+    /// (SPEC 6.1). `resource` is `memory` or `disk`, and the three
+    /// numbers share that resource's unit.
+    #[error(
+        "store: the host has no room: the {resource} limit is {limit}, {used} provisioned, {requested} requested"
+    )]
+    Capacity {
+        resource: &'static str,
         used: i64,
         requested: i64,
-        max: i64,
+        limit: i64,
     },
     /// A released name is still reserved for its previous owner (SPEC 7.2).
     /// `remaining` feeds the error message shown by the CLI (SPEC 15).

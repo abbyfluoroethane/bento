@@ -191,15 +191,28 @@ pub struct User {
     pub created_at: OffsetDateTime,
 }
 
-/// The four per-user limits: instance count, total vCPU count, total
-/// memory, and total virtual disk size (SPEC 6.1).
+/// What the host can hold (SPEC 6.1). Bento has no per-user limit, so
+/// these two numbers are the only ceiling on a create or a resize. The
+/// binary reads them from the host once at startup.
+///
+/// vCPU has no entry. Processor time is shared, so a host may carry more
+/// virtual processors than it has cores.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
-pub struct Quota {
-    pub user_id: i64,
-    pub max_instances: i64,
-    pub max_vcpu: i64,
-    pub max_memory_mib: i64,
-    pub max_disk_gib: i64,
+pub struct Capacity {
+    /// Host memory times the operator's overcommit ratio (SPEC 5.3).
+    pub memory_mib: i64,
+    /// The size of the storage volume, against virtual disk size.
+    pub disk_gib: i64,
+}
+
+impl Capacity {
+    /// A capacity that bounds nothing. Zero means "no ceiling", not "no
+    /// room": a check whose ceiling is zero is skipped. Tests use this.
+    /// `bentod` refuses to start without real host figures, so a running
+    /// deployment never holds one.
+    pub fn unbounded() -> Self {
+        Self::default()
+    }
 }
 
 /// One public key registered by a user. The SSH frontend looks keys up by

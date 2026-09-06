@@ -32,14 +32,14 @@ Real, in every test:
 * the `bentod` binary itself, started as a child process, one `serve` per
   test, plus `fetch-images` and `reconcile` as separate invocations;
 * configuration parsing, from a generated `bento.toml`;
-* the SQLite database, including its schema and the account, quota, and
-  token rows the test seeds before startup;
+* the SQLite database, including its schema and the account and token
+  rows the test seeds before startup;
 * `qemu-img` and `xorriso`, which really do create the overlay disk, the
   seed ISO, and the disk a bootc conversion produces;
 * the HTTP listener, reached over loopback with `reqwest`;
 * bearer-token authentication, against the stored SHA-256 hash;
-* the whole lifecycle path: quota check, address allocation, overlay,
-  seed, domain definition, the state poller, rename, and delete;
+* the whole lifecycle path: the host capacity check, address allocation,
+  overlay, seed, domain definition, the state poller, rename, and delete;
 * the bootc conversion path: the order of the Podman steps, the flags each
   one carries, the build cache keyed on the OCI source digest, and the
   operator-only runtime addition to the allowlist;

@@ -3,6 +3,7 @@ resolver = "3"
 members = [
     "crates/types",
     "crates/config",
+    "crates/hostinfo",
     "crates/store",
     "crates/hypervisor",
     "crates/images",
@@ -31,6 +32,7 @@ repository = "https://github.com/abbyfluoroethane/bento"
 [workspace.dependencies]
 bento-types = { path = "crates/types" }
 bento-config = { path = "crates/config" }
+bento-hostinfo = { path = "crates/hostinfo" }
 bento-store = { path = "crates/store" }
 bento-hypervisor = { path = "crates/hypervisor" }
 bento-images = { path = "crates/images" }
