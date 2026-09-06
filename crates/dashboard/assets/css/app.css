@@ -150,17 +150,23 @@ a:not(.btn) { color: inherit; }
 .wordmark { display: inline-flex; align-items: center; text-decoration: none; color: inherit; }
 .wordmark-img { display: block; height: 1.25rem; aspect-ratio: 722 / 136; background: currentColor; -webkit-mask: url("../branding/wordmark.png") no-repeat left center / contain; mask: url("../branding/wordmark.png") no-repeat left center / contain; }
 .side .btn.new-vm { width: 100%; justify-content: space-between; }
-.vm-group { width: 100%; display: flex; }
-.vm-group > a.btn { flex: 1; justify-content: flex-start; font-weight: 500; }
-.vm-group > a.btn[aria-current="page"] { border-color: var(--primary); box-shadow: inset 2px 0 0 var(--primary); }
-.vm-group > button svg { transition: transform 0.15s; }
-.vm-group > button[aria-expanded="false"] svg { transform: rotate(-90deg); }
-#vm-tree[hidden] { display: none; }
-.vm-list li a { display: flex; align-items: center; gap: 0.5rem; padding: 0.4rem 0.6rem; border: 1px solid var(--sidebar-border); text-decoration: none; font-family: var(--font-mono); font-size: 0.85rem; background: var(--background); }
-.vm-list li a:hover { border-color: var(--primary); }
-.vm-list li a[aria-current="page"] { border-color: var(--primary); box-shadow: inset 2px 0 0 var(--primary); }
-.vm-list li a .shared { margin-left: auto; font-family: var(--font-sans); font-size: 0.7rem; color: var(--muted-foreground); }
-.vm-list .none { font-size: 0.8rem; color: var(--muted-foreground); padding: 0.3rem 0.6rem; }
+/* The machine tree: a full-width root button, then rows hung off one
+ * vertical guide with a branch tick each, like ├─ in a terminal. */
+.vm-list { display: grid; gap: 0.35rem; }
+.vm-root { width: 100%; justify-content: flex-start; font-weight: 500; }
+.vm-root[aria-current="page"] { border-color: var(--primary); box-shadow: inset 2px 0 0 var(--primary); }
+.vm-tree { list-style: none; margin: 0; padding: 0 0 0 0.75rem; }
+.vm-tree li { position: relative; padding-left: 1rem; }
+/* Each row draws its own piece of the guide, so the last row ends at its
+ * branch (└─) instead of running past it. */
+.vm-tree li::after { content: ""; position: absolute; left: 0; top: 0; bottom: 0; border-left: 1px solid var(--muted-foreground); }
+.vm-tree li:last-child::after { bottom: auto; height: 0.9rem; }
+.vm-tree li::before { content: ""; position: absolute; left: 0; top: 0.9rem; width: 0.7rem; border-top: 1px solid var(--muted-foreground); }
+.vm-tree li a { display: flex; align-items: center; gap: 0.5rem; padding: 0.35rem 0.5rem; text-decoration: none; font-family: var(--font-mono); font-size: 0.85rem; border: 1px solid transparent; }
+.vm-tree li a:hover { background: var(--background); border-color: var(--sidebar-border); }
+.vm-tree li a[aria-current="page"] { background: var(--background); border-color: var(--primary); }
+.vm-tree li a .shared { margin-left: auto; font-family: var(--font-sans); font-size: 0.7rem; color: var(--muted-foreground); }
+.vm-tree .none { font-size: 0.8rem; color: var(--muted-foreground); padding: 0.35rem 0.5rem; }
 .account-menu { width: 100%; }
 /* The trigger is the outline button component, opened up to two lines. */
 .account-menu > .btn { width: 100%; height: auto; justify-content: flex-start; gap: 0.6rem; padding: 0.5rem 0.6rem; font-size: 0.9rem; text-align: left; }

@@ -13,11 +13,11 @@ fs.mkdirSync(OUT, { recursive: true });
 const pages = [
   ["home", "/"],
   ["new", "/new"],
-  ["vm", "/vm/uuid-web"],
-  ["vm_settings", "/vm/uuid-web/settings"],
-  ["vm_danger", "/vm/uuid-web/danger"],
-  ["vm_terminal", "/vm/uuid-web/terminal"],
-  ["vm_shared", "/vm/uuid-db/settings"],
+  ["vm", "/vm/uuid-blog"],
+  ["vm_settings", "/vm/uuid-blog/settings"],
+  ["vm_danger", "/vm/uuid-blog/danger"],
+  ["vm_terminal", "/vm/uuid-blog/terminal"],
+  ["vm_shared", "/vm/uuid-staging/settings"],
   ["account", "/settings/account"],
   ["users", "/settings"],
   ["configuration", "/settings/configuration"],
@@ -78,8 +78,8 @@ const pages = [
     await page.keyboard.press("Escape");
   });
   await step("hx-boost navigation to a VM keeps the sidebar and swaps content", async () => {
-    await page.click('#vm-list a[href="/vm/uuid-web"]');
-    await page.waitForURL("**/vm/uuid-web");
+    await page.click('#vm-list a[href="/vm/uuid-blog"]');
+    await page.waitForURL("**/vm/uuid-blog");
     await page.waitForSelector("h1.vm-title");
     await page.waitForFunction(() => document.querySelector(".chart canvas"));
   });
@@ -94,7 +94,7 @@ const pages = [
     await page.waitForResponse((r) => r.url().includes("/fragments/instances"), { timeout: 12000 });
     await page.waitForResponse((r) => r.url().includes("/fragments/sidebar"), { timeout: 17000 });
     await page.waitForTimeout(200);
-    if (!(await page.$("#sidebar .vm-group")) || !(await page.$(".tiles")) || !(await page.$("#instances table"))) throw new Error("a fragment poll replaced the front page");
+    if (!(await page.$("#sidebar .vm-root")) || !(await page.$(".tiles")) || !(await page.$("#instances table"))) throw new Error("a fragment poll replaced the front page");
   });
   await step("steppers change values and clamp", async () => {
     await page.goto(BASE + "/new", { waitUntil: "networkidle" });
@@ -117,33 +117,33 @@ const pages = [
     await page.screenshot({ path: `${OUT}/interact-created.png` });
   });
   await step("settings rename asks for confirmation, then saves", async () => {
-    await page.goto(BASE + "/vm/uuid-web/settings", { waitUntil: "networkidle" });
-    await page.fill("#name", "web2");
+    await page.goto(BASE + "/vm/uuid-blog/settings", { waitUntil: "networkidle" });
+    await page.fill("#name", "blog2");
     await page.click('button[type=submit]:has-text("Save changes")');
     await page.waitForFunction(() => document.getElementById("rename-dialog")?.open, null, { timeout: 5000 });
     const txt = await page.$eval("#rename-dialog", (e) => e.textContent);
-    if (!txt.includes("web2@bento.example")) throw new Error("dialog text lacks new name");
+    if (!txt.includes("blog2@bento.example")) throw new Error("dialog text lacks new name");
     await page.screenshot({ path: `${OUT}/interact-rename.png` });
     await page.click("[data-rename-go]");
     await page.waitForSelector(".toast", { timeout: 3000 });
     const t = await page.$eval(".toast h2", (e) => e.textContent);
     if (!t.includes("Saved name")) throw new Error("toast: " + t);
-    if (!(await page.$eval("h1.vm-title", (e) => e.textContent)).includes("web2")) throw new Error("title not renamed");
+    if (!(await page.$eval("h1.vm-title", (e) => e.textContent)).includes("blog2")) throw new Error("title not renamed");
   });
   await step("delete dialog arms only on the exact name", async () => {
-    await page.goto(BASE + "/vm/uuid-web/danger", { waitUntil: "networkidle" });
+    await page.goto(BASE + "/vm/uuid-blog/danger", { waitUntil: "networkidle" });
     await page.click('button:has-text("Delete VM")');
     await page.waitForFunction(() => document.getElementById("delete-dialog")?.open, null, { timeout: 5000 });
     if (!(await page.$eval("[data-armed]", (e) => e.disabled))) throw new Error("armed too early");
-    await page.fill("#confirm", "web");
+    await page.fill("#confirm", "blog");
     if (!(await page.$eval("[data-armed]", (e) => e.disabled))) throw new Error("armed on old name");
-    await page.fill("#confirm", "web2");
+    await page.fill("#confirm", "blog2");
     if (await page.$eval("[data-armed]", (e) => e.disabled)) throw new Error("not armed on exact name");
     await page.screenshot({ path: `${OUT}/interact-delete.png` });
     await page.click("[data-armed]");
     await page.waitForURL(BASE + "/");
     await page.waitForSelector(".toast");
-    if (await page.$('#vm-list a[href="/vm/uuid-web"]')) throw new Error("deleted VM still in sidebar");
+    if (await page.$('#vm-list a[href="/vm/uuid-blog"]')) throw new Error("deleted VM still in sidebar");
   });
   await step("theme picker switches and persists", async () => {
     await page.goto(BASE + "/settings/account", { waitUntil: "networkidle" });
@@ -162,16 +162,11 @@ const pages = [
     await page.waitForSelector("#account-menu-popover[aria-hidden=false]", { timeout: 2000 });
     await page.keyboard.press("Escape");
   });
-  await step("machine tree collapses from the button group and stays collapsed", async () => {
-    await page.goto(BASE + "/", { waitUntil: "networkidle" });
-    await page.click("[data-vm-tree-toggle]");
-    if (!(await page.$eval("#vm-tree", (e) => e.hidden))) throw new Error("tree still shown");
-    await page.reload({ waitUntil: "networkidle" });
-    if (!(await page.$eval("#vm-tree", (e) => e.hidden))) throw new Error("collapse not remembered");
-    await page.click("[data-vm-tree-toggle]");
-    if (await page.$eval("#vm-tree", (e) => e.hidden)) throw new Error("tree did not reopen");
-    await page.click('.vm-group > a[href="/"]');
+  await step("the Virtual Machines root links to the front page", async () => {
+    await page.goto(BASE + "/vm/uuid-blog", { waitUntil: "networkidle" });
+    await page.click(".vm-root");
     await page.waitForURL(BASE + "/");
+    if ((await page.$$eval(".vm-tree li a", (as) => as.length)) < 2) throw new Error("tree rows missing");
   });
   await step("mobile sidebar toggle", async () => {
     await page.setViewportSize({ width: 390, height: 844 });

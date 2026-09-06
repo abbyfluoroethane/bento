@@ -104,23 +104,6 @@
   var observer = window.ResizeObserver ? new ResizeObserver(fitPlots) : null;
   function watch(el) { if (observer && !el._watched) { observer.observe(el); el._watched = true; } }
 
-  // --- Sidebar: the machine tree toggle, remembered per browser ----------
-  function applyTree() {
-    var collapsed = false;
-    try { collapsed = localStorage.getItem("vmTree") === "closed"; } catch (e) {}
-    var tree = document.getElementById("vm-tree");
-    var button = document.querySelector("[data-vm-tree-toggle]");
-    if (tree) tree.hidden = collapsed;
-    if (button) button.setAttribute("aria-expanded", String(!collapsed));
-  }
-  document.addEventListener("click", function (event) {
-    var button = event.target.closest("[data-vm-tree-toggle]");
-    if (!button) return;
-    var open = button.getAttribute("aria-expanded") !== "true";
-    try { localStorage.setItem("vmTree", open ? "open" : "closed"); } catch (e) {}
-    applyTree();
-  });
-
   // --- Sidebar on small screens ------------------------------------------
   document.addEventListener("click", function (event) {
     var side = document.getElementById("sidebar");
@@ -188,7 +171,6 @@
 
   // --- Boot, and re-boot after HTMX swaps --------------------------------
   function boot(root) {
-    applyTree();
     initCharts(root);
     cleanUrl();
   }
