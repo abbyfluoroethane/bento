@@ -13,7 +13,7 @@ use bento_auth::TokenStore as _;
 use bento_cli::Lifecycle as _;
 use bento_cloudinit::Seed;
 use bento_hypervisor::{Definer, Fake, Hypervisor};
-use bento_lifecycle::{ISOBuilder, ImageStore};
+use bento_lifecycle::{Fleet, ISOBuilder, ProvisionSpec};
 use bento_network::{Plan, PortRange};
 use bento_proxy::InstanceSource as _;
 use bento_sshfront::KeyLinker as _;
@@ -22,26 +22,70 @@ use bento_types::{DesiredState, Image, ImageVersion, State, Visibility};
 use time::OffsetDateTime;
 
 use crate::adapters::{
-    ApiBackend, AuthAccess, AuthPairings, AuthTokens, AuthUsers, Backend, CliBackend,
-    LifecycleStore, Linker, NetworkEnsurer, Provisioner, ProxySource, access_status,
+    AccountProvisioner, ApiBackend, AuthAccess, AuthPairings, AuthTokens, AuthUsers, Backend,
+    CliBackend, LifecycleStore, Linker, NetworkEnsurer, ProxySource, access_status,
+    api_lifecycle_error,
 };
 use crate::firewall::Firewall;
 use crate::firewall::tests::RecordingApplier;
 
 const OWNER_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFoo owner@laptop";
 
-struct FakeImages;
+/// Stands in for the machine that builds an instance, writing the same
+/// files and defining the same domain a real one would.
+struct FakeImages {
+    hypervisor: Arc<Fake>,
+    iso: Arc<FakeIso>,
+    storage_dir: PathBuf,
+}
 
 #[async_trait]
-impl ImageStore for FakeImages {
-    async fn create_overlay(
+impl Fleet for FakeImages {
+    async fn provision(
         &self,
-        _checksum: &str,
-        path: &Path,
-        _disk_gib: i64,
+        spec: &ProvisionSpec,
+    ) -> Result<bento_types::State, bento_lifecycle::DynError> {
+        let uuid = &spec.instance.uuid;
+        tokio::fs::write(self.storage_dir.join(format!("{uuid}.qcow2")), b"overlay").await?;
+        if spec.with_seed_iso {
+            self.iso
+                .build(
+                    &spec.seed,
+                    &self.storage_dir.join(format!("{uuid}-seed.iso")),
+                )
+                .await?;
+        }
+        let xml = bento_hypervisor::domain_xml(&bento_hypervisor::DomainSpec {
+            name: spec.instance.name.clone(),
+            uuid: uuid.clone(),
+            vcpu: spec.instance.vcpu,
+            memory_mib: spec.instance.memory_mib,
+            disk_path: self
+                .storage_dir
+                .join(format!("{uuid}.qcow2"))
+                .display()
+                .to_string(),
+            iso_path: String::new(),
+            network: spec.network.clone(),
+            mac: spec.instance.mac.clone(),
+            nested: spec.instance.nested,
+            ksm: spec.instance.ksm,
+            arch: String::new(),
+        })?;
+        bento_hypervisor::Hypervisor::create(self.hypervisor.as_ref(), &xml).await?;
+        Ok(bento_types::State::Running)
+    }
+
+    async fn deprovision(
+        &self,
+        _host_id: i64,
+        _instance: &bento_types::Instance,
     ) -> Result<(), bento_lifecycle::DynError> {
-        tokio::fs::write(path, b"overlay").await?;
         Ok(())
+    }
+
+    async fn hypervisor(&self, _host_id: i64) -> Option<Arc<dyn bento_hypervisor::Hypervisor>> {
+        Some(self.hypervisor.clone())
     }
 }
 
@@ -94,7 +138,11 @@ impl Env {
         let store = Store::open(temp.path().join("bento.db")).await.unwrap();
         let plan = Plan::new("10.100.0.0/16").unwrap();
         let host = store
-            .ensure_host("testhost", "qemu:///system")
+            .ensure_host(
+                "00000000000000000000000000000001",
+                "testhost",
+                "qemu:///system",
+            )
             .await
             .unwrap();
         let hypervisor = Arc::new(Fake::default());
@@ -103,8 +151,24 @@ impl Env {
             bento_lifecycle::Manager::new(bento_lifecycle::Config {
                 hypervisor: Some(hypervisor.clone()),
                 definer: Some(Arc::new(FakeDefiner(hypervisor.clone()))),
-                store: Some(Arc::new(LifecycleStore(store.clone()))),
-                images: Some(Arc::new(FakeImages)),
+                store: Some(Arc::new(LifecycleStore(
+                    store.clone(),
+                    crate::adapters::LocalCapacity {
+                        host_id: host.id,
+                        capacity: bento_types::Capacity::unbounded(),
+                        overcommit_ratio: 1.0,
+                    },
+                ))),
+                // The manager and the backend must agree which machine
+                // this is. A copy checks that its source runs here
+                // (MULTI-NODE 13.3), and a mismatch would refuse a copy
+                // of an instance that is in fact local.
+                host_id: host.id,
+                fleet: Some(Arc::new(FakeImages {
+                    hypervisor: hypervisor.clone(),
+                    iso: iso.clone(),
+                    storage_dir: temp.path().to_owned(),
+                })),
                 iso: Some(iso.clone()),
                 plan: Some(plan),
                 storage_dir: temp.path().to_owned(),
@@ -153,7 +217,7 @@ impl Env {
         self.store
             .upsert_image(Image {
                 name: "debian-13".into(),
-                url: "https://example.test/debian-13".into(),
+                url: "https://images.example.org/debian-13".into(),
                 kind: Default::default(),
                 pinned_checksum: None,
                 current_checksum: None,
@@ -174,6 +238,12 @@ impl Env {
             .unwrap();
         self.store
             .set_current_checksum("debian-13", "aa11")
+            .await
+            .unwrap();
+        // This fixture has one active host. Its local image store holds the
+        // current version, so create can pass the fleet gate (MULTI-NODE 13.2).
+        self.store
+            .record_host_image(self.host_id, "debian-13", "aa11")
             .await
             .unwrap();
     }
@@ -208,6 +278,20 @@ impl Env {
             .await
             .unwrap()
     }
+}
+
+#[test]
+fn the_fleet_image_gate_maps_to_conflict() {
+    let error = api_lifecycle_error(bento_lifecycle::Error::FleetImageNotReady {
+        image_name: "debian-13".into(),
+        missing: "runner-b.example.org is not ready".into(),
+    });
+    let status = error
+        .downcast_ref::<bento_api::StatusError>()
+        .expect("the API adapter assigns a status");
+
+    assert_eq!(status.http_status(), http::StatusCode::CONFLICT);
+    assert!(status.to_string().contains("runner-b.example.org"));
 }
 
 #[tokio::test]
@@ -356,6 +440,7 @@ async fn cli_backend_console_unavailable() {
                 visibility: Visibility::Off,
                 created_at: OffsetDateTime::now_utc(),
                 last_seen_at: None,
+                slot: None,
             },
             &mut stream,
         )
@@ -379,7 +464,7 @@ impl NetworkEnsurer for RecordingNetworks {
 async fn provisioning_allocates_a_subnet_and_network_but_no_key() {
     let env = Env::new().await;
     let networks = Arc::new(RecordingNetworks::default());
-    let provisioner = Provisioner {
+    let provisioner = AccountProvisioner {
         store: env.store.clone(),
         plan: env.plan,
         networks: Some(networks.clone()),
@@ -430,7 +515,7 @@ async fn a_first_time_user_gets_an_account_from_oidc_and_a_key_from_the_link() {
         Arc::new(AuthTokens(env.store.clone())),
     )
     .with_pairings(Arc::new(AuthPairings(env.store.clone())))
-    .with_provisioner(Arc::new(Provisioner {
+    .with_provisioner(Arc::new(AccountProvisioner {
         store: env.store.clone(),
         plan: env.plan,
         networks: Some(networks.clone()),
@@ -674,6 +759,7 @@ async fn api_and_cli_changes_reload_firewall() {
         env.plan,
         applier.clone(),
         PortRange { from: 0, to: 0 },
+        env.host_id,
     ));
     let cli = CliBackend(Backend {
         manager: env.manager.clone(),
@@ -770,6 +856,142 @@ async fn cli_runner_writes_output_from_inside_the_runtime() {
         !output.is_empty(),
         "the help text never reached the ssh stream"
     );
+}
+
+/// A guest on another machine is not in this machine's libvirt, so its
+/// charts stay empty unless the controller asks the machine that runs it
+/// (SPEC 14.4, MULTI-NODE 20).
+#[tokio::test]
+async fn the_sampler_charts_a_machine_and_a_guest_it_cannot_see_locally() {
+    use bento_runner::{CpuTimeSample, DomainUsage, HostSample, Samples};
+
+    /// Answers for the other machine without a network.
+    struct FakeRunner;
+
+    #[async_trait]
+    impl crate::metrics::RemoteSampler for FakeRunner {
+        async fn sample(&self, _host: &bento_types::Host) -> Result<Samples, String> {
+            Ok(Samples {
+                host: HostSample {
+                    cpu: Some(CpuTimeSample {
+                        total: 1000,
+                        idle: 850,
+                    }),
+                    memory_total_bytes: 8 * 1024 * 1024 * 1024,
+                    memory_available_bytes: 6 * 1024 * 1024 * 1024,
+                    storage_total_bytes: 165 * 1024 * 1024 * 1024,
+                    storage_available_bytes: 154 * 1024 * 1024 * 1024,
+                    cpu_count: 4,
+                },
+                domains: vec![DomainUsage {
+                    uuid: "uuid-remote".into(),
+                    cpu_time_ns: 0,
+                    vcpus: 2,
+                    rss_kib: Some(700 * 1024),
+                    storage_used_bytes: 3 * 1024 * 1024 * 1024,
+                }],
+            })
+        }
+    }
+
+    /// This machine runs no guest in this test, so the local path
+    /// reports the machine and nothing else.
+    struct NoDomains;
+
+    #[async_trait]
+    impl bento_hypervisor::DomainSampler for NoDomains {
+        async fn sample(
+            &self,
+            _name: &str,
+        ) -> Result<Option<bento_hypervisor::DomainSample>, bento_hypervisor::Error> {
+            Ok(None)
+        }
+    }
+
+    let env = Env::new().await;
+    env.add_image().await;
+    let owner = env.add_user("amber").await;
+    let other = env
+        .store
+        .register_runner("tsukasa.example.org", "http://10.0.0.97:10443", "10.0.0.97")
+        .await
+        .unwrap();
+    env.store
+        .create_instance(
+            bento_types::Instance {
+                uuid: "uuid-remote".into(),
+                name: "remote".into(),
+                owner_id: owner.id,
+                host_id: other.id,
+                image_name: "debian-13".into(),
+                base_checksum: "aa11".into(),
+                state: State::Running,
+                desired_state: DesiredState::Running,
+                address: "10.100.0.2".into(),
+                mac: "ba:c9:e6:00:00:09".into(),
+                vcpu: 2,
+                memory_mib: 2048,
+                disk_gib: 20,
+                nested: false,
+                ksm: true,
+                http_port: 80,
+                visibility: Visibility::Off,
+                created_at: OffsetDateTime::UNIX_EPOCH,
+                last_seen_at: None,
+                // No slot: this test is about reading a machine, not
+                // about allocation, and a row from before subdivision
+                // looks exactly like this (MULTI-NODE 7.1).
+                slot: None,
+            },
+            std::time::Duration::from_secs(0),
+            bento_types::Capacity::unbounded(),
+        )
+        .await
+        .unwrap();
+
+    let sampler = Arc::new(crate::metrics::Sampler::new());
+    let task = crate::metrics::SamplerTask {
+        sampler: sampler.clone(),
+        store: env.store.clone(),
+        manager: env.manager.clone(),
+        domains: Arc::new(NoDomains),
+        storage_dir: env._temp.path().display().to_string(),
+        local_host_id: env.host_id,
+        remote: Some(Arc::new(FakeRunner)),
+    };
+    task.tick().await;
+
+    let window = std::time::Duration::from_secs(3600);
+    let hosts = bento_api::Metrics::hosts(sampler.as_ref(), window)
+        .await
+        .unwrap();
+    assert_eq!(hosts.len(), 2, "both machines are charted");
+    let remote = hosts
+        .iter()
+        .find(|host| host.host_id == other.id)
+        .expect("the other machine is listed");
+    assert_eq!(remote.host_name, "tsukasa.example.org");
+    assert_eq!(remote.memory_total_mib, 8 * 1024);
+    assert_eq!(remote.cpu_count, 4);
+    // Two of the eight gibibytes are free, so six are in use.
+    assert_eq!(remote.memory_used_mib.last().unwrap().value, 2.0 * 1024.0);
+
+    let metrics = bento_api::Metrics::instance(sampler.as_ref(), "uuid-remote", window)
+        .await
+        .unwrap();
+    assert_eq!(
+        metrics.memory_used_mib.last().unwrap().value,
+        700.0,
+        "the guest reports memory through its own machine"
+    );
+    assert_eq!(metrics.storage_used_gib, 3.0);
+
+    // And the account total counts it, against the cores of the machine
+    // it really runs on.
+    let user = bento_api::Metrics::user(sampler.as_ref(), owner.id)
+        .await
+        .unwrap();
+    assert_eq!(user.memory_used_mib, 700);
 }
 
 /// End of stream on the read half is the client closing stdin, which has to

@@ -3,7 +3,7 @@ use crate::{Ipv4Prefix, Plan, Result, invalid};
 
 /// Describes one per-user libvirt network (SPEC 6.2). Every instance of
 /// the user attaches to this network's bridge.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct UserNetwork {
     /// The libvirt network name, for example `bento-user-3`.
     pub name: String,

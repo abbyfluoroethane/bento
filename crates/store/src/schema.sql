@@ -20,8 +20,9 @@ CREATE TABLE IF NOT EXISTS users (
 
 -- Bento had a per-user quota table here. Section 6.1 replaced it with a
 -- host capacity check, so the table holds nothing that any code reads.
--- There is no migration tool, so this statement is how an existing
--- database loses it. It is safe to run on a database that never had one.
+-- This statement predates the numbered migrations and stays where it is:
+-- it is safe on a database that never had the table, and moving it now
+-- would only give the same drop a second home.
 DROP TABLE IF EXISTS quotas;
 
 CREATE TABLE IF NOT EXISTS ssh_keys (
@@ -36,11 +37,95 @@ CREATE TABLE IF NOT EXISTS ssh_keys (
 -- The SSH frontend reads this column on every connection (SPEC 12).
 CREATE INDEX IF NOT EXISTS idx_ssh_keys_fingerprint ON ssh_keys(fingerprint);
 
+-- The machine ID is the identity of a host and the name is a label,
+-- the relation the instance UUID and the instance name already have
+-- (MULTI-NODE 16). Its unique index is created by migration 2, not here:
+-- this file runs before the migrations, so on a database that predates
+-- the column an index over it would name a column that does not exist.
 CREATE TABLE IF NOT EXISTS hosts (
     id          INTEGER PRIMARY KEY,
+    machine_id  TEXT,
     name        TEXT    NOT NULL UNIQUE,
     libvirt_uri TEXT    NOT NULL,
     created_at  TEXT    NOT NULL
+);
+
+-- Settings that belong to the deployment, not to one host
+-- (MULTI-NODE 19). One row, id 1.
+CREATE TABLE IF NOT EXISTS deployment (
+    id            INTEGER PRIMARY KEY CHECK (id = 1),
+    -- 24, 25, 26, or 27: how a user /24 divides into runner slots
+    -- (MULTI-NODE 7.1). A /24 is one slot, which is what version 1 was.
+    -- Setup persists the real value on first initialization.
+    runner_prefix INTEGER NOT NULL DEFAULT 24
+                  CHECK (runner_prefix BETWEEN 24 AND 27)
+);
+INSERT OR IGNORE INTO deployment (id) VALUES (1);
+
+-- The controller lease and its epoch (MULTI-NODE 11). One row, id 1.
+-- Only the holder may dispatch to a runner.
+CREATE TABLE IF NOT EXISTS controller_lease (
+    id         INTEGER PRIMARY KEY CHECK (id = 1),
+    -- Random, one for each controller process. NULL when free.
+    holder_id  TEXT,
+    -- Durable and strictly increasing. A runner records the highest
+    -- epoch it has accepted and refuses every lower one after that.
+    epoch      INTEGER NOT NULL DEFAULT 0,
+    expires_at TEXT
+);
+INSERT OR IGNORE INTO controller_lease (id) VALUES (1);
+
+-- Slot ownership is global, not per user: the runner that owns slot 1
+-- owns slot 1 of every user /24 (MULTI-NODE 7.2). The slot number is the
+-- primary key, and that is what permits one active owner for a slot
+-- (MULTI-NODE 16).
+CREATE TABLE IF NOT EXISTS runner_slots (
+    slot                INTEGER PRIMARY KEY,
+    state               TEXT    NOT NULL DEFAULT 'active'
+                        CHECK (state IN ('active', 'draining', 'moving')),
+    owner_host_id       INTEGER NOT NULL REFERENCES hosts(id),
+    -- Increases every time the slot changes hands. A runner refuses an
+    -- ownership claim older than the one it holds.
+    ownership_epoch     INTEGER NOT NULL DEFAULT 0,
+    -- Set only while `state` is 'moving' (MULTI-NODE 17).
+    source_host_id      INTEGER REFERENCES hosts(id),
+    destination_host_id INTEGER REFERENCES hosts(id),
+    operation_id        TEXT
+);
+
+-- What the controller last saw when it called a runner (MULTI-NODE 16).
+-- These are observations, not configuration, so they live apart from the
+-- `hosts` row. A row appears on first contact and is replaced on each
+-- later one.
+CREATE TABLE IF NOT EXISTS host_observations (
+    host_id               INTEGER PRIMARY KEY REFERENCES hosts(id) ON DELETE CASCADE,
+    health                TEXT    NOT NULL DEFAULT 'unknown'
+                          CHECK (health IN ('unknown', 'ok', 'unreachable', 'mismatched')),
+    last_contact_at       TEXT,
+    -- The highest controller epoch the runner says it has accepted.
+    accepted_epoch        INTEGER NOT NULL DEFAULT 0,
+    arch                  TEXT,
+    cpu_count             INTEGER,
+    memory_total_mib      INTEGER,
+    storage_total_gib     INTEGER,
+    storage_available_gib INTEGER,
+    hypervisor_version    TEXT,
+    -- Why the last call failed, for the operator to read.
+    last_error            TEXT
+);
+
+-- Which image versions each machine holds (MULTI-NODE 13.2).
+--
+-- A machine holds a set, not one version. Every instance is backed by
+-- the version it was built from, and that file is the overlay's backing
+-- file, so a machine keeps a version while any of its instances needs it
+-- (SPEC 5.1). A newer build lands beside the older one.
+CREATE TABLE IF NOT EXISTS host_images (
+    host_id     INTEGER NOT NULL REFERENCES hosts(id) ON DELETE CASCADE,
+    image_name  TEXT    NOT NULL,
+    checksum    TEXT    NOT NULL,
+    verified_at TEXT    NOT NULL,
+    PRIMARY KEY (host_id, image_name, checksum)
 );
 
 CREATE TABLE IF NOT EXISTS images (

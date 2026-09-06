@@ -72,7 +72,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
             "s start  t stop  r restart  e enable  d disable  l logs  f follow  D daemon-reload"
         }
         Tab::Install => "enter run step  a run every missing step",
-        Tab::Config => "e edit  f fetch-images  i images  c reconcile",
+        Tab::Config => "e edit  f fetch-images  i images  c reconcile  b backup  r restore",
         Tab::Host => "F5 refresh now",
     };
     let [top, bottom] =
@@ -549,7 +549,7 @@ fn help_lines() -> Vec<Line<'static>> {
         "Services  s start  t stop  r restart  e enable  d disable",
         "          l last 200 log lines  f follow the log  D daemon-reload",
         "Install   enter run the selected step  a run every missing step",
-        "Config    e edit  f fetch-images  i images  c reconcile",
+        "Config    e edit  f fetch-images  i images  c reconcile  b backup  r restore",
         "",
         "  q  quit",
     ]

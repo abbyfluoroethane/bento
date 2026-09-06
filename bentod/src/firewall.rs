@@ -2,15 +2,12 @@
 //! applied atomically. The control plane applies it at startup and every poll
 //! tick; applying an unchanged ruleset is skipped.
 
-use std::collections::HashMap;
-use std::net::Ipv4Addr;
 use std::sync::Arc;
 
 use anyhow::Result;
-use bento_network::{
-    Applier, FirewallUser, Plan, PortRange, PublishedInstance, Ruleset, UserNetwork,
-};
+use bento_network::{Applier, Plan, PortRange, Ruleset};
 use bento_store::Store;
+#[cfg(test)]
 use bento_types::Visibility;
 use tokio::sync::Mutex;
 
@@ -19,6 +16,9 @@ pub(crate) struct Firewall {
     plan: Plan,
     applier: Arc<dyn Applier>,
     high_ports: PortRange,
+    /// This machine. The policy describes the guests on this machine and
+    /// admits the ones that reach it over the underlay (MULTI-NODE 8.4).
+    host_id: i64,
     last: Mutex<String>,
 }
 
@@ -28,12 +28,14 @@ impl Firewall {
         plan: Plan,
         applier: Arc<dyn Applier>,
         high_ports: PortRange,
+        host_id: i64,
     ) -> Self {
         Self {
             store,
             plan,
             applier,
             high_ports,
+            host_id,
             last: Mutex::new(String::new()),
         }
     }
@@ -42,7 +44,7 @@ impl Firewall {
     /// successful apply.
     pub(crate) async fn reload(&self) -> Result<()> {
         let mut last = self.last.lock().await;
-        let ruleset = build_ruleset(&self.store, self.plan, self.high_ports).await?;
+        let ruleset = build_ruleset(&self.store, self.plan, self.high_ports, self.host_id).await?;
         let text = ruleset.render()?;
         if text == *last {
             return Ok(());
@@ -60,13 +62,17 @@ impl Firewall {
     }
 }
 
-/// Derives SPEC 6.3 policy from users and instances. Every user contributes a
-/// bridge. Port 22 is published for every instance so the SSH frontend can
-/// reach it; private and public instances also publish their HTTP ports.
+/// Derives this machine's SPEC 6.3 policy from its desired network state.
+///
+/// The policy and the routes come from one description of the machine
+/// (MULTI-NODE 8), so the controller's own firewall and the firewall it
+/// sends a runner cannot disagree. Two builders would drift, and a drift
+/// makes two machines overwrite each other's table on every tick.
 pub(crate) async fn build_ruleset(
     store: &Store,
     plan: Plan,
     mut high_ports: PortRange,
+    host_id: i64,
 ) -> Result<Ruleset> {
     if high_ports.from == 0 && high_ports.to == 0 {
         high_ports = PortRange {
@@ -74,53 +80,9 @@ pub(crate) async fn build_ruleset(
             to: i32::from(bento_proxy::HIGH_PORT_MAX),
         };
     }
-    let users = store.users().await?;
-    let instances = store.instances().await?;
-    let mut by_owner: HashMap<i64, Vec<PublishedInstance>> = HashMap::new();
-    for instance in instances {
-        let Ok(address) = instance.address.parse::<Ipv4Addr>() else {
-            continue;
-        };
-        let mut published = PublishedInstance {
-            address,
-            http_ports: Vec::new(),
-            port_ranges: Vec::new(),
-        };
-        if matches!(
-            instance.visibility,
-            Visibility::Private | Visibility::Public
-        ) {
-            published
-                .http_ports
-                .push(i32::from(if instance.http_port == 0 {
-                    80
-                } else {
-                    instance.http_port
-                }));
-            published.port_ranges.push(high_ports);
-        }
-        by_owner
-            .entry(instance.owner_id)
-            .or_default()
-            .push(published);
-    }
-    let mut firewall_users = Vec::new();
-    for user in users {
-        let Ok(prefix) = bento_config::parse_prefix(&user.subnet) else {
-            continue;
-        };
-        let Ok(index) = plan.index(prefix) else {
-            continue;
-        };
-        firewall_users.push(FirewallUser {
-            network: UserNetwork::new(plan, index as isize)?,
-            instances: by_owner.remove(&user.id).unwrap_or_default(),
-        });
-    }
-    Ok(Ruleset {
-        private_range: plan.range(),
-        users: firewall_users,
-    })
+    let network =
+        crate::netstate::machine_network(store, plan, high_ports, host_id, host_id).await?;
+    Ok(network.ruleset()?)
 }
 
 #[cfg(test)]
@@ -154,7 +116,11 @@ pub(crate) mod tests {
             .await
             .unwrap();
         store
-            .ensure_host("testhost", "qemu:///system")
+            .ensure_host(
+                "00000000000000000000000000000001",
+                "testhost",
+                "qemu:///system",
+            )
             .await
             .unwrap();
         (dir, store, plan, user)
@@ -207,13 +173,14 @@ pub(crate) mod tests {
                     visibility: Visibility::Off,
                     created_at: OffsetDateTime::now_utc(),
                     last_seen_at: None,
+                    slot: None,
                 },
                 std::time::Duration::from_secs(1),
                 bento_types::Capacity::unbounded(),
             )
             .await
             .unwrap();
-        let text = build_ruleset(&store, plan, PortRange { from: 0, to: 0 })
+        let text = build_ruleset(&store, plan, PortRange { from: 0, to: 0 }, 1)
             .await
             .unwrap()
             .render()
@@ -231,6 +198,7 @@ pub(crate) mod tests {
             plan,
             applier.clone(),
             PortRange { from: 0, to: 0 },
+            1,
         );
         firewall.reload().await.unwrap();
         firewall.reload().await.unwrap();

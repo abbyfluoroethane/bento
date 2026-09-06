@@ -7,7 +7,9 @@ use crate::{Ipv4Prefix, Result, UserNetwork, invalid};
 
 /// An inclusive TCP port range the host may reach on an instance, such
 /// as the 3000-9999 proxy range of SPEC 9.1.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct PortRange {
     pub from: i32,
     pub to: i32,
@@ -16,7 +18,7 @@ pub struct PortRange {
 /// One instance as the firewall sees it: its address and the HTTP ports
 /// the host may reach. Port 22 is always reachable from the host and
 /// need not be listed.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PublishedInstance {
     pub address: Ipv4Addr,
     pub http_ports: Vec<i32>,
@@ -40,6 +42,22 @@ pub struct Ruleset {
     /// Every user with a network. Order does not matter to the policy;
     /// [`Ruleset::render`] sorts by bridge name so output is stable.
     pub users: Vec<FirewallUser>,
+    /// Whether another machine runs guests for these users.
+    ///
+    /// When it does, a guest packet can reach this machine over the
+    /// underlay rather than from a local bridge, and the policy must
+    /// admit it (MULTI-NODE 8.4). Leaving this false on a single-machine
+    /// deployment keeps exactly the version-1 policy, so nothing that
+    /// arrives from outside a user bridge is ever forwarded to a guest.
+    pub underlay_peers: bool,
+    /// Frontend addresses on other machines that may reach a local
+    /// instance's published ports (MULTI-NODE 8.4).
+    ///
+    /// A frontend on this machine needs no entry: it reaches a local
+    /// guest through the `output` chain. This list exists for the
+    /// machines that do not run the frontend, whose guests the frontend
+    /// reaches over the underlay.
+    pub frontends: Vec<Ipv4Addr>,
 }
 
 impl Ruleset {
@@ -162,6 +180,49 @@ impl Ruleset {
                 .expect("writing to a String cannot fail");
             }
         }
+        if self.underlay_peers {
+            // A guest of this user may run on another machine. Its packets
+            // arrive over the underlay rather than from a user bridge, so
+            // the bridge-to-bridge rules below never see them
+            // (MULTI-NODE 8.4). Both addresses are held to the same user
+            // network, which is what stops the underlay carrying traffic
+            // between two different users. The source address is the
+            // guest's own; no machine rewrites it.
+            text.push_str(
+                "\t\t# rule 6: same user, different machines, arriving over the underlay\n",
+            );
+            for user in &users {
+                writeln!(
+                    text,
+                    "\t\tip saddr {subnet} ip daddr {subnet} oifname {:?} accept",
+                    user.network.bridge,
+                    subnet = format_prefix(user.network.subnet)
+                )
+                .expect("writing to a String cannot fail");
+            }
+        }
+        if !self.frontends.is_empty() {
+            // The frontend runs on one machine and the guest may run on
+            // another. Reaching it is then a forwarded packet, not one
+            // this machine originates, so the `output` rule above does not
+            // cover it (MULTI-NODE 8.4). Only the named frontend
+            // addresses and only the published ports are permitted.
+            text.push_str("\t\t# rule 7: a frontend on another machine reaching an instance\n");
+            for user in &users {
+                for instance in &user.instances {
+                    for frontend in &self.frontends {
+                        writeln!(
+                            text,
+                            "\t\tip saddr {frontend} oifname {:?} ip daddr {} tcp dport {{ {} }} accept",
+                            user.network.bridge,
+                            instance.address,
+                            port_set(&instance.http_ports, &instance.port_ranges)
+                        )
+                        .expect("writing to a String cannot fail");
+                    }
+                }
+            }
+        }
         text.push_str("\t\t# rule 4: permit traffic within a user's bridge\n");
         for user in &users {
             writeln!(
@@ -229,6 +290,8 @@ pub(crate) mod tests {
     pub(crate) fn two_user_ruleset() -> Ruleset {
         Ruleset {
             private_range: bento_config::parse_prefix("10.77.0.0/16").unwrap(),
+            underlay_peers: false,
+            frontends: Vec::new(),
             users: vec![
                 FirewallUser {
                     network: UserNetwork {
@@ -266,6 +329,81 @@ pub(crate) mod tests {
                 },
             ],
         }
+    }
+
+    /// The same two users, but a second machine also runs guests for
+    /// them and the frontend lives elsewhere (MULTI-NODE 8.4).
+    fn multi_node_ruleset() -> Ruleset {
+        Ruleset {
+            underlay_peers: true,
+            frontends: vec![Ipv4Addr::new(10, 0, 0, 188)],
+            ..two_user_ruleset()
+        }
+    }
+
+    #[test]
+    fn one_machine_alone_keeps_the_version_one_policy() {
+        // Nothing arriving from outside a user bridge may reach a guest
+        // when no other machine runs one.
+        let text = two_user_ruleset().render().unwrap();
+        assert!(!text.contains("rule 6"), "{text}");
+        assert!(!text.contains("rule 7"), "{text}");
+        assert!(text.contains("type filter hook forward priority filter; policy drop;"));
+    }
+
+    #[test]
+    fn the_underlay_carries_one_users_traffic_and_not_another_users() {
+        let text = multi_node_ruleset().render().unwrap();
+
+        // Rule 6 holds both addresses to the same user network, so the
+        // underlay cannot carry traffic between two users.
+        assert!(
+            text.contains("ip saddr 10.77.2.0/24 ip daddr 10.77.2.0/24 oifname \"bento2\" accept"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("ip saddr 10.77.2.0/24 ip daddr 10.77.1.0/24"),
+            "the underlay would carry traffic between two users:\n{text}"
+        );
+
+        // The cross-bridge drops still precede every accept.
+        let drop_at = text
+            .find("iifname \"bento1\" oifname \"bento2\" drop")
+            .unwrap();
+        let accept_at = text.find("ip saddr 10.77.2.0/24 ip daddr").unwrap();
+        assert!(drop_at < accept_at, "an accept precedes the drops:\n{text}");
+    }
+
+    #[test]
+    fn a_remote_frontend_reaches_only_published_ports() {
+        let text = multi_node_ruleset().render().unwrap();
+
+        // The frontend runs on another machine, so reaching a guest here
+        // is a forwarded packet and the output chain never sees it.
+        assert!(
+            text.contains(
+                "ip saddr 10.0.0.188 oifname \"bento2\" ip daddr 10.77.2.2 \
+                 tcp dport { 22, 3000 } accept"
+            ) || text.contains("ip saddr 10.0.0.188 oifname \"bento2\" ip daddr 10.77.2.2"),
+            "{text}"
+        );
+        // No unrestricted accept for the frontend address.
+        assert!(
+            !text.contains("ip saddr 10.0.0.188 accept"),
+            "the frontend may reach any port:\n{text}"
+        );
+    }
+
+    #[test]
+    fn guest_to_guest_across_machines_is_not_masqueraded() {
+        // The destination is inside the private range, so rule 5 does not
+        // match it and the guest source address survives the hop
+        // (MULTI-NODE 8.4).
+        let text = multi_node_ruleset().render().unwrap();
+        assert!(
+            text.contains("ip saddr 10.77.2.0/24 ip daddr != 10.77.0.0/16 masquerade"),
+            "{text}"
+        );
     }
 
     #[test]

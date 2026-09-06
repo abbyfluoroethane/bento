@@ -192,32 +192,21 @@ fn find_error<'a, E: StdError + 'static>(error: &'a (dyn StdError + 'static)) ->
 
 /// Maps persistence and lifecycle failures to the established HTTP contract.
 pub(crate) fn mapped_error(error: BoxError) -> Response {
-    if let Some(store_error) = find_error::<StoreError>(error.as_ref()) {
-        match store_error {
-            StoreError::NotFound => {
-                return error_response(StatusCode::NOT_FOUND, "not found");
-            }
-            StoreError::NameTaken => {
-                return error_response(StatusCode::CONFLICT, "that name is taken");
-            }
-            StoreError::Capacity { .. } => {
-                return error_response(StatusCode::CONFLICT, store_error.to_string());
-            }
-            StoreError::NameCooldown { remaining, .. } => {
-                return json_response(
-                    StatusCode::CONFLICT,
-                    &ErrorBody {
-                        error: store_error.to_string(),
-                        cooldown_seconds: remaining.as_secs() as i64,
-                    },
-                );
-            }
-        }
+    if let Some(store_error) = find_error::<StoreError>(error.as_ref())
+        && let StoreError::NameCooldown { remaining, .. } = store_error
+    {
+        return json_response(
+            StatusCode::CONFLICT,
+            &ErrorBody {
+                error: store_error.to_string(),
+                cooldown_seconds: remaining.as_secs() as i64,
+            },
+        );
     }
-    if let Some(status_error) = find_error::<StatusError>(error.as_ref()) {
-        return error_response(status_error.http_status(), status_error.to_string());
-    }
-    error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+    // JSON and HTML use one status decision. This keeps the fleet gate at
+    // HTTP 409 in both paths (MULTI-NODE 13.2).
+    let (status, message) = error_parts(&error);
+    error_response(status, message)
 }
 
 pub(crate) fn valid_name(name: &str) -> bool {

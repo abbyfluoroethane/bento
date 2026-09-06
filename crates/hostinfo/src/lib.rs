@@ -1,5 +1,5 @@
-//! What the host has: processor time, memory, and free space on a
-//! filesystem.
+//! What the host has: its identity, processor time, memory, and free
+//! space on a filesystem.
 //!
 //! Three callers read these numbers. `bentod` reads memory and the
 //! storage volume once at startup, to build the ceiling that a create or
@@ -8,12 +8,67 @@
 //! `bento-monitor` reads them every frame to draw the operator screen.
 //!
 //! The parsers take text so that a test can supply a host it does not
-//! have. Only the two `read_*` functions and [`disk_usage`] touch the
-//! real host.
+//! have. Only the `read_*` functions and [`disk_usage`] touch the real
+//! host.
 
 use std::ffi::CString;
 use std::io;
 use std::path::Path;
+
+/// Where systemd writes the machine ID. It is generated once, at first
+/// boot, and it stays the same across a rename, a new DHCP lease, and a
+/// reinstalled network.
+const MACHINE_ID_FILE: &str = "/etc/machine-id";
+
+/// The D-Bus copy. A host whose `/etc` copy is absent or still empty can
+/// have this one.
+const DBUS_MACHINE_ID_FILE: &str = "/var/lib/dbus/machine-id";
+
+/// The durable identity of this machine: 32 lowercase hexadecimal digits.
+///
+/// Bento keys the `hosts` row on this value, not on the hostname. The
+/// kernel hostname is the transient one, so NetworkManager or a DHCP
+/// lease can change it while the machine stays the same.
+pub fn read_machine_id() -> io::Result<String> {
+    for path in [MACHINE_ID_FILE, DBUS_MACHINE_ID_FILE] {
+        // A missing file is the reason to try the next one. Any other
+        // error is the operator's to see, so it is not swallowed here.
+        let text = match std::fs::read_to_string(path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        if let Some(id) = parse_machine_id(&text) {
+            return Ok(id);
+        }
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!("no machine ID in {MACHINE_ID_FILE} or {DBUS_MACHINE_ID_FILE}"),
+    ))
+}
+
+/// The machine ID in the text of a machine-id file, if it holds one.
+///
+/// `systemd-machine-id-setup` leaves the file empty on a read-only or
+/// first-boot host, and an image can ship the word `uninitialized`.
+/// Neither is an identity, so both answer `None` and the caller stops
+/// rather than key a database row on a value every machine shares.
+pub fn parse_machine_id(text: &str) -> Option<String> {
+    let id = text.trim();
+    let shaped = id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit());
+    (shaped && id.chars().all(|c| !c.is_ascii_uppercase())).then(|| id.to_owned())
+}
+
+/// The hostname the kernel reports. It is a label, never an identity:
+/// see [`read_machine_id`].
+pub fn read_hostname() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|text| text.trim().to_owned())
+        .ok()
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "localhost".to_owned())
+}
 
 /// One reading of the aggregate processor counters of `/proc/stat`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -155,6 +210,33 @@ mod tests {
     use super::*;
 
     const STAT: &str = "cpu  100 0 50 800 50 0 0 0 0 0\ncpu0 50 0 25 400 25 0 0 0 0 0\nintr 1\n";
+
+    #[test]
+    fn a_machine_id_is_thirty_two_lowercase_hexadecimal_digits() {
+        let id = "ebb80f403ef641deaa486417f2b6992a";
+        assert_eq!(parse_machine_id(id).as_deref(), Some(id));
+        // systemd writes the value with a trailing newline.
+        assert_eq!(parse_machine_id(&format!("{id}\n")).as_deref(), Some(id));
+    }
+
+    #[test]
+    fn a_host_without_an_identity_yet_reports_none() {
+        // A first-boot or read-only host leaves the file empty, and an
+        // image can ship the word instead of a value. Keying a database
+        // row on either would give every such host the same identity.
+        for text in ["", "\n", "uninitialized\n"] {
+            assert_eq!(parse_machine_id(text), None, "{text:?}");
+        }
+        // Too short, too long, not hexadecimal, and not lowercase.
+        for text in [
+            "ebb80f403ef641deaa486417f2b6992",
+            "ebb80f403ef641deaa486417f2b6992ab",
+            "ebb80f403ef641deaa486417f2b6992g",
+            "EBB80F403EF641DEAA486417F2B6992A",
+        ] {
+            assert_eq!(parse_machine_id(text), None, "{text:?}");
+        }
+    }
 
     #[test]
     fn the_aggregate_processor_line_counts_iowait_as_idle() {

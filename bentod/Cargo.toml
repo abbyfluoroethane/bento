@@ -26,6 +26,7 @@ bento-images = { workspace = true }
 bento-lifecycle = { workspace = true }
 bento-network = { workspace = true }
 bento-proxy = { workspace = true }
+bento-runner = { workspace = true }
 bento-sshfront = { workspace = true }
 bento-store = { workspace = true }
 bento-tlscert = { workspace = true }
@@ -38,6 +39,8 @@ reqwest = { workspace = true }
 rand = { workspace = true }
 russh = { workspace = true }
 rustls = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true, features = ["io-util"] }
@@ -47,6 +50,5 @@ url = { workspace = true }
 
 [dev-dependencies]
 hex = { workspace = true }
-serde_json = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }

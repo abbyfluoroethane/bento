@@ -17,7 +17,8 @@ impl Manager {
             return Ok(());
         }
         let old_name = instance.name.clone();
-        let domain_gone = match self.hyp.state(&old_name).await {
+        let hyp = self.hyp_for(&instance).await?;
+        let domain_gone = match hyp.state(&old_name).await {
             Ok(State::Stopped) => false,
             Ok(state) => return Err(Error::RenameNeedsStop(format!("{old_name} is {state}"))),
             Err(HypervisorError::DomainNotFound(_)) => true,
@@ -45,7 +46,7 @@ impl Manager {
             Ok(xml) => xml,
             Err(error) => return Err(self.unwind_rename(&instance, &old_name, error).await),
         };
-        match self.hyp.remove(&old_name).await {
+        match hyp.remove(&old_name).await {
             Ok(()) | Err(HypervisorError::DomainNotFound(_)) => {}
             Err(error) => {
                 return Err(self

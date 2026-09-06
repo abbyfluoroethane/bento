@@ -3,55 +3,181 @@
 //! libvirt, user networks, firewall, reboot restore, then HTTP.
 
 use std::ffi::OsString;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use axum::Router;
 use axum::body::Body;
 use axum::extract::Path as AxumPath;
 use axum::http::{HeaderMap, Response, Uri};
 use axum::routing::{get, post};
-use bento_hypervisor::{CheckConfig, NetworkManager};
+use bento_hypervisor::NetworkManager;
 use bento_network::{NftApplier, PortRange};
+use bento_types::Lease;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::adapters::{
-    ApiBackend, ApiStore, AuthAccess, AuthPairings, AuthTokens, AuthUsers, Authenticator, Backend,
-    NetworkEnsurer, Provisioner, RuntimeImages, access_status, operator_predicate, user_network,
+    AccountProvisioner, ApiBackend, ApiStore, AuthAccess, AuthPairings, AuthTokens, AuthUsers,
+    Authenticator, Backend, NetworkEnsurer, RuntimeImages, access_status, operator_predicate,
+    user_network,
 };
 use crate::firewall::Firewall;
 use crate::keys::{FRONTEND_KEY_FILE, authorized_key_line, ensure_key, key_path};
 use crate::ops::sync_image_allowlist;
-use crate::setup::{App, shutdown_signal, socket_path};
+use crate::setup::{App, host_checks, shutdown_signal};
+
+const CONTROLLER_LEASE_TTL: Duration = Duration::from_secs(30);
 
 pub(crate) async fn run_serve(config: &Path, _args: &[OsString]) -> Result<()> {
     let app = App::new(config).await?;
-    let result = serve_inner(&app).await;
+    let holder_id = bento_lifecycle::random_uuid();
+    let lease = acquire_controller_lease(&app.store, holder_id.clone()).await?;
+    tracing::info!(
+        controller_epoch = lease.epoch,
+        holder_id = %lease.holder_id,
+        expires_at = %lease.expires_at,
+        "controller lease acquired"
+    );
+
+    let cancellation = CancellationToken::new();
+    let (lease_sender, lease_receiver) = watch::channel(lease);
+    let renewal = spawn_lease_renewal(
+        app.store.clone(),
+        holder_id.clone(),
+        lease_sender,
+        cancellation.clone(),
+    );
+    let result = serve_inner(&app, lease_receiver, cancellation.clone()).await;
+    cancellation.cancel();
+    let _ = renewal.await;
+    let release = app.store.release_lease(holder_id).await;
+    if let Err(error) = &release {
+        tracing::warn!(%error, "controller lease release failed");
+    }
     app.close().await;
-    result
+    result?;
+    release.context("release controller lease (MULTI-NODE 11.3)")?;
+    Ok(())
 }
 
-async fn serve_inner(app: &App) -> Result<()> {
+async fn acquire_controller_lease(store: &bento_store::Store, holder_id: String) -> Result<Lease> {
+    match store.acquire_lease(holder_id, CONTROLLER_LEASE_TTL).await {
+        Ok(lease) => Ok(lease),
+        Err(bento_store::Error::LeaseHeld { holder, expires_at }) => bail!(
+            "control plane cannot start: controller lease is held by {holder} until {expires_at} (MULTI-NODE 11.3)"
+        ),
+        Err(error) => Err(error).context("acquire controller lease (MULTI-NODE 11.3)"),
+    }
+}
+
+fn spawn_lease_renewal(
+    store: bento_store::Store,
+    holder_id: String,
+    lease_sender: watch::Sender<Lease>,
+    cancellation: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(CONTROLLER_LEASE_TTL / 3);
+        // The lease already has a full TTL. Wait one renewal period before
+        // writing it again (MULTI-NODE 11.3).
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                _ = cancellation.cancelled() => return,
+                _ = ticker.tick() => {
+                    match store.renew_lease(holder_id.clone(), CONTROLLER_LEASE_TTL).await {
+                        Ok(lease) => {
+                            lease_sender.send_replace(lease);
+                        }
+                        Err(bento_store::Error::LeaseLost) => {
+                            tracing::error!(
+                                "controller lease lost; this process has been replaced and must not dispatch"
+                            );
+                            cancellation.cancel();
+                            return;
+                        }
+                        Err(error) => {
+                            // The controller cannot prove that it still owns
+                            // the lease. Stop before it can dispatch stale work
+                            // (MULTI-NODE 11.3).
+                            tracing::error!(
+                                %error,
+                                "controller lease renewal failed; this process must not dispatch"
+                            );
+                            cancellation.cancel();
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    })
+}
+
+async fn serve_inner(
+    app: &App,
+    lease: watch::Receiver<Lease>,
+    cancellation: CancellationToken,
+) -> Result<()> {
     host_checks(app).await?;
     let hypervisor = app.connect_libvirt().await?;
-    let hostname = std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .unwrap_or_else(|_| "localhost".to_owned())
-        .trim()
-        .to_owned();
+    // The machine ID is the key and the hostname is a label. Reading the
+    // transient kernel hostname as the key gave one machine a second row
+    // every time NetworkManager renamed it (MULTI-NODE 16).
+    let machine_id = bento_hostinfo::read_machine_id()
+        .map_err(|error| anyhow::anyhow!("machine identity: {error}"))?;
     let host = app
         .store
-        .ensure_host(hostname, &app.cfg.libvirt_uri)
+        .ensure_host(
+            machine_id,
+            bento_hostinfo::read_hostname(),
+            &app.cfg.libvirt_uri,
+        )
         .await
         .map_err(|error| anyhow::anyhow!("hosts row: {error}"))?;
+    for runner in &app.cfg.runners {
+        // The configuration validated this address at startup, so the
+        // only reachable failure here would be a code change that let an
+        // unvalidated entry through (MULTI-NODE 8.5).
+        let underlay = runner
+            .underlay_address()
+            .map_err(|error| anyhow::anyhow!("runner {:?}: {error}", runner.name))?;
+        app.store
+            .register_runner(&runner.name, &runner.endpoint, underlay.to_string())
+            .await
+            .with_context(|| format!("register runner {:?}", runner.name))?;
+    }
 
     // The frontend public key rides in every seed so the frontend can reach
     // guests (SPEC 10 step 9). Creating it here keeps serve and sshd aligned.
     let frontend_key = ensure_key(&key_path(app, FRONTEND_KEY_FILE), "bento-frontend")?;
     let frontend_public = authorized_key_line(frontend_key.public_key(), "bento-frontend")?;
-    let manager = app.manager(hypervisor.clone())?;
+    // Only this process holds the controller lease, so only this process
+    // may send a change to another machine (MULTI-NODE 11.3). A create
+    // that placement sends elsewhere goes through here.
+    let instances = crate::runners::InstanceSync::new(app.store.clone(), lease.clone());
+    let manager = app.manager_with_runners(hypervisor.clone(), host.id, Some(instances.clone()))?;
     sync_image_allowlist(app).await?;
+
+    // The controller fetches images to its own image directory, so the
+    // versions it knows about are files on this machine. Recording them
+    // is what lets the fleet gate pass on a deployment that has only ever
+    // had one host (MULTI-NODE 13.2).
+    let recorded = app
+        .store
+        .record_local_image_versions(host.id)
+        .await
+        .map_err(|error| anyhow::anyhow!("record local image versions: {error}"))?;
+    if recorded > 0 {
+        tracing::info!(
+            host = %host.name,
+            versions = recorded,
+            "recorded the image versions this machine holds"
+        );
+    }
 
     // Per-user networks and one whole-table nftables reload (SPEC 6.2, 6.3).
     let firewall = Arc::new(Firewall::new(
@@ -62,6 +188,7 @@ async fn serve_inner(app: &App) -> Result<()> {
             from: i32::from(app.cfg.listen.proxy_port_min),
             to: i32::from(app.cfg.listen.proxy_port_max),
         },
+        host.id,
     ));
     ensure_user_networks(app, hypervisor.as_ref()).await?;
     firewall
@@ -71,7 +198,7 @@ async fn serve_inner(app: &App) -> Result<()> {
 
     // The sampler holds the series the dashboard charts read (SPEC
     // 14.4). The router answers from it, and the task below fills it.
-    let sampler = Arc::new(crate::metrics::Sampler::default());
+    let sampler = Arc::new(crate::metrics::Sampler::new());
     let router = control_plane_router(
         app,
         manager.clone(),
@@ -91,7 +218,6 @@ async fn serve_inner(app: &App) -> Result<()> {
         "control plane listening"
     );
 
-    let cancellation = CancellationToken::new();
     let restore = tokio::spawn({
         let manager = manager.clone();
         async move {
@@ -116,6 +242,14 @@ async fn serve_inner(app: &App) -> Result<()> {
             manager: manager.clone(),
             domains: hypervisor.clone(),
             storage_dir: app.cfg.storage_dir.clone(),
+            local_host_id: host.id,
+            // Every other machine is asked over the runner protocol. A
+            // guest on another machine is not in this machine's libvirt,
+            // so without this its charts would stay empty for ever
+            // (MULTI-NODE 20).
+            remote: Some(Arc::new(crate::runners::RunnerSampler::new(
+                instances.clone(),
+            ))),
         };
         let cancellation = cancellation.clone();
         async move {
@@ -129,6 +263,23 @@ async fn serve_inner(app: &App) -> Result<()> {
                     _ = ticker.tick() => task.tick().await,
                 }
             }
+        }
+    });
+    let runner_poll = tokio::spawn({
+        let network_sync = crate::runners::NetworkSync::new(
+            app.store.clone(),
+            lease.clone(),
+            app.plan,
+            PortRange {
+                from: i32::from(app.cfg.listen.proxy_port_min),
+                to: i32::from(app.cfg.listen.proxy_port_max),
+            },
+            host.id,
+        );
+        let task = crate::runners::PollTask::new(app.store.clone(), lease, network_sync, host.id);
+        let cancellation = cancellation.clone();
+        async move {
+            task.run(cancellation.cancelled()).await;
         }
     });
     let convergence = tokio::spawn({
@@ -145,8 +296,10 @@ async fn serve_inner(app: &App) -> Result<()> {
     let shutdown = cancellation.clone();
     let serve_result = axum::serve(listener, router)
         .with_graceful_shutdown(async move {
-            shutdown_signal().await;
-            shutdown.cancel();
+            tokio::select! {
+                _ = shutdown_signal() => shutdown.cancel(),
+                _ = shutdown.cancelled() => {}
+            }
         })
         .await;
     cancellation.cancel();
@@ -155,48 +308,11 @@ async fn serve_inner(app: &App) -> Result<()> {
     let _ = poller.await;
     let _ = convergence.await;
     let _ = sampling.await;
+    let _ = runner_poll.await;
     drop(manager);
     drop(firewall);
     hypervisor.close().await?;
     Ok(serve_result?)
-}
-
-/// Runs the SPEC 4.2 checks. Fatal requirements refuse startup; KSM and
-/// nested-virtualization failures only warn.
-async fn host_checks(app: &App) -> Result<()> {
-    let nested_wanted = app
-        .store
-        .instances()
-        .await
-        .unwrap_or_default()
-        .iter()
-        .any(|instance| instance.nested);
-    let report = bento_hypervisor::check(
-        CheckConfig {
-            socket_path: socket_path(&app.cfg.libvirt_uri),
-            image_dir: PathBuf::from(&app.cfg.image_dir),
-            storage_dir: PathBuf::from(&app.cfg.storage_dir),
-            container_storage: PathBuf::from(&app.cfg.bootc.container_storage),
-            podman_required: app.cfg.images.iter().any(|image| !image.oci.is_empty()),
-            nested_wanted,
-            ..Default::default()
-        },
-        &bento_hypervisor::default_check_deps(),
-    );
-    for warning in report.warnings() {
-        tracing::warn!(check = %warning.name, detail = %warning.detail, "host check");
-    }
-    if !report.ok() {
-        let failures = report
-            .results
-            .iter()
-            .filter(|result| result.fatal && !result.ok)
-            .map(|result| format!("{}: {}", result.name, result.detail))
-            .collect::<Vec<_>>()
-            .join("\n  ");
-        bail!("host requirements not met (SPEC 4.2):\n  {failures}");
-    }
-    Ok(())
 }
 
 /// Defines and starts every registered user's libvirt network (SPEC 6.2).
@@ -330,7 +446,7 @@ async fn control_plane_router(
     if app.cfg.oidc.allow_signup {
         // Wiring the provisioner is what opens signups: without it a login
         // for an unknown identity is refused (SPEC 13).
-        auth = auth.with_provisioner(Arc::new(Provisioner {
+        auth = auth.with_provisioner(Arc::new(AccountProvisioner {
             store: app.store.clone(),
             plan: app.plan,
             networks: Some(hypervisor.clone()),
@@ -486,6 +602,29 @@ fn auth_response(response: http::Response<String>) -> Response<Body> {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn startup_refuses_a_lease_held_by_another_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = bento_store::Store::open(directory.path().join("bento.db"))
+            .await
+            .unwrap();
+        let held = store
+            .acquire_lease("controller-a", CONTROLLER_LEASE_TTL)
+            .await
+            .unwrap();
+
+        let error = acquire_controller_lease(&store, "controller-b".into())
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("control plane cannot start"), "{error}");
+        assert!(error.contains("controller-a"), "{error}");
+        assert!(error.contains(&held.expires_at.to_string()), "{error}");
+    }
+
     #[test]
     fn status_code_type_is_the_http_one() {
         assert_eq!(http::StatusCode::NO_CONTENT.as_u16(), 204);

@@ -11,7 +11,7 @@ use crate::{Error, Result, Store, format_time, parse_time};
 
 const INSTANCE_COLUMNS: &str = "uuid, name, owner_id, host_id, image_name, base_checksum, \
      state, desired_state, address, mac, vcpu, memory, disk, nested, ksm, \
-     http_port, visibility, created_at, last_seen_at";
+     http_port, visibility, created_at, last_seen_at, slot";
 
 impl Store {
     /// Inserts an instance after checking name cooldown (SPEC 7.2) and
@@ -27,7 +27,14 @@ impl Store {
         let now = self.clock();
         self.with_tx(move |tx| {
             claim_name_tx(tx, &instance.name, instance.owner_id, name_cooldown, now())?;
-            check_capacity_tx(tx, "", instance.memory_mib, instance.disk_gib, capacity)?;
+            check_capacity_tx(
+                tx,
+                instance.host_id,
+                "",
+                instance.memory_mib,
+                instance.disk_gib,
+                capacity,
+            )?;
             let created_at = if instance.created_at == time::OffsetDateTime::UNIX_EPOCH {
                 now()
             } else {
@@ -37,8 +44,8 @@ impl Store {
                 "INSERT INTO instances \
                  (uuid, name, owner_id, host_id, image_name, base_checksum, \
                   state, desired_state, address, mac, vcpu, memory, disk, \
-                  nested, ksm, http_port, visibility, created_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                  nested, ksm, http_port, visibility, created_at, slot) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 params![
                     instance.uuid,
                     instance.name,
@@ -57,7 +64,8 @@ impl Store {
                     instance.ksm,
                     instance.http_port,
                     instance.visibility.as_str(),
-                    format_time(created_at)?
+                    format_time(created_at)?,
+                    instance.slot
                 ],
             )?;
             Ok(())
@@ -121,11 +129,12 @@ impl Store {
     ) -> Result<()> {
         let uuid = uuid.into();
         self.with_tx(move |tx| {
-            // Read only to fail with NotFound on an unknown UUID. The
-            // capacity check below sums every row, so it would otherwise
-            // pass for an instance that does not exist.
-            get_instance_tx(tx, "uuid", &uuid)?;
-            check_capacity_tx(tx, &uuid, memory_mib, disk_gib, capacity)?;
+            // Read to fail with NotFound on an unknown UUID, and to learn
+            // which machine the instance is on: a resize is weighed
+            // against that machine's ceiling, not the controller's
+            // (MULTI-NODE 12).
+            let existing = get_instance_tx(tx, "uuid", &uuid)?;
+            check_capacity_tx(tx, existing.host_id, &uuid, memory_mib, disk_gib, capacity)?;
             tx.execute(
                 "UPDATE instances SET vcpu = ?, memory = ?, disk = ?, nested = ? WHERE uuid = ?",
                 params![vcpu, memory_mib, disk_gib, nested, uuid],
@@ -162,12 +171,24 @@ impl Store {
             .await
     }
 
-    /// Lists instances whose desired state is running while observed state
-    /// is stopped: the reboot-restore batch input (SPEC 11.2).
-    pub async fn instances_to_restore(&self) -> Result<Vec<Instance>> {
+    /// Lists one host's instances, oldest first. Host-local checks must not
+    /// treat instances on another host as missing (MULTI-NODE 21).
+    pub async fn instances_on_host(&self, host_id: i64) -> Result<Vec<Instance>> {
         self.list_instances(
-            "WHERE desired_state = 'running' AND state = 'stopped' ORDER BY created_at, uuid",
-            Vec::new(),
+            "WHERE host_id = ? ORDER BY created_at, uuid",
+            vec![Value::Integer(host_id)],
+        )
+        .await
+    }
+
+    /// Lists instances whose desired state is running while observed state
+    /// is stopped (SPEC 11.2). Restore must not act on another host's
+    /// instances (MULTI-NODE 21).
+    pub async fn instances_to_restore(&self, host_id: i64) -> Result<Vec<Instance>> {
+        self.list_instances(
+            "WHERE host_id = ? AND desired_state = 'running' AND state = 'stopped' \
+             ORDER BY created_at, uuid",
+            vec![Value::Integer(host_id)],
         )
         .await
     }
@@ -293,8 +314,18 @@ fn get_instance_tx(tx: &Transaction<'_>, column: &str, value: &str) -> Result<In
 ///
 /// A ceiling of zero bounds nothing, so that check is skipped. See
 /// [`Capacity::unbounded`].
+/// Refuses work that would take one machine past its ceiling
+/// (SPEC 6.1).
+///
+/// The sum is of that machine's instances only, and `capacity` is that
+/// machine's ceiling. Capacity belongs to a host: a deployment with two
+/// machines has two ceilings, and adding them together would let one
+/// machine be filled past its own (MULTI-NODE 12). Summing the whole
+/// deployment against one machine's figures was right when there was one
+/// machine, and became wrong the moment placement could choose another.
 fn check_capacity_tx(
     tx: &Transaction<'_>,
+    host_id: i64,
     exclude_uuid: &str,
     add_memory: i64,
     add_disk: i64,
@@ -302,8 +333,8 @@ fn check_capacity_tx(
 ) -> Result<()> {
     let (memory, disk) = tx.query_row(
         "SELECT COALESCE(SUM(memory), 0), COALESCE(SUM(disk), 0) \
-         FROM instances WHERE uuid != ?",
-        params![exclude_uuid],
+         FROM instances WHERE host_id = ? AND uuid != ?",
+        params![host_id, exclude_uuid],
         |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
     for (resource, used, requested, limit) in [
@@ -346,6 +377,7 @@ pub(crate) fn scan_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<Instanc
         ksm: row.get(14)?,
         http_port: row.get(15)?,
         visibility: parse_enum(16, &visibility_text)?,
+        slot: row.get(19)?,
         created_at: parse_time(17, &created_text)?,
         last_seen_at: last_seen_text
             .as_deref()
@@ -354,7 +386,7 @@ pub(crate) fn scan_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<Instanc
     })
 }
 
-fn parse_enum<T>(column: usize, value: &str) -> rusqlite::Result<T>
+pub(crate) fn parse_enum<T>(column: usize, value: &str) -> rusqlite::Result<T>
 where
     T: FromStr,
     T::Err: std::error::Error + Send + Sync + 'static,
@@ -456,6 +488,52 @@ mod tests {
                 resource: "memory",
                 ..
             })
+        ));
+    }
+
+    #[tokio::test]
+    async fn capacity_counts_one_machine_not_the_whole_deployment() {
+        // Capacity belongs to a host (MULTI-NODE 12). Summing every
+        // instance in the deployment against one machine's ceiling was
+        // right when there was one machine, and refuses work the moment
+        // there are two: a full machine would block a create bound for an
+        // empty one.
+        let store = new_test_store().await;
+        let (owner, host) = seed_store(&store).await;
+        let second = store
+            .register_runner("tsukasa", "http://10.0.0.97:10443", "10.0.0.97")
+            .await
+            .unwrap();
+        store.claim_slot(0, second.id).await.unwrap();
+        let capacity = Capacity {
+            memory_mib: 2048,
+            disk_gib: 100,
+        };
+
+        // Fill the second machine.
+        let mut theirs = test_instance(1, "theirs", &owner, &second);
+        theirs.memory_mib = 2048;
+        store
+            .create_instance(theirs, Duration::ZERO, capacity)
+            .await
+            .unwrap();
+
+        // The first machine is still empty, so a create bound for it fits.
+        store.claim_slot(0, host.id).await.unwrap();
+        let mut mine = test_instance(2, "mine", &owner, &host);
+        mine.memory_mib = 2048;
+        store
+            .create_instance(mine, Duration::ZERO, capacity)
+            .await
+            .expect("a full machine refused a create bound for an empty one");
+
+        // And the machine that is full still refuses.
+        store.claim_slot(0, second.id).await.unwrap();
+        let mut third = test_instance(3, "third", &owner, &second);
+        third.memory_mib = 1;
+        assert!(matches!(
+            store.create_instance(third, Duration::ZERO, capacity).await,
+            Err(Error::Capacity { .. })
         ));
     }
 
@@ -586,13 +664,42 @@ mod tests {
             ]))
             .await
             .unwrap();
-        let restore = store.instances_to_restore().await.unwrap();
+        let restore = store.instances_to_restore(host.id).await.unwrap();
         assert_eq!(restore.len(), 1);
         assert_eq!(restore[0].uuid, "uuid-000");
         assert_eq!(
             store.instance("uuid-002").await.unwrap().state,
             State::Running
         );
+    }
+
+    #[tokio::test]
+    async fn host_scoped_instance_lists_exclude_other_hosts() {
+        let store = new_test_store().await;
+        let (owner, host_a) = seed_store(&store).await;
+        let host_b = store
+            .ensure_host(
+                "00000000000000000000000000000002",
+                "host-b.example.org",
+                "qemu+ssh://root@host-b.example.org/system",
+            )
+            .await
+            .unwrap();
+        let local = test_instance(1, "local", &owner, &host_a);
+        let remote = test_instance(2, "remote", &owner, &host_b);
+        for instance in [local.clone(), remote] {
+            store
+                .create_instance(instance, Duration::ZERO, Capacity::unbounded())
+                .await
+                .unwrap();
+        }
+
+        let on_host = store.instances_on_host(host_a.id).await.unwrap();
+        assert_eq!(on_host.len(), 1);
+        assert_eq!(on_host[0].uuid, local.uuid);
+        let restore = store.instances_to_restore(host_a.id).await.unwrap();
+        assert_eq!(restore.len(), 1);
+        assert_eq!(restore[0].uuid, local.uuid);
     }
 
     #[tokio::test]

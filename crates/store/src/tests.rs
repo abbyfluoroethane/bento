@@ -77,7 +77,14 @@ pub(crate) async fn seed_store(store: &Store) -> (User, Host) {
         .register_user("alice", "alice@example.org", None, test_range())
         .await
         .unwrap();
-    let host = store.ensure_host("host1", "qemu:///system").await.unwrap();
+    let host = store
+        .ensure_host(
+            "00000000000000000000000000000001",
+            "host1",
+            "qemu:///system",
+        )
+        .await
+        .unwrap();
     store
         .upsert_image(Image {
             name: "debian-13".into(),
@@ -124,6 +131,7 @@ pub(crate) fn test_instance(number: usize, name: &str, owner: &User, host: &Host
         visibility: Visibility::Off,
         created_at: OffsetDateTime::UNIX_EPOCH,
         last_seen_at: None,
+        slot: None,
     }
 }
 

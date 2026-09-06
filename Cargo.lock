@@ -323,6 +323,7 @@ name = "bento-cloudinit"
 version = "0.9.0"
 dependencies = [
  "async-trait",
+ "serde",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -412,6 +413,8 @@ dependencies = [
  "bento-types",
  "libc",
  "ratatui",
+ "tempfile",
+ "time",
  "tokio",
  "url",
 ]
@@ -422,6 +425,8 @@ version = "0.9.0"
 dependencies = [
  "async-trait",
  "bento-config",
+ "serde",
+ "serde_json",
  "sha2 0.11.0",
  "tempfile",
  "thiserror 2.0.20",
@@ -446,6 +451,26 @@ dependencies = [
  "tokio-rustls",
  "tokio-util",
  "url",
+]
+
+[[package]]
+name = "bento-runner"
+version = "0.9.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bento-cloudinit",
+ "bento-network",
+ "bento-types",
+ "reqwest",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "time",
+ "tokio",
+ "tower",
 ]
 
 [[package]]
@@ -524,6 +549,7 @@ dependencies = [
  "bento-lifecycle",
  "bento-network",
  "bento-proxy",
+ "bento-runner",
  "bento-sshfront",
  "bento-store",
  "bento-tlscert",

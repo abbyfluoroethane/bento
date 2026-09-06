@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::{OsStr, OsString};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -12,7 +12,10 @@ use bento_hypervisor::{
     StopResult,
 };
 use bento_network::Plan;
-use bento_types::{Capacity, DesiredState, Image, ImageKind, ImageVersion, Instance, State, User};
+use bento_types::{
+    Capacity, Deployment, DesiredState, Image, ImageKind, ImageVersion, Instance, Placing, Slot,
+    SlotState, State, User,
+};
 use tempfile::TempDir;
 use time::macros::datetime;
 
@@ -22,12 +25,25 @@ fn boxed(message: &str) -> DynError {
     Box::new(io::Error::other(message.to_string()))
 }
 
-#[derive(Default)]
 struct StoreData {
+    /// The deployment slot division and who owns each slot
+    /// (MULTI-NODE 7.1 and 7.2). The default matches a single-machine
+    /// deployment: one `/24`-wide slot owned by host 1.
+    runner_prefix: u8,
+    slots: Vec<Slot>,
+    /// How many machines could take an instance. One keeps the
+    /// single-machine behaviour, where placement is not consulted.
+    placeable_hosts: usize,
+    /// What `choose_host` answers. `None` makes it refuse.
+    chosen_host: Option<i64>,
+    /// The ceiling of one machine, when a test sets one.
+    capacities: HashMap<i64, Capacity>,
     instances: Vec<Instance>,
     users: HashMap<i64, User>,
     images: HashMap<String, Image>,
     versions: HashMap<String, ImageVersion>,
+    active_hosts: Vec<String>,
+    host_images: HashSet<(String, String, String)>,
     mutations: Vec<String>,
     released: Vec<String>,
     create_error: Option<String>,
@@ -37,6 +53,38 @@ struct StoreData {
     /// store is the layer that enforces it, so the manager's whole job
     /// here is to pass its configured value through unchanged.
     seen_capacity: Option<Capacity>,
+}
+
+impl Default for StoreData {
+    fn default() -> Self {
+        Self {
+            runner_prefix: 24,
+            placeable_hosts: 1,
+            chosen_host: None,
+            capacities: HashMap::new(),
+            slots: vec![Slot {
+                slot: 0,
+                state: SlotState::Active,
+                owner_host_id: 1,
+                ownership_epoch: 0,
+                source_host_id: None,
+                destination_host_id: None,
+                operation_id: None,
+            }],
+            instances: Vec::new(),
+            users: HashMap::new(),
+            images: HashMap::new(),
+            versions: HashMap::new(),
+            active_hosts: Vec::new(),
+            host_images: HashSet::new(),
+            mutations: Vec::new(),
+            released: Vec::new(),
+            create_error: None,
+            resize_error: None,
+            rename_error: None,
+            seen_capacity: None,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -88,6 +136,14 @@ impl TestStore {
             );
         }
     }
+    fn add_host(&self, name: &str) {
+        self.data().active_hosts.push(name.into());
+    }
+    fn hold_image(&self, host: &str, image: &str, checksum: &str) {
+        self.data()
+            .host_images
+            .insert((host.into(), image.into(), checksum.into()));
+    }
 }
 
 #[async_trait]
@@ -130,13 +186,30 @@ impl Store for TestStore {
     async fn instances(&self) -> std::result::Result<Vec<Instance>, DynError> {
         Ok(self.data().instances.clone())
     }
-    async fn instances_to_restore(&self) -> std::result::Result<Vec<Instance>, DynError> {
+    async fn instances_on_host(
+        &self,
+        host_id: i64,
+    ) -> std::result::Result<Vec<Instance>, DynError> {
+        Ok(self
+            .data()
+            .instances
+            .iter()
+            .filter(|item| item.host_id == host_id)
+            .cloned()
+            .collect())
+    }
+    async fn instances_to_restore(
+        &self,
+        host_id: i64,
+    ) -> std::result::Result<Vec<Instance>, DynError> {
         Ok(self
             .data()
             .instances
             .iter()
             .filter(|item| {
-                item.desired_state == DesiredState::Running && item.state == State::Stopped
+                item.host_id == host_id
+                    && item.desired_state == DesiredState::Running
+                    && item.state == State::Stopped
             })
             .cloned()
             .collect())
@@ -155,6 +228,56 @@ impl Store for TestStore {
             .cloned()
             .ok_or_else(|| boxed(&format!("no image version {checksum}")))
     }
+    async fn hosts_missing_image(
+        &self,
+        image_name: &str,
+        checksum: &str,
+    ) -> std::result::Result<Vec<String>, DynError> {
+        let data = self.data();
+        Ok(data
+            .active_hosts
+            .iter()
+            .filter(|host| {
+                !data.host_images.contains(&(
+                    (*host).clone(),
+                    image_name.to_owned(),
+                    checksum.to_owned(),
+                ))
+            })
+            .cloned()
+            .collect())
+    }
+    async fn host_capacity(&self, host_id: i64) -> std::result::Result<Capacity, DynError> {
+        // Every machine has the same generous ceiling unless a test says
+        // otherwise, so only a test about capacity sees one.
+        Ok(self
+            .data()
+            .capacities
+            .get(&host_id)
+            .copied()
+            .unwrap_or(TEST_CAPACITY))
+    }
+
+    async fn choose_host(&self, _want: Placing) -> std::result::Result<i64, DynError> {
+        let data = self.data();
+        data.chosen_host
+            .ok_or_else(|| boxed("no machine can take this instance"))
+    }
+
+    async fn placeable_hosts(&self) -> std::result::Result<usize, DynError> {
+        Ok(self.data().placeable_hosts)
+    }
+
+    async fn deployment(&self) -> std::result::Result<Deployment, DynError> {
+        Ok(Deployment {
+            runner_prefix: self.data().runner_prefix,
+        })
+    }
+
+    async fn slots(&self) -> std::result::Result<Vec<Slot>, DynError> {
+        Ok(self.data().slots.clone())
+    }
+
     async fn user_by_id(&self, id: i64) -> std::result::Result<User, DynError> {
         self.data()
             .users
@@ -252,28 +375,133 @@ impl Store for TestStore {
     }
 }
 
-#[derive(Default)]
+/// Stands in for the machine that builds an instance.
+///
+/// It defines the domain in the same fake hypervisor the manager reads,
+/// which is what a real machine does, and it records which machine was
+/// asked so a placement test can assert where the work went.
 struct TestImages {
     calls: Mutex<Vec<String>>,
     error: Mutex<Option<String>>,
+    /// The `host_id` of every provision request, in order.
+    placed_on: Mutex<Vec<i64>>,
+    /// The `host_id` of every hypervisor lookup, in order. An action on
+    /// an instance asks for the machine that runs it.
+    acted_on: Mutex<Vec<i64>>,
+    /// Machines that cannot be reached, by id.
+    unreachable: Mutex<Vec<i64>>,
+    /// The machine this fake stands for. Only work aimed here reaches
+    /// the hypervisor, as with the real one.
+    fake: Arc<Fake>,
+    /// The seed image is written by the machine that builds the
+    /// instance, so this fake writes it (SPEC 5.2).
+    iso: Arc<TestIso>,
+    storage_dir: PathBuf,
 }
+
+impl TestImages {
+    fn new(fake: Arc<Fake>, iso: Arc<TestIso>, storage_dir: PathBuf) -> Self {
+        Self {
+            calls: Mutex::new(Vec::new()),
+            error: Mutex::new(None),
+            placed_on: Mutex::new(Vec::new()),
+            acted_on: Mutex::new(Vec::new()),
+            unreachable: Mutex::new(Vec::new()),
+            fake,
+            iso,
+            storage_dir,
+        }
+    }
+}
+
 #[async_trait]
-impl ImageStore for TestImages {
-    async fn create_overlay(
-        &self,
-        checksum: &str,
-        path: &Path,
-        disk: i64,
-    ) -> std::result::Result<(), DynError> {
-        self.calls
-            .lock()
-            .unwrap()
-            .push(format!("{checksum} {} {disk}", path.display()));
+impl Fleet for TestImages {
+    async fn provision(&self, spec: &ProvisionSpec) -> std::result::Result<State, DynError> {
+        self.placed_on.lock().unwrap().push(spec.host_id);
+        self.calls.lock().unwrap().push(format!(
+            "{} {} {}",
+            spec.instance.base_checksum, spec.instance.uuid, spec.instance.disk_gib
+        ));
+        let overlay = self
+            .storage_dir
+            .join(format!("{}.qcow2", spec.instance.uuid));
+        let seed_iso = self
+            .storage_dir
+            .join(format!("{}-seed.iso", spec.instance.uuid));
         if let Some(error) = self.error.lock().unwrap().clone() {
             return Err(boxed(&error));
         }
-        tokio::fs::write(path, b"overlay").await?;
+        tokio::fs::write(&overlay, b"overlay").await?;
+        if spec.with_seed_iso
+            && let Err(error) = self.iso.build(&spec.seed, &seed_iso).await
+        {
+            self.unwind(&spec.instance.uuid).await;
+            return Err(error);
+        }
+        let xml = bento_hypervisor::domain_xml(&bento_hypervisor::DomainSpec {
+            name: spec.instance.name.clone(),
+            uuid: spec.instance.uuid.clone(),
+            vcpu: spec.instance.vcpu,
+            memory_mib: spec.instance.memory_mib,
+            disk_path: self
+                .storage_dir
+                .join(format!("{}.qcow2", spec.instance.uuid))
+                .display()
+                .to_string(),
+            iso_path: if spec.with_seed_iso {
+                self.storage_dir
+                    .join(format!("{}-seed.iso", spec.instance.uuid))
+                    .display()
+                    .to_string()
+            } else {
+                String::new()
+            },
+            network: spec.network.clone(),
+            mac: spec.instance.mac.clone(),
+            nested: spec.instance.nested,
+            ksm: spec.instance.ksm,
+            arch: String::new(),
+        })
+        .map_err(|error| boxed(&error.to_string()))?;
+        if let Err(error) = bento_hypervisor::Hypervisor::create(self.fake.as_ref(), &xml).await {
+            self.unwind(&spec.instance.uuid).await;
+            return Err(boxed(&error.to_string()));
+        }
+        Ok(if spec.start {
+            State::Running
+        } else {
+            State::Stopped
+        })
+    }
+
+    async fn deprovision(
+        &self,
+        _host_id: i64,
+        instance: &Instance,
+    ) -> std::result::Result<(), DynError> {
+        self.unwind(&instance.uuid).await;
         Ok(())
+    }
+
+    async fn hypervisor(&self, host_id: i64) -> Option<Arc<dyn bento_hypervisor::Hypervisor>> {
+        self.acted_on.lock().unwrap().push(host_id);
+        if self.unreachable.lock().unwrap().contains(&host_id) {
+            return None;
+        }
+        // One fake machine stands for the whole fleet here, so an action
+        // aimed anywhere reaches the same domains the manager reads.
+        Some(self.fake.clone())
+    }
+}
+
+impl TestImages {
+    /// A real machine removes its own partial work before it reports a
+    /// failure, so this one does too.
+    async fn unwind(&self, uuid: &str) {
+        let seed_iso = self.storage_dir.join(format!("{uuid}-seed.iso"));
+        self.iso.seeds.lock().unwrap().remove(&seed_iso);
+        let _ = tokio::fs::remove_file(&seed_iso).await;
+        let _ = tokio::fs::remove_file(self.storage_dir.join(format!("{uuid}.qcow2"))).await;
     }
 }
 
@@ -387,7 +615,6 @@ struct Fixture {
 fn fixture(with_definer: bool, with_clearer: bool) -> Fixture {
     let fake = Arc::new(Fake::default());
     let store = Arc::new(TestStore::default());
-    let images = Arc::new(TestImages::default());
     let iso = Arc::new(TestIso::default());
     let resizer = Arc::new(TestResizer::default());
     let definer = Arc::new(TestDefiner::default());
@@ -395,6 +622,11 @@ fn fixture(with_definer: bool, with_clearer: bool) -> Fixture {
     let log = Arc::new(TestLog::default());
     let sleep = Arc::new(TestSleep::default());
     let temp = tempfile::tempdir().unwrap();
+    let images = Arc::new(TestImages::new(
+        fake.clone(),
+        iso.clone(),
+        temp.path().to_path_buf(),
+    ));
     let iso_for_exists = iso.clone();
     let iso_for_delete = iso.clone();
     let manager = Manager::new(Config {
@@ -402,11 +634,11 @@ fn fixture(with_definer: bool, with_clearer: bool) -> Fixture {
         definer: with_definer.then(|| definer.clone() as Arc<dyn Definer>),
         autostart_clearer: with_clearer.then(|| clearer.clone() as Arc<dyn AutostartClearer>),
         store: Some(store.clone()),
-        images: Some(images.clone()),
+        host_id: 1,
+        fleet: Some(images.clone()),
         iso: Some(iso.clone()),
         resizer: Some(resizer.clone()),
         plan: Some(Plan::new("10.77.0.0/16").unwrap()),
-        capacity: TEST_CAPACITY,
         storage_dir: temp.path().to_path_buf(),
         logger: Some(log.clone()),
         nested_enabled: Some(Arc::new(|| (false, "kvm_intel nested is N".into()))),
@@ -494,6 +726,356 @@ async fn new_instance() {
     assert_eq!(domain.state, State::Running);
     assert!(domain.xml.contains("bento-user-0"));
     assert!(domain.xml.contains(&instance.mac));
+}
+
+#[tokio::test]
+async fn a_new_instance_records_the_slot_its_address_came_from() {
+    // Slot ownership is deployment-wide, so the address alone says which
+    // machine runs the instance (MULTI-NODE 7.2). At /24 there is one
+    // slot and the guest still gets a /24 address.
+    let f = fixture(false, false);
+    let instance = setup(&f).await;
+    assert_eq!(instance.address, "10.77.0.2");
+    assert_eq!(instance.slot, Some(0));
+}
+
+#[tokio::test]
+async fn a_new_instance_allocates_inside_its_machines_slot() {
+    // At /25 the machine owning slot 1 hands out .129 upwards, never an
+    // address from slot 0, and never the .128 subprefix boundary
+    // (MULTI-NODE 7.1).
+    let f = fixture(false, false);
+    {
+        let mut data = f.store.data();
+        data.runner_prefix = 25;
+        data.slots[0].owner_host_id = 2;
+        data.slots.push(Slot {
+            slot: 1,
+            state: SlotState::Active,
+            owner_host_id: 1,
+            ownership_epoch: 0,
+            source_host_id: None,
+            destination_host_id: None,
+            operation_id: None,
+        });
+    }
+    let owner = f.store.add_user(1, "amber", "10.77.0.0/24");
+    f.store.add_image(Some("aa11"));
+
+    let instance = f.manager.create(request(owner, "web")).await.unwrap();
+    assert_eq!(instance.address, "10.77.0.129");
+    assert_eq!(instance.slot, Some(1));
+
+    // The guest is still configured /24 and keeps the .1 gateway, so it
+    // treats the whole user network as on-link (MULTI-NODE 8.1).
+    let seed = f.iso.seeds.lock().unwrap()[&f.manager.seed_iso_path(&instance.uuid)].clone();
+    assert_eq!(
+        (seed.address_cidr.as_str(), seed.gateway.as_str()),
+        ("10.77.0.129/24", "10.77.0.1")
+    );
+}
+
+#[tokio::test]
+async fn one_machine_keeps_using_itself_without_asking_placement() {
+    // A single-machine deployment need not run a runner service, so it
+    // has no health observation to place against. Asking a placement
+    // question with one possible answer would make every create depend on
+    // a poll that deployment does not run (MULTI-NODE 12).
+    let f = fixture(false, false);
+    f.store.data().placeable_hosts = 1;
+    f.store.data().chosen_host = None; // placement would refuse if asked
+    let instance = setup(&f).await;
+
+    assert_eq!(instance.host_id, 1);
+    assert_eq!(f.images.placed_on.lock().unwrap().as_slice(), &[1]);
+}
+
+#[tokio::test]
+async fn a_second_machine_receives_the_instance_placement_chose() {
+    // The whole point of a fleet: the create names no machine, and the
+    // instance is built on the one placement picked (MULTI-NODE 12).
+    let f = fixture(false, false);
+    {
+        let mut data = f.store.data();
+        data.placeable_hosts = 2;
+        data.chosen_host = Some(2);
+        data.runner_prefix = 25;
+        data.slots.push(Slot {
+            slot: 1,
+            state: SlotState::Active,
+            owner_host_id: 2,
+            ownership_epoch: 0,
+            source_host_id: None,
+            destination_host_id: None,
+            operation_id: None,
+        });
+    }
+    let owner = f.store.add_user(1, "amber", "10.77.0.0/24");
+    f.store.add_image(Some("aa11"));
+
+    let instance = f.manager.create(request(owner, "web")).await.unwrap();
+
+    assert_eq!(
+        instance.host_id, 2,
+        "the instance went to the wrong machine"
+    );
+    assert_eq!(
+        f.images.placed_on.lock().unwrap().as_slice(),
+        &[2],
+        "the work went to the wrong machine"
+    );
+    // The address came from the slot that machine owns, so the address
+    // alone says where the instance runs (MULTI-NODE 7.2).
+    assert_eq!(instance.address, "10.77.0.129");
+    assert_eq!(instance.slot, Some(1));
+}
+
+#[tokio::test]
+async fn a_full_machine_does_not_refuse_a_create_bound_for_an_empty_one() {
+    // Capacity belongs to a host (MULTI-NODE 12). Weighing a create
+    // against the controller's ceiling, or against the whole
+    // deployment's usage, refuses work that the machine it is bound for
+    // has ample room for. That reads to a user as "the host has no room"
+    // while a machine sits empty.
+    let f = fixture(false, false);
+    {
+        let mut data = f.store.data();
+        data.placeable_hosts = 2;
+        data.chosen_host = Some(2);
+        data.slots[0].owner_host_id = 2;
+        // Host 1 is nearly full; host 2 is empty and large.
+        data.capacities.insert(
+            1,
+            Capacity {
+                memory_mib: 1024,
+                disk_gib: 4,
+            },
+        );
+        data.capacities.insert(
+            2,
+            Capacity {
+                memory_mib: 65_536,
+                disk_gib: 512,
+            },
+        );
+    }
+    let owner = f.store.add_user(1, "amber", "10.77.0.0/24");
+    f.store.add_image(Some("aa11"));
+
+    let mut request = request(owner, "web");
+    request.memory_mib = 8192;
+    request.disk_gib = 40;
+    let instance = f.manager.create(request).await.unwrap();
+
+    assert_eq!(instance.host_id, 2);
+    // The ceiling that travelled to the store is the one of the machine
+    // that will run it.
+    assert_eq!(
+        f.store.data().seen_capacity,
+        Some(Capacity {
+            memory_mib: 65_536,
+            disk_gib: 512,
+        }),
+        "the create was weighed against the wrong machine"
+    );
+}
+
+#[tokio::test]
+async fn a_create_is_still_refused_when_its_own_machine_is_full() {
+    // The check is not weakened, only moved to the right machine.
+    let f = fixture(false, false);
+    f.store.data().capacities.insert(
+        1,
+        Capacity {
+            memory_mib: 1024,
+            disk_gib: 4,
+        },
+    );
+    f.store.data().create_error = Some("the host has no room".into());
+    let owner = f.store.add_user(1, "amber", "10.77.0.0/24");
+    f.store.add_image(Some("aa11"));
+
+    let mut request = request(owner, "web");
+    request.disk_gib = 40;
+    let error = f.manager.create(request).await.unwrap_err();
+
+    assert!(error.to_string().contains("no room"), "{error}");
+    assert_eq!(
+        f.store.data().seen_capacity,
+        Some(Capacity {
+            memory_mib: 1024,
+            disk_gib: 4,
+        })
+    );
+}
+
+#[tokio::test]
+async fn a_create_that_no_machine_can_take_is_refused() {
+    // Placement refuses and names why. Nothing is written: no row, no
+    // address, and no work sent anywhere.
+    let f = fixture(false, false);
+    {
+        let mut data = f.store.data();
+        data.placeable_hosts = 2;
+        data.chosen_host = None;
+    }
+    let owner = f.store.add_user(1, "amber", "10.77.0.0/24");
+    f.store.add_image(Some("aa11"));
+
+    let error = f.manager.create(request(owner, "web")).await.unwrap_err();
+
+    assert!(error.to_string().contains("no machine"), "{error}");
+    assert!(f.store.data().instances.is_empty());
+    assert!(f.images.placed_on.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_failure_on_the_far_machine_leaves_no_row_behind() {
+    // The machine cleans up its own files and reports why. This side
+    // removes the row, which is the only thing it can reach
+    // (MULTI-NODE 13.1).
+    let f = fixture(false, false);
+    {
+        let mut data = f.store.data();
+        data.placeable_hosts = 2;
+        data.chosen_host = Some(2);
+        data.slots[0].owner_host_id = 2;
+    }
+    *f.images.error.lock().unwrap() = Some("no room on that machine".into());
+    let owner = f.store.add_user(1, "amber", "10.77.0.0/24");
+    f.store.add_image(Some("aa11"));
+
+    let error = f.manager.create(request(owner, "web")).await.unwrap_err();
+
+    assert!(
+        error.to_string().contains("no room on that machine"),
+        "{error}"
+    );
+    assert!(f.store.data().instances.is_empty(), "the row survived");
+    assert!(f.fake.domain("web").is_none());
+}
+
+#[tokio::test]
+async fn an_action_goes_to_the_machine_that_runs_the_instance() {
+    // Starting, stopping, rebooting, and removing all act on the domain,
+    // and the domain is on one machine (MULTI-NODE 13.1). The local
+    // connection is used only for an instance that is local.
+    let f = fixture(false, false);
+    let instance = setup(&f).await;
+    // The manager runs on host 1; move the instance to host 2.
+    f.store
+        .data()
+        .instances
+        .iter_mut()
+        .for_each(|row| row.host_id = 2);
+
+    f.manager.stop(&instance.uuid).await.unwrap();
+    f.manager.start(&instance.uuid).await.unwrap();
+    f.manager.restart(&instance.uuid).await.unwrap();
+
+    assert_eq!(
+        f.images.acted_on.lock().unwrap().as_slice(),
+        &[2, 2, 2],
+        "an action reached the wrong machine"
+    );
+}
+
+#[tokio::test]
+async fn a_local_instance_never_leaves_this_machine() {
+    // The fleet is not asked at all for an instance that runs here, so a
+    // single-machine deployment needs no way to reach another machine.
+    let f = fixture(false, false);
+    let instance = setup(&f).await;
+
+    f.manager.stop(&instance.uuid).await.unwrap();
+    f.manager.start(&instance.uuid).await.unwrap();
+
+    assert!(
+        f.images.acted_on.lock().unwrap().is_empty(),
+        "a local action asked the fleet for a machine"
+    );
+}
+
+#[tokio::test]
+async fn an_action_on_an_unreachable_machine_says_so() {
+    // A deployment with no runner endpoints cannot act on another
+    // machine. The refusal names the instance rather than reporting a
+    // missing domain, which would read as an instance that is gone.
+    let f = fixture(false, false);
+    let instance = setup(&f).await;
+    f.store
+        .data()
+        .instances
+        .iter_mut()
+        .for_each(|row| row.host_id = 2);
+    f.images.unreachable.lock().unwrap().push(2);
+
+    let error = f.manager.stop(&instance.uuid).await.unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("another machine that cannot be reached"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
+async fn a_copy_of_an_instance_on_another_machine_is_refused() {
+    // A copy is a local file copy of the source's overlay
+    // (MULTI-NODE 13.3). Copying between machines is a transfer with its
+    // own verification, which is the slot-move workflow of section 17.
+    let f = fixture(false, false);
+    let source = setup(&f).await;
+    f.manager.stop(&source.uuid).await.unwrap();
+    f.store
+        .data()
+        .instances
+        .iter_mut()
+        .for_each(|instance| instance.host_id = 2);
+    let owner = f.store.user_by_id(1).await.unwrap();
+
+    let error = f
+        .manager
+        .copy(&source.uuid, copy_request(owner, "clone"))
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("another machine"), "{error}");
+}
+
+#[tokio::test]
+async fn a_machine_with_no_slot_cannot_take_an_instance() {
+    // A machine that has joined the fleet but has not been given a slot
+    // has no address range, so placement onto it is refused rather than
+    // silently borrowing another machine's addresses (MULTI-NODE 7.2).
+    let f = fixture(false, false);
+    f.store.data().slots[0].owner_host_id = 2;
+    let owner = f.store.add_user(1, "amber", "10.77.0.0/24");
+    f.store.add_image(Some("aa11"));
+
+    let error = f.manager.create(request(owner, "web")).await.unwrap_err();
+    assert!(
+        matches!(error, Error::NoSlotForHost { host_id: 1 }),
+        "{error:?}"
+    );
+    assert!(f.store.data().mutations.is_empty());
+}
+
+#[tokio::test]
+async fn a_draining_slot_takes_no_new_address() {
+    // Draining keeps the owner authoritative but permits no new
+    // allocation (MULTI-NODE 17).
+    let f = fixture(false, false);
+    f.store.data().slots[0].state = SlotState::Draining;
+    let owner = f.store.add_user(1, "amber", "10.77.0.0/24");
+    f.store.add_image(Some("aa11"));
+
+    let error = f.manager.create(request(owner, "web")).await.unwrap_err();
+    assert!(
+        matches!(error, Error::NoSlotForHost { host_id: 1 }),
+        "{error:?}"
+    );
 }
 
 #[tokio::test]
@@ -591,6 +1173,49 @@ async fn new_no_image_version() {
         f.manager.create(request(owner, "web")).await,
         Err(Error::NoImageVersion(_))
     ));
+}
+
+#[tokio::test]
+async fn new_waits_for_every_active_host_to_hold_the_current_image() {
+    let f = fixture(false, false);
+    let owner = f.store.add_user(1, "a", "10.77.0.0/24");
+    f.store.add_image(Some("aa"));
+    f.store.add_host("runner-a.example.org");
+    f.store.add_host("runner-b.example.org");
+    f.store
+        .hold_image("runner-a.example.org", "debian-13", "aa");
+
+    let error = f
+        .manager
+        .create(request(owner.clone(), "web"))
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, Error::FleetImageNotReady { .. }));
+    assert_eq!(
+        error.to_string(),
+        "the fleet is still fetching debian-13: runner-b.example.org is not ready"
+    );
+    assert!(f.store.data().instances.is_empty());
+    assert!(f.images.calls.lock().unwrap().is_empty());
+
+    f.store
+        .hold_image("runner-b.example.org", "debian-13", "aa");
+    f.manager.create(request(owner, "web")).await.unwrap();
+}
+
+#[tokio::test]
+async fn new_passes_the_image_gate_on_one_ready_host() {
+    let f = fixture(false, false);
+    let owner = f.store.add_user(1, "a", "10.77.0.0/24");
+    f.store.add_image(Some("aa"));
+    f.store.add_host("runner-a.example.org");
+    f.store
+        .hold_image("runner-a.example.org", "debian-13", "aa");
+
+    let instance = f.manager.create(request(owner, "web")).await.unwrap();
+
+    assert_eq!(instance.base_checksum, "aa");
 }
 
 #[tokio::test]
@@ -1099,6 +1724,20 @@ async fn reconcile_empty() {
 }
 
 #[tokio::test]
+async fn reconcile_ignores_instances_on_other_hosts() {
+    let f = fixture(false, false);
+    let local = setup(&f).await;
+    let mut remote = local;
+    remote.uuid = "remote-uuid".into();
+    remote.name = "remote".into();
+    remote.host_id = 2;
+    f.store.data().instances.push(remote);
+
+    let report = f.manager.reconcile().await.unwrap();
+    assert!(report.rows_without_domains.is_empty());
+}
+
+#[tokio::test]
 async fn poll_once_updates_observed_state() {
     let f = fixture(false, false);
     let instance = setup(&f).await;
@@ -1360,7 +1999,7 @@ struct RecordingRunner {
     fail: Mutex<bool>,
 }
 #[async_trait]
-impl Runner for RecordingRunner {
+impl CommandRunner for RecordingRunner {
     async fn run(&self, name: &OsStr, args: &[OsString]) -> std::result::Result<Vec<u8>, RunError> {
         let mut call = vec![name.to_string_lossy().into_owned()];
         call.extend(args.iter().map(|arg| arg.to_string_lossy().into_owned()));
@@ -1428,7 +2067,11 @@ fn new_manager_validation() {
             Config {
                 hypervisor: Some(Arc::new(Fake::default())),
                 store: Some(store),
-                images: Some(Arc::new(TestImages::default())),
+                fleet: Some(Arc::new(TestImages::new(
+                    Arc::new(Fake::default()),
+                    Arc::new(TestIso::default()),
+                    PathBuf::new(),
+                ))),
                 iso: Some(Arc::new(TestIso::default())),
                 plan: Some(Plan::new("10.77.0.0/16").unwrap()),
                 ..Config::default()
@@ -1441,7 +2084,7 @@ fn new_manager_validation() {
         match missing {
             0 => config.hypervisor = None,
             1 => config.store = None,
-            2 => config.images = None,
+            2 => config.fleet = None,
             3 => config.iso = None,
             4 => config.plan = None,
             _ => config.storage_dir = PathBuf::new(),

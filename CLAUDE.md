@@ -18,17 +18,18 @@ One Rust workspace, one binary (`bentod`), one libvirt/KVM host. `SPEC.md` is th
 * Host-touching code sits behind a trait with an in-memory fake. A new trait comes with a fake. A behavior change comes with a test.
 * Errors map to a status in one place, `error_parts` in `crates/api/src/lib.rs`. Never in a handler.
 * Visibility and the HTTP port change through the lifecycle, never the store. Both reload the firewall.
-* The UUID is the instance key. The name is a label.
-* `schema.sql` has no migration tool. A schema change ships with code that reads both shapes.
+* The UUID is the instance key. The name is a label. The same holds for a host: `/etc/machine-id` is the key, the hostname is a label. Never key on the kernel hostname; it is the transient one and it drifts.
+* `schema.sql` is the baseline. A schema change after it ships as the next numbered migration in `crates/store/src/migrate.rs`. Never edit an applied migration; add the next number. A migration inspects before it mutates, so a database that already has the change only records the version.
+* A migration is safe because there is a way back: `bentod dump-db` writes a copy, `bentod restore-db` reads one and then migrates it forward, and `bento-monitor` offers both on the Config tab. Take a copy before running a migration against real data.
 * Read settings from the parsed `Config`. A missing required value stops `serve` at startup.
 * A backend gap does not block frontend work. Put it behind a trait with a placeholder, badge placeholder data in the UI, and file a GitHub issue assigned to zackerthescar.
-* There are no per-user quotas (issue #22). The host capacity of SPEC 6.1 is the only ceiling. The dashboard compares provisioned resources against the host.
+* There are no per-user quotas (issue #22). Capacity belongs to a host: SPEC 6.1 for one host, a per-runner cap for many (MULTI-NODE 12). The dashboard compares provisioned resources against the host, one host at a time.
 * Names in `operators` are host root.
 
 ## Words
 
 * The UI says "VM". Code and SPEC say "instance". No third name.
-* Prose follows the `ste-writing` skill. Lint with `python3 ~/.claude/vendor/ste-kit/videos/ep01-the-cure-for-ai-slop/ste-writing/ste-lint.py <file>`.
+* Prose follows the `ste-writing` skill. Lint with `python3 ~/.claude/skills/ste-writing/ste-lint.py <file>`.
 * Comments explain why and cite the SPEC section, for example `(SPEC 7.2)`.
 * Use `example.org` in tests, seeds, docs, and screenshots. No real emails or hosts.
 

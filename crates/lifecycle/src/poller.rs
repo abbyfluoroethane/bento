@@ -8,6 +8,7 @@ use crate::{Error, Manager, Result};
 impl Manager {
     /// Runs one observed-state poll (SPEC 12), updates all rows together,
     /// then finishes first boot for running instances whose seed remains.
+    /// The sweep uses only this host's rows (MULTI-NODE 21).
     pub async fn poll_once(&self) -> Result<()> {
         let domains =
             self.hyp.list().await.map_err(|error| {
@@ -23,9 +24,13 @@ impl Manager {
             .map_err(|error| {
                 Error::operation(format!("lifecycle: poll: record observed states: {error}"))
             })?;
-        let instances = self.store.instances().await.map_err(|error| {
-            Error::operation(format!("lifecycle: poll: list instances: {error}"))
-        })?;
+        let instances = self
+            .store
+            .instances_on_host(self.host_id)
+            .await
+            .map_err(|error| {
+                Error::operation(format!("lifecycle: poll: list instances: {error}"))
+            })?;
         for instance in instances {
             if states.get(&instance.uuid) != Some(&State::Running) {
                 continue;

@@ -8,6 +8,7 @@ impl Manager {
     /// Restores each instance to its last desired state after host reboot
     /// (SPEC 11.2). Starts are batched and every batch reaches running or
     /// times out before the next, avoiding a simultaneous memory/disk spike.
+    /// Restore selects only this host's instances (MULTI-NODE 21).
     pub async fn restore(&self) -> Result<()> {
         let domains = self.hyp.list().await.map_err(|error| {
             Error::operation(format!("lifecycle: restore: list domains: {error}"))
@@ -38,7 +39,7 @@ impl Manager {
             })?;
         let instances = self
             .store
-            .instances_to_restore()
+            .instances_to_restore(self.host_id)
             .await
             .map_err(|error| Error::operation(format!("lifecycle: restore: {error}")))?;
         if instances.is_empty() {

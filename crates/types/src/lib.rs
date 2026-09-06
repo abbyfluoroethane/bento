@@ -174,6 +174,9 @@ pub struct Instance {
     /// column; it only helps a user find a forgotten instance (SPEC 12).
     #[serde(with = "time::serde::rfc3339::option")]
     pub last_seen_at: Option<OffsetDateTime>,
+    /// The runner slot that supplied `address` (MULTI-NODE 16). `None`
+    /// until slot-aware allocation places it (MULTI-NODE 22 step 6).
+    pub slot: Option<i64>,
 }
 
 /// A person with a Bento account (SPEC 12).
@@ -233,10 +236,148 @@ pub struct SshKey {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Host {
     pub id: i64,
+    /// The durable identity of the machine, from `/etc/machine-id`. This
+    /// is the key; `name` is a label (MULTI-NODE 16). It is `None` only
+    /// for a row a version-1 database carried and no machine has claimed.
+    pub machine_id: Option<String>,
     pub name: String,
     pub libvirt_uri: String,
+    /// Where the controller reaches this host's runner service
+    /// (MULTI-NODE 11.2). `None` for a version-1 host, which the controller
+    /// drives through its own libvirt socket.
+    pub endpoint: Option<String>,
+    /// The next hop other machines use to reach this machine's guest
+    /// slots (MULTI-NODE 8.5).
+    ///
+    /// It is separate from `endpoint` because management traffic and
+    /// guest data need not share a path: a deployment can keep management
+    /// on the LAN and carry guest traffic over a tunnel. `None` means no
+    /// machine can route to this one, so it gets no slot route.
+    pub underlay: Option<String>,
+    /// A disabled host keeps its guests and its routes. It only stops
+    /// taking new placement.
+    pub enabled: bool,
+    pub placement: Placement,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+}
+
+/// Whether a host takes new instances (MULTI-NODE 18).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Placement {
+    #[default]
+    Active,
+    /// Keeps its guests, takes nothing new, and waits to be emptied.
+    Draining,
+    /// Emptied and retired. The row stays for the audit trail.
+    Removed,
+}
+
+impl Placement {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Placement::Active => "active",
+            Placement::Draining => "draining",
+            Placement::Removed => "removed",
+        }
+    }
+}
+
+impl FromStr for Placement {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "active" => Ok(Placement::Active),
+            "draining" => Ok(Placement::Draining),
+            "removed" => Ok(Placement::Removed),
+            other => Err(ParseError::new("placement", other)),
+        }
+    }
+}
+
+/// What a new instance needs from a machine, so placement can weigh
+/// every machine against it (MULTI-NODE 12).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Placing {
+    pub vcpu: i64,
+    pub memory_mib: i64,
+    pub disk_gib: i64,
+    /// The architecture of the image the instance boots. A machine of
+    /// another architecture cannot run it.
+    pub arch: Option<String>,
+}
+
+/// One runner slot: the same subprefix of every user `/24` (MULTI-NODE 7.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Slot {
+    pub slot: i64,
+    pub state: SlotState,
+    pub owner_host_id: i64,
+    /// Increases every time the slot changes hands. A runner refuses an
+    /// ownership claim older than the one it holds (MULTI-NODE 11.3).
+    pub ownership_epoch: i64,
+    pub source_host_id: Option<i64>,
+    pub destination_host_id: Option<i64>,
+    pub operation_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SlotState {
+    #[default]
+    Active,
+    Draining,
+    Moving,
+}
+
+impl SlotState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SlotState::Active => "active",
+            SlotState::Draining => "draining",
+            SlotState::Moving => "moving",
+        }
+    }
+}
+
+impl FromStr for SlotState {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "active" => Ok(SlotState::Active),
+            "draining" => Ok(SlotState::Draining),
+            "moving" => Ok(SlotState::Moving),
+            other => Err(ParseError::new("slot state", other)),
+        }
+    }
+}
+
+/// The controller lease (MULTI-NODE 11.3). Only its holder may dispatch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Lease {
+    /// Random, one for each controller process.
+    pub holder_id: String,
+    /// Durable and strictly increasing across acquisitions.
+    pub epoch: i64,
+    #[serde(with = "time::serde::rfc3339")]
+    pub expires_at: OffsetDateTime,
+}
+
+/// Settings that belong to the deployment (MULTI-NODE 19).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Deployment {
+    /// 24, 25, 26, or 27.
+    pub runner_prefix: u8,
+}
+
+impl Deployment {
+    /// How many slots the prefix divides a user `/24` into: 1, 2, 4, or 8.
+    pub fn slot_count(&self) -> i64 {
+        1 << (self.runner_prefix.saturating_sub(24)).min(3)
+    }
 }
 
 /// A named entry in the operator allowlist (SPEC 5.1).

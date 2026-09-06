@@ -15,14 +15,16 @@ mod dump;
 mod hosts;
 mod images;
 mod instances;
-mod migrate;
+pub(crate) mod migrate;
 mod names;
 mod pairings;
+mod runners;
 mod shares;
 mod sshkeys;
 mod tokens;
 mod users;
 
+pub use runners::{HostHealth, HostSeen, Observation};
 pub use users::Usage;
 
 /// The full database schema from SPEC section 12.
@@ -71,6 +73,40 @@ pub enum Error {
     /// A database dump never replaces an existing file (SPEC 12.1).
     #[error("store: dump destination {path} already exists")]
     DumpDestinationExists { path: String },
+    /// Another controller process holds the lease (MULTI-NODE 11.3).
+    #[error("store: the controller lease is held by {holder} until {expires_at}")]
+    LeaseHeld {
+        holder: String,
+        expires_at: OffsetDateTime,
+    },
+    /// This process no longer holds the lease it tried to renew. It must
+    /// stop dispatching: a later controller has raised the epoch.
+    #[error("store: the controller lease was lost")]
+    LeaseLost,
+    /// The runner prefix must be 24, 25, 26, or 27 (MULTI-NODE 7.1).
+    #[error("store: runner prefix {0} is not 24, 25, 26, or 27")]
+    RunnerPrefix(u8),
+    /// A smaller prefix would leave an owned slot with no number.
+    #[error("store: prefix {prefix} has no room for slot {slot}, which is owned")]
+    RunnerPrefixStrandsSlot { prefix: u8, slot: i64 },
+    /// The slot number is outside what the runner prefix divides into.
+    #[error("store: slot {slot} does not exist: the deployment has {count}")]
+    NoSuchSlot { slot: i64, count: i64 },
+    /// Instances still hold addresses the slot supplied (MULTI-NODE 17).
+    #[error("store: slot {slot} still holds {occupied} instances of another host")]
+    SlotInUse { slot: i64, occupied: i64 },
+    /// No runner can take a new instance (MULTI-NODE 12). The message
+    /// names every runner and why each one was refused, because "no
+    /// room" alone does not say which machine to fix.
+    #[error("store: no runner can take this instance: {reasons}")]
+    NoPlacement { reasons: String },
+    /// A restore source must exist and be a readable SQLite database.
+    #[error("store: restore source {path}: {source}")]
+    RestoreSource {
+        path: String,
+        #[source]
+        source: std::io::Error,
+    },
     /// The dump destination could not be inspected or created.
     #[error("store: dump destination {path}: {source}")]
     DumpDestination {
@@ -139,6 +175,22 @@ impl Store {
             connection
                 .close()
                 .map_err(|(_, error)| Error::Sqlite(error))
+        })
+        .await?
+    }
+
+    /// Like [`Store::with_conn`], for the two callers that need the
+    /// connection itself: SQLite's backup API and the migrations both
+    /// write through a `&mut Connection`.
+    async fn with_conn_mut<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let conn = Arc::clone(&self.conn);
+        tokio::task::spawn_blocking(move || {
+            let mut guard = conn.lock().map_err(|_| Error::MutexPoisoned)?;
+            f(&mut guard)
         })
         .await?
     }

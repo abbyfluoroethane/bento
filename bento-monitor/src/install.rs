@@ -472,8 +472,8 @@ mod tests {
         let units = vec![installed_unit(UNITS[0].name, false)];
         let steps = steps(&paths(None), &facts, &units, Some(true));
         assert!(!steps[3].done);
-        assert_eq!(steps[3].detail, "1 of 3 installed");
-        assert_eq!(steps[4].detail, "0 of 3 enabled");
+        assert_eq!(steps[3].detail, "1 of 4 installed");
+        assert_eq!(steps[4].detail, "0 of 4 enabled");
         assert!(steps[4].blocked.is_some());
     }
 

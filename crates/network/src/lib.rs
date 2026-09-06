@@ -4,14 +4,20 @@
 mod apply;
 mod libvirt;
 mod mac;
+mod machine;
 mod nftables;
+mod routes;
+mod slot;
 mod subnet;
 
-pub use apply::{Applier, NftApplier, reload};
+pub use apply::{Applier, NftApplier, foreign_forward_filters, reload};
 pub use bento_config::Ipv4Prefix;
 pub use libvirt::UserNetwork;
 pub use mac::mac;
+pub use machine::{MachineNetwork, MachineUser, RemoteSlot};
 pub use nftables::{FirewallUser, PortRange, PublishedInstance, Ruleset};
+pub use routes::{Converged, IpRouteApplier, Route, RouteApplier, converge};
+pub use slot::{MAX_SLOT_BITS, MIN_SLOT_BITS, Slots};
 pub use subnet::{
     AddressStore, DEFAULT_DNS, GuestNetwork, Plan, SubnetStore, allocate_address, gateway,
 };

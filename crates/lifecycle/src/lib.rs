@@ -18,12 +18,13 @@ mod runner;
 
 pub use actions::{ResizeRequest, ResizeResult};
 pub use manager::{
-    Clock, Config, DeleteIso, DeleteIsoFuture, DynError, ISOBuilder, ImageStore, IsoExists,
-    LifecycleLogger, Manager, NestedProbe, OverlayResizer, Result, Sleep, Store, UuidMint,
+    Clock, Config, DeleteIso, DeleteIsoFuture, DynError, Fleet, ISOBuilder, IsoExists,
+    LifecycleLogger, Manager, NestedProbe, OverlayResizer, ProvisionSpec, Result, Sleep, Store,
+    UuidMint, random_uuid,
 };
 pub use new::{GUEST_USER, NewRequest};
 pub use reconcile::ReconcileReport;
-pub use runner::{QemuImgResizer, RunError, Runner};
+pub use runner::{CommandRunner, QemuImgResizer, RunError};
 
 use thiserror::Error as ThisError;
 
@@ -42,6 +43,15 @@ pub enum Error {
     /// An allowlisted image has not yet been fetched (SPEC 5.1).
     #[error("lifecycle: image has no fetched version; run fetch-images: {0}")]
     NoImageVersion(String),
+    /// A create must use one image version across the deployment
+    /// (MULTI-NODE 13.2).
+    #[error("the fleet is still fetching {image_name}: {missing}")]
+    FleetImageNotReady { image_name: String, missing: String },
+    /// A machine owns no active runner slot, so it has no address range
+    /// to allocate from (MULTI-NODE 7.2). A machine that has joined the
+    /// fleet but has not been given a slot is in this state.
+    #[error("host {host_id} owns no active runner slot; give it one before placing an instance")]
+    NoSlotForHost { host_id: i64 },
     /// Copying a live overlay could produce a torn disk image (SPEC 15).
     #[error("lifecycle: the cp source must be stopped: {0}")]
     CopySourceRunning(String),

@@ -366,15 +366,17 @@ impl App {
         let config = self.paths.config.display().to_string();
         let binary = self.paths.binary.display().to_string();
         // The operator commands need the same configuration the units use.
-        let bentod = |subcommand: &str| {
+        let bentod_with = |subcommand: &str, extra: Vec<String>| {
             let mut args = Vec::new();
             if let Some(path) = self.paths.config_flag() {
                 args.push("-config".to_string());
                 args.push(path.to_string());
             }
             args.push(subcommand.to_string());
+            args.extend(extra);
             Cmd::owned(binary.clone(), args).privileged(self.euid)
         };
+        let bentod = |subcommand: &str| bentod_with(subcommand, Vec::new());
         match c {
             'e' => {
                 let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
@@ -392,14 +394,104 @@ impl App {
                 vec![bentod("reconcile")],
             ),
             'i' => self.confirm("list the stored images".to_string(), vec![bentod("images")]),
+            'b' => match self.database_path() {
+                Some(db) => {
+                    let destination = format!("{db}.backup-{}", timestamp());
+                    self.confirm(
+                        format!("copy the database to {destination}"),
+                        vec![bentod_with("dump-db", vec![destination])],
+                    );
+                }
+                None => self.modal = Some(no_configuration("Backup")),
+            },
+            // A restore needs a file to restore from, and the screen has
+            // nowhere to type one. It offers the newest copy beside the
+            // database, and the confirmation shows the whole command, so
+            // an operator who wants a different file can read the shape
+            // and run it themselves.
+            'r' => match self.database_path() {
+                Some(db) => match newest_backup(&db) {
+                    Some(source) => self.confirm(
+                        format!("replace {db} with {source}"),
+                        vec![bentod_with("restore-db", vec![source])],
+                    ),
+                    None => {
+                        self.modal = Some(Modal::Message {
+                            title: "Restore".to_string(),
+                            body: format!(
+                                "No copy to restore from sits beside {db}.\n\n\
+                                 Press b to make one, or run restore-db yourself with\n\
+                                 the path of the copy you want."
+                            ),
+                        });
+                    }
+                },
+                None => self.modal = Some(no_configuration("Restore")),
+            },
             _ => {}
         }
         Outcome::None
     }
 
+    /// The database the loaded configuration names, if one loaded.
+    fn database_path(&self) -> Option<String> {
+        self.config.as_ref().ok().map(|c| c.db_path.clone())
+    }
+
     fn confirm(&mut self, title: String, commands: Vec<Cmd>) {
         self.modal = Some(Modal::Confirm { title, commands });
     }
+}
+
+/// What an action says when it needs the database and no configuration
+/// loaded to name one.
+fn no_configuration(title: &str) -> Modal {
+    Modal::Message {
+        title: title.to_string(),
+        body: "The configuration has not loaded, so nothing here knows where the\n\
+               database is. The Config tab says why."
+            .to_string(),
+    }
+}
+
+/// A stamp for a backup file name: sortable, and readable by an operator
+/// listing the directory.
+fn timestamp() -> String {
+    time::OffsetDateTime::now_utc()
+        .format(&time::macros::format_description!(
+            "[year][month][day]-[hour][minute][second]"
+        ))
+        .expect("fixed UTC timestamp format")
+}
+
+/// The newest copy of `db` beside it.
+///
+/// A copy carries one of two prefixes: `.backup-` is what the Backup key
+/// writes, and `.before-restore-` is what `restore-db` keeps of the
+/// database it replaced. Both then carry the same sortable stamp, and the
+/// stamp is what decides. Comparing whole names would not: the two
+/// prefixes sort against each other, so an older `before-restore` copy
+/// would win over a newer `backup` one.
+pub fn newest_backup(db: &str) -> Option<String> {
+    const PREFIXES: [&str; 2] = [".backup-", ".before-restore-"];
+    let path = std::path::Path::new(db);
+    let directory = path.parent()?;
+    let stem = path.file_name()?.to_str()?;
+    let mut newest: Option<(String, String)> = None;
+    for entry in std::fs::read_dir(directory).ok()? {
+        let Ok(entry) = entry else { continue };
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let Some(stamp) = PREFIXES.iter().find_map(|prefix| {
+            name.strip_prefix(&format!("{stem}{prefix}"))
+                .map(str::to_owned)
+        }) else {
+            continue;
+        };
+        if newest.as_ref().is_none_or(|(best, _)| stamp > *best) {
+            newest = Some((stamp, name));
+        }
+    }
+    newest.map(|(_, name)| directory.join(name).display().to_string())
 }
 
 /// One entry per unit of [`UNITS`], in that order, whatever `systemctl`
@@ -601,6 +693,79 @@ mod tests {
             commands[0].display(),
             "sudo /usr/local/bin/bentod -config /srv/bento.toml fetch-images"
         );
+    }
+
+    #[test]
+    fn the_config_tab_backs_the_database_up_and_restores_the_newest_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = directory.path().join("bento.db");
+        let mut app = app();
+        app.tab = Tab::Config;
+        app.config = Ok(Config {
+            db_path: db.display().to_string(),
+            ..Default::default()
+        });
+
+        // With no copy beside it, restore says so rather than offering a
+        // command with nothing to run.
+        app.on_key(Key::Char('r'));
+        let Some(Modal::Message { title, body }) = app.modal.clone() else {
+            panic!("expected a message, got {:?}", app.modal);
+        };
+        assert_eq!(title, "Restore");
+        assert!(body.contains("No copy to restore from"), "{body}");
+        app.modal = None;
+
+        // Backup names its destination beside the database.
+        app.on_key(Key::Char('b'));
+        let Some(Modal::Confirm { commands, .. }) = app.modal.clone() else {
+            panic!("expected a confirmation, got {:?}", app.modal);
+        };
+        let line = commands[0].display();
+        assert!(line.contains("dump-db"), "{line}");
+        assert!(
+            line.contains(&format!("{}.backup-", db.display())),
+            "{line}"
+        );
+        app.modal = None;
+
+        // Restore offers the newest of the copies that are there.
+        for name in [
+            "bento.db.backup-20260101-000000",
+            "bento.db.backup-20260905-120000",
+        ] {
+            std::fs::write(directory.path().join(name), b"").unwrap();
+        }
+        std::fs::write(
+            directory
+                .path()
+                .join("bento.db.before-restore-20260301-000000"),
+            b"",
+        )
+        .unwrap();
+        app.on_key(Key::Char('r'));
+        let Some(Modal::Confirm { commands, .. }) = app.modal.clone() else {
+            panic!("expected a confirmation, got {:?}", app.modal);
+        };
+        let line = commands[0].display();
+        assert!(line.contains("restore-db"), "{line}");
+        assert!(line.ends_with("bento.db.backup-20260905-120000"), "{line}");
+    }
+
+    #[test]
+    fn an_action_that_needs_the_database_says_when_no_configuration_loaded() {
+        let mut app = app();
+        app.tab = Tab::Config;
+        app.config = Err("no such file".to_string());
+        for key in ['b', 'r'] {
+            app.on_key(Key::Char(key));
+            assert!(
+                matches!(app.modal, Some(Modal::Message { .. })),
+                "{key}: {:?}",
+                app.modal
+            );
+            app.modal = None;
+        }
     }
 
     #[test]

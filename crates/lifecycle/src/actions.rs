@@ -1,7 +1,6 @@
 use bento_hypervisor::{Error as HypervisorError, StopResult};
 use bento_types::{DesiredState, Instance, State};
 
-use crate::fs::remove_file;
 use crate::{Error, Manager, Result};
 
 /// The complete target shape of an instance.
@@ -25,9 +24,13 @@ impl Manager {
     /// Starts a stopped instance and records desired running (SPEC 11.1).
     pub async fn start(&self, uuid: &str) -> Result<()> {
         let instance = self.store.instance(uuid).await.map_err(external)?;
-        self.hyp.start(&instance.name).await.map_err(|error| {
-            Error::operation(format!("lifecycle: start {}: {error}", instance.name))
-        })?;
+        self.hyp_for(&instance)
+            .await?
+            .start(&instance.name)
+            .await
+            .map_err(|error| {
+                Error::operation(format!("lifecycle: start {}: {error}", instance.name))
+            })?;
         self.store
             .set_desired_state(uuid, DesiredState::Running)
             .await
@@ -47,9 +50,14 @@ impl Manager {
             .set_desired_state(uuid, DesiredState::Stopped)
             .await
             .map_err(external)?;
-        let result = self.hyp.stop(&instance.name).await.map_err(|error| {
-            Error::operation(format!("lifecycle: stop {}: {error}", instance.name))
-        })?;
+        let result = self
+            .hyp_for(&instance)
+            .await?
+            .stop(&instance.name)
+            .await
+            .map_err(|error| {
+                Error::operation(format!("lifecycle: stop {}: {error}", instance.name))
+            })?;
         self.store
             .set_observed_state(uuid, State::Stopped)
             .await
@@ -64,9 +72,13 @@ impl Manager {
     /// Reboots and records desired running (SPEC 11.1).
     pub async fn restart(&self, uuid: &str) -> Result<()> {
         let instance = self.store.instance(uuid).await.map_err(external)?;
-        self.hyp.reboot(&instance.name).await.map_err(|error| {
-            Error::operation(format!("lifecycle: restart {}: {error}", instance.name))
-        })?;
+        self.hyp_for(&instance)
+            .await?
+            .reboot(&instance.name)
+            .await
+            .map_err(|error| {
+                Error::operation(format!("lifecycle: restart {}: {error}", instance.name))
+            })?;
         self.store
             .set_desired_state(uuid, DesiredState::Running)
             .await
@@ -79,7 +91,7 @@ impl Manager {
     /// deletes an instance on its own (SPEC section 3).
     pub async fn remove(&self, uuid: &str) -> Result<()> {
         let instance = self.store.instance(uuid).await.map_err(external)?;
-        match self.hyp.remove(&instance.name).await {
+        match self.hyp_for(&instance).await?.remove(&instance.name).await {
             Ok(()) | Err(HypervisorError::DomainNotFound(_)) => {}
             Err(error) => {
                 return Err(Error::operation(format!(
@@ -88,17 +100,13 @@ impl Manager {
                 )));
             }
         }
-        remove_file(&self.overlay_path(uuid))
-            .await
-            .map_err(|error| {
-                Error::operation(format!(
-                    "lifecycle: rm {}: delete overlay: {error}",
-                    instance.name
-                ))
-            })?;
-        if let Err(error) = (self.delete_iso)(self.seed_iso_path(uuid)).await {
+        // The disk and the seed image are on the machine that ran the
+        // instance, and only that machine can delete them. It does so
+        // when it undefines the domain, so this call is a no-op for an
+        // instance that ran elsewhere (MULTI-NODE 13.1).
+        if let Err(error) = self.fleet.deprovision(instance.host_id, &instance).await {
             self.log.warn(&format!(
-                "rm: seed iso not deleted for {}: {error}",
+                "rm: files not deleted for {}: {error}",
                 instance.name
             ));
         }
@@ -135,6 +143,13 @@ impl Manager {
                 || request.nested != instance.nested,
             disk_grown: request.disk_gib > instance.disk_gib,
         };
+        // Weighed against the ceiling of the machine this instance runs
+        // on (MULTI-NODE 12).
+        let capacity = self
+            .store
+            .host_capacity(instance.host_id)
+            .await
+            .map_err(external)?;
         self.store
             .resize(
                 &request.uuid,
@@ -142,7 +157,7 @@ impl Manager {
                 request.memory_mib,
                 request.disk_gib,
                 request.nested,
-                self.capacity,
+                capacity,
             )
             .await
             .map_err(external)?;

@@ -63,10 +63,12 @@ fn series(seed: u64, window: Duration, lo: f64, hi: f64) -> Vec<Point> {
 
 #[async_trait]
 impl Metrics for PlaceholderMetrics {
-    async fn host(&self, window: Duration) -> Result<HostMetrics, BoxError> {
+    async fn hosts(&self, window: Duration) -> Result<Vec<HostMetrics>, BoxError> {
         let seed = hash("host");
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
-        Ok(HostMetrics {
+        Ok(vec![HostMetrics {
+            host_id: 1,
+            host_name: "runner.example.org".to_string(),
             cpu_pct: series(seed, window, 4.0, 88.0),
             memory_used_mib: series(seed ^ 0xa5a5, window, 5_200.0, 13_800.0),
             memory_total_mib: HOST_MEMORY_MIB,
@@ -74,7 +76,7 @@ impl Metrics for PlaceholderMetrics {
             storage_total_gib: HOST_STORAGE_GIB,
             cpu_count: HOST_CPUS,
             placeholder: true,
-        })
+        }])
     }
 
     async fn instance(&self, uuid: &str, window: Duration) -> Result<InstanceMetrics, BoxError> {
@@ -107,7 +109,11 @@ mod tests {
     #[tokio::test]
     async fn series_are_continuous_and_bounded() {
         let metrics = PlaceholderMetrics;
-        let host = metrics.host(Duration::from_secs(3600)).await.unwrap();
+        let hosts = metrics.hosts(Duration::from_secs(3600)).await.unwrap();
+        assert_eq!(hosts.len(), 1);
+        let host = &hosts[0];
+        assert_eq!(host.host_id, 1);
+        assert_eq!(host.host_name, "runner.example.org");
         assert!(host.placeholder);
         assert!(host.cpu_pct.len() >= 120);
         assert!(
@@ -116,8 +122,8 @@ mod tests {
                 .all(|p| (0.0..=100.0).contains(&p.value))
         );
         // The same bucket yields the same value on the next poll.
-        let again = metrics.host(Duration::from_secs(3600)).await.unwrap();
-        assert_eq!(host.cpu_pct[10], again.cpu_pct[10]);
+        let again = metrics.hosts(Duration::from_secs(3600)).await.unwrap();
+        assert_eq!(host.cpu_pct[10], again[0].cpu_pct[10]);
         // Different instances get different series.
         let a = metrics
             .instance("a", Duration::from_secs(600))

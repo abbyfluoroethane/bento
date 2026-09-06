@@ -288,6 +288,7 @@ impl Lifecycle for FakeLifecycle {
             visibility: Visibility::Off,
             created_at: OffsetDateTime::UNIX_EPOCH,
             last_seen_at: None,
+            slot: None,
         };
         self.store
             .data
@@ -464,6 +465,7 @@ pub(crate) fn instance(
         visibility: Visibility::Off,
         created_at: OffsetDateTime::UNIX_EPOCH,
         last_seen_at: None,
+        slot: None,
     }
 }
 
@@ -480,6 +482,10 @@ pub(crate) struct Fixture {
 }
 
 pub(crate) fn fixture() -> Fixture {
+    fixture_with_metrics(Arc::new(crate::PlaceholderMetrics))
+}
+
+pub(crate) fn fixture_with_metrics(metrics: Arc<dyn Metrics>) -> Fixture {
     let alice = user(1, "alice", "alice@example.com", 1000);
     let bob = user(2, "bob", "bob@example.com", 0);
     let store = Arc::new(FakeStore::default());
@@ -528,7 +534,7 @@ pub(crate) fn fixture() -> Fixture {
         is_operator: Some(Arc::new(|user| user.id == 1)),
         image_admin: Some(image_admin.clone()),
         db_path: "/var/lib/bento/bento.db".to_string(),
-        metrics: Arc::new(crate::PlaceholderMetrics),
+        metrics,
         base_domain: "bento.example".to_string(),
         defaults: CreateDefaults {
             vcpu: 2,

@@ -3,14 +3,14 @@ use std::net::{IpAddr, Ipv4Addr};
 
 use async_trait::async_trait;
 
+use crate::slot::Slots;
 use crate::{DynError, Error, Ipv4Prefix, Result, invalid};
 
 // Host address layout inside a user /24 (SPEC 6.2). The .1 address is the
 // host side of the bridge and the gateway of every instance. Instances
-// receive .2 through .254.
+// receive .2 through .254, bounded further by their runner slot
+// (MULTI-NODE 7.1).
 const GATEWAY_HOST: u32 = 1;
-const FIRST_INSTANCE: u32 = 2;
-const LAST_INSTANCE: u32 = 254;
 
 /// The DNS servers written into cloud-init network configuration when
 /// the operator does not override them. No resolver runs on the user
@@ -127,16 +127,26 @@ pub trait AddressStore: Send + Sync {
     ) -> std::result::Result<Vec<Ipv4Addr>, DynError>;
 }
 
-/// Picks the lowest free instance address in a user `/24`. Bento selects
-/// the address at creation time; there is no DHCP (SPEC 6.2). The `.1`
-/// address belongs to the host and is never returned. A freed address is
-/// reused. Returns [`Error::AddressesExhausted`] when `.2` through `.254`
-/// are all taken.
+/// Picks the lowest free instance address inside one runner slot.
+///
+/// Bento selects the address at creation time; there is no DHCP
+/// (SPEC 6.2). The slot bounds the choice so that the address itself
+/// says which runner owns the instance, without a per-instance route
+/// (MULTI-NODE 7.3). At `/24` there is one slot covering the whole
+/// subnet, which is what version 1 did.
+///
+/// The excluded addresses are the `.1` gateway and every subprefix
+/// boundary (MULTI-NODE 7.1); [`Slots::assignable`] holds that rule.
+/// A freed address is reused. Returns [`Error::AddressesExhausted`]
+/// when the slot is full.
 pub async fn allocate_address<S: AddressStore + ?Sized>(
     store: &S,
     subnet: Ipv4Prefix,
+    slots: Slots,
+    slot: u32,
 ) -> Result<Ipv4Addr> {
     require_slash_24(subnet)?;
+    let (low, high) = slots.assignable(slot)?;
     let used: HashSet<Ipv4Addr> = store
         .used_addresses(subnet)
         .await
@@ -144,7 +154,7 @@ pub async fn allocate_address<S: AddressStore + ?Sized>(
         .into_iter()
         .collect();
     let base = addr_to_u32(masked(subnet).addr);
-    for host in FIRST_INSTANCE..=LAST_INSTANCE {
+    for host in low..=high {
         let address = u32_to_addr(base + host);
         if !used.contains(&address) {
             return Ok(address);
@@ -229,11 +239,11 @@ fn prefix_mask(bits: u8) -> u32 {
     }
 }
 
-fn addr_to_u32(address: Ipv4Addr) -> u32 {
+pub(crate) fn addr_to_u32(address: Ipv4Addr) -> u32 {
     u32::from(address)
 }
 
-fn u32_to_addr(address: u32) -> Ipv4Addr {
+pub(crate) fn u32_to_addr(address: u32) -> Ipv4Addr {
     Ipv4Addr::from(address)
 }
 
@@ -408,7 +418,9 @@ mod tests {
             ("exhausted", full, None, true),
         ];
         for (name, used, want, exhausted) in cases {
-            let result = allocate_address(&FakeAddressStore { addresses: used }, subnet).await;
+            let slots = Slots::new(24).unwrap();
+            let result =
+                allocate_address(&FakeAddressStore { addresses: used }, subnet, slots, 0).await;
             if exhausted {
                 assert!(
                     matches!(result, Err(Error::AddressesExhausted)),
@@ -423,10 +435,50 @@ mod tests {
     #[tokio::test]
     async fn allocate_address_rejects_non_slash_24() {
         assert!(
-            allocate_address(&FakeAddressStore::default(), prefix("10.77.0.0/16"))
-                .await
-                .is_err()
+            allocate_address(
+                &FakeAddressStore::default(),
+                prefix("10.77.0.0/16"),
+                Slots::new(24).unwrap(),
+                0
+            )
+            .await
+            .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn allocate_address_stays_inside_its_slot() {
+        // At /25 the two slots never hand out each other's addresses, and
+        // neither hands out a subprefix boundary (MULTI-NODE 7.1).
+        let subnet = prefix("10.100.1.0/24");
+        let slots = Slots::new(25).unwrap();
+
+        let empty = FakeAddressStore::default();
+        assert_eq!(
+            allocate_address(&empty, subnet, slots, 0).await.unwrap(),
+            Ipv4Addr::new(10, 100, 1, 2)
+        );
+        assert_eq!(
+            allocate_address(&empty, subnet, slots, 1).await.unwrap(),
+            Ipv4Addr::new(10, 100, 1, 129)
+        );
+
+        // Slot 0 full stops at .126 rather than spilling into slot 1.
+        let full_low: Vec<_> = (2..=126).map(|h| Ipv4Addr::new(10, 100, 1, h)).collect();
+        let store = FakeAddressStore {
+            addresses: full_low.clone(),
+        };
+        assert!(matches!(
+            allocate_address(&store, subnet, slots, 0).await,
+            Err(Error::AddressesExhausted)
+        ));
+        // The same store still has room in slot 1.
+        assert_eq!(
+            allocate_address(&store, subnet, slots, 1).await.unwrap(),
+            Ipv4Addr::new(10, 100, 1, 129)
+        );
+
+        assert!(allocate_address(&empty, subnet, slots, 2).await.is_err());
     }
 
     #[test]

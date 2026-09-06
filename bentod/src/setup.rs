@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 use bento_config::Config;
-use bento_hypervisor::Client;
+use bento_hypervisor::{CheckConfig, Client};
 use bento_images::Store as ImageStore;
 use bento_lifecycle::Manager;
 use bento_network::Plan;
@@ -15,7 +15,7 @@ use bento_store::Store;
 use bento_types::Capacity;
 use url::Url;
 
-use crate::adapters::{ImageDb, LifecycleImages, LifecycleStore};
+use crate::adapters::{ImageDb, LifecycleStore};
 
 /// Bundles what every subcommand needs.
 pub(crate) struct App {
@@ -67,7 +67,23 @@ impl App {
     }
 
     /// Builds the lifecycle manager over the given hypervisor connection.
-    pub(crate) fn manager(&self, hypervisor: Arc<Client>) -> Result<Arc<Manager>> {
+    pub(crate) fn manager(&self, hypervisor: Arc<Client>, host_id: i64) -> Result<Arc<Manager>> {
+        self.manager_with_runners(hypervisor, host_id, None)
+    }
+
+    /// Builds the lifecycle manager, and gives it a way to send work to
+    /// another machine when the deployment has one (MULTI-NODE 13.1).
+    ///
+    /// Only `serve` holds the controller lease, so only `serve` may send
+    /// a change to another machine. Every other subcommand builds a
+    /// manager that can act on this machine alone, and a create that
+    /// placement sent elsewhere fails there with a sentence saying so.
+    pub(crate) fn manager_with_runners(
+        &self,
+        hypervisor: Arc<Client>,
+        host_id: i64,
+        runners: Option<crate::runners::InstanceSync>,
+    ) -> Result<Arc<Manager>> {
         let dns = self.dns_addrs()?;
         let images = self.image_store();
         let capacity = host_capacity(&self.cfg)?;
@@ -80,12 +96,27 @@ impl App {
         Ok(Arc::new(Manager::new(bento_lifecycle::Config {
             hypervisor: Some(hypervisor.clone()),
             definer: Some(hypervisor.clone()),
-            autostart_clearer: Some(hypervisor),
-            store: Some(Arc::new(LifecycleStore(self.store.clone()))),
-            images: Some(Arc::new(LifecycleImages(images))),
+            autostart_clearer: Some(hypervisor.clone()),
+            store: Some(Arc::new(LifecycleStore(
+                self.store.clone(),
+                crate::adapters::LocalCapacity {
+                    host_id,
+                    capacity,
+                    overcommit_ratio: self.cfg.overcommit_ratio,
+                },
+            ))),
+            host_id,
+            fleet: Some(Arc::new(crate::adapters::RunnerFleet {
+                store: self.store.clone(),
+                images,
+                seeds: Arc::new(bento_cloudinit::Builder::default()),
+                hypervisor: hypervisor.clone(),
+                storage_dir: PathBuf::from(&self.cfg.storage_dir),
+                host_id,
+                runners,
+            })),
             iso: Some(Arc::new(bento_cloudinit::Builder::default())),
             plan: Some(self.plan),
-            capacity,
             storage_dir: PathBuf::from(&self.cfg.storage_dir),
             name_cooldown: self.cfg.cooldown(),
             batch_size: self.cfg.restore_batch_size as usize,
@@ -105,6 +136,46 @@ impl App {
             })
             .collect()
     }
+}
+
+/// Runs the host checks that must finish before a service starts a listener.
+/// Fatal requirements stop startup. Other requirements only warn. The runner
+/// uses this order to keep its management listener off an invalid host
+/// (MULTI-NODE 11.1).
+pub(crate) async fn host_checks(app: &App) -> Result<()> {
+    let nested_wanted = app
+        .store
+        .instances()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .any(|instance| instance.nested);
+    let report = bento_hypervisor::check(
+        CheckConfig {
+            socket_path: socket_path(&app.cfg.libvirt_uri),
+            image_dir: PathBuf::from(&app.cfg.image_dir),
+            storage_dir: PathBuf::from(&app.cfg.storage_dir),
+            container_storage: PathBuf::from(&app.cfg.bootc.container_storage),
+            podman_required: app.cfg.images.iter().any(|image| !image.oci.is_empty()),
+            nested_wanted,
+            ..Default::default()
+        },
+        &bento_hypervisor::default_check_deps(),
+    );
+    for warning in report.warnings() {
+        tracing::warn!(check = %warning.name, detail = %warning.detail, "host check");
+    }
+    if !report.ok() {
+        let failures = report
+            .results
+            .iter()
+            .filter(|result| result.fatal && !result.ok)
+            .map(|result| format!("{}: {}", result.name, result.detail))
+            .collect::<Vec<_>>()
+            .join("\n  ");
+        bail!("host requirements not met (SPEC 4.2):\n  {failures}");
+    }
+    Ok(())
 }
 
 const MIB: u64 = 1024 * 1024;

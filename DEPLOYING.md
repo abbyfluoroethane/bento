@@ -118,6 +118,99 @@ Or narrow `proxy_port_min`/`proxy_port_max` to a clear range.
 If the host already runs sshd on 22, move it (or move Bento's
 `listen.ssh`). Bento's frontend must own the port users will `ssh` to.
 
+### The runner port, when there is more than one machine
+
+A deployment that runs guests on more than one machine adds a runner port
+on each of them. **Bento trusts the network that port sits on.** It runs
+no certificate authority and authenticates nothing between the controller
+and its runners, because a protected LAN or a routed VPN has already
+decided who can reach the port (MULTI-NODE 11.1).
+
+That makes two rules absolute:
+
+* Put every Bento machine on a **protected LAN, or a routed VPN** such as
+  WireGuard or Tailscale. Never expose a runner port to the public
+  internet, and never run Bento on a network you share with people you do
+  not trust.
+* Bind the runner listener to the **underlay address**, never to a
+  wildcard. Bento denies every guest prefix all management addresses, so a
+  guest cannot reach it; a wildcard bind would undo that.
+
+Guests are not trusted and never were. The trust here is in your own
+network, not in the virtual machines running on it.
+
+### The host firewall
+
+**Do this before you give a second machine a slot.** A host firewall on a
+Bento machine has to let guest traffic be forwarded onto the user
+bridges. Bento cannot arrange that from its own rules.
+
+nftables runs every base chain at a hook. Bento's `accept` ends only its
+own chain; the packet still meets the next table's, and one `drop` or
+`reject` anywhere is final. So a host firewall that rejects forwarded
+traffic overrides Bento, whatever Bento's table says.
+
+This costs nothing on one machine, because nothing is forwarded from off
+the machine. It matters the moment a guest on one machine has to reach a
+guest on another: the packet arrives on the underlay interface and has to
+be forwarded onto a user bridge. A firewall that rejects it produces the
+same signature as a missing route — the guest sees nothing, and every
+Bento rule still looks right.
+
+On a Fedora or RHEL machine running firewalld, give the bridges and the
+guest range a zone that accepts, on **every** Bento machine:
+
+```
+firewall-cmd --permanent --new-zone=bento
+firewall-cmd --permanent --zone=bento --set-target=ACCEPT
+firewall-cmd --permanent --zone=bento --add-source=10.100.0.0/16
+firewall-cmd --permanent --zone=bento --add-interface=bento0
+firewall-cmd --permanent --zone=bento --add-interface=bento1
+firewall-cmd --reload
+```
+
+Use your own `private_range` in place of `10.100.0.0/16`, and name every
+user bridge you have. Add the bridge of each new user as you create one;
+`ip -br addr | grep bento` lists them.
+
+The source line is the one that matters. A zone holding only the
+interfaces governs traffic *leaving* those bridges, and firewalld judges
+a forwarded packet by where it came *from*. Adding the guest range as a
+source is what lets a guest packet arriving over the underlay be
+forwarded onto a bridge. It is also the durable half: a source rule names
+no interface, so it keeps working when libvirt destroys and recreates a
+bridge, which drops that bridge out of the zone until the next reload.
+
+This does not widen what a guest may reach. Bento's own table still
+carries the whole policy: it permits traffic only between two addresses
+of the same user, and it permits a frontend on another machine only to an
+instance's published ports (MULTI-NODE 8.4). The firewalld change stops
+the host firewall from pre-empting that decision; Bento still makes it.
+
+On a machine whose network is already protected, turning the host
+firewall off is the other answer, and it leaves Bento's table as the one
+policy for guest traffic:
+
+```
+systemctl disable --now firewalld
+```
+
+That is the same trust decision as section 2: the network is the
+boundary. It does not widen what a guest may reach, because Bento's table
+still carries the whole guest policy.
+
+On a machine with no host firewall, there is nothing to do. `bentod
+runner` names any other table it finds filtering the forward hook, once
+the machine has a slot another machine routes to:
+
+```
+another nftables table filters the forward hook; Bento cannot accept
+what it rejects  tables="inet firewalld filter_FORWARD"
+```
+
+That message is advice, not a fault. It appears on any machine running
+firewalld, including one that is configured correctly.
+
 ## 3. DNS
 
 Two records pointing at the host (SPEC 7.1):
@@ -337,8 +430,9 @@ this — the guest's own configuration has to name the alias.
 
 ## 6. Running it
 
-Three units, one per process (SPEC 4). `bentod-serve` owns the database;
-start it first.
+Four units, one per process (SPEC 4). `bentod-serve` owns the database;
+start it first. The fourth, `bentod-runner`, is only needed once a
+deployment runs guests on more than one machine; see below.
 
 ```ini
 [Unit]
@@ -385,6 +479,130 @@ was ever needed. Rust does not do this, so the limit has to be set.
 ```
 systemctl enable --now bentod-serve bentod-proxy bentod-sshd
 ```
+
+### bentod-runner, on a machine that holds guests
+
+`bentod-runner` is the service the controller calls to act on one
+machine's libvirt (MULTI-NODE 11). A single-host deployment does not need
+it, and nothing breaks if it never runs.
+
+**Which units go where.** The controller machine runs all four: it holds
+the database, the proxy, and the SSH frontend, and it also holds guests,
+so it runs a runner service of its own (MULTI-NODE 19). A machine that
+only holds guests runs `bentod-runner` **alone**. Do not enable
+`bentod-serve`, `bentod-proxy`, or `bentod-sshd` there: one deployment has
+one control plane, and a second `serve` against a second database would
+be a second Bento.
+
+`bento-monitor` writes all four unit files. Enabling them is per unit on
+its Services tab, so a runner-only machine enables only the one.
+
+```ini
+[Unit]
+Description=Bento runner service
+After=network-online.target virtqemud.socket virtnetworkd.socket
+Wants=network-online.target
+
+[Service]
+ExecStart=/usr/local/bin/bentod -config /etc/bento/runner.toml runner
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Its configuration needs the `[runner]` section from section 2, and the
+`listen` address must be that machine's own underlay address. A wildcard
+is refused at startup, because it would put the management port on the
+user bridges.
+
+### Adding a machine to the fleet
+
+The order matters. The new machine is prepared first, and the controller
+is told about it last, so the controller never calls an address that
+answers with something unexpected.
+
+**On the new machine**, run `bento-monitor` and work down the Install
+tab, exactly as for a first host:
+
+1. Build and install the binary.
+2. Write the configuration. Set `[runner] listen` to this machine's own
+   underlay address, and `fence_db` to a path on local disk.
+3. Create the directories.
+4. Install the unit files.
+
+Then, on the Services tab, enable and start **`bentod-runner` only**.
+Leave `bentod-serve`, `bentod-proxy`, and `bentod-sshd` alone: one
+deployment has one control plane.
+
+Check the log says what you expect:
+
+```
+runner listening addr=10.0.0.97:10443 machine_id=167eeb68... accepted_epoch=0
+```
+
+The machine ID is that machine's `/etc/machine-id`. It is the identity
+Bento keys the host row on, so a rename never makes a second row.
+
+**On the controller**, add the machine to the configuration:
+
+```toml
+[[runners]]
+name = "tsukasa"
+endpoint = "http://10.0.0.97:10443"
+```
+
+Restart `bentod-serve`. It creates the host row, calls the endpoint, and
+learns the machine ID from the first answer. Nothing needs an enrollment
+secret: the network is the trust boundary (MULTI-NODE 11.1).
+
+**Give it a slot.** A machine with no slot owns no addresses and takes no
+instances (MULTI-NODE 7.2). Slot ownership is deployment-wide: the runner
+that owns slot 1 owns slot 1 of every user's `/24`.
+
+```
+bentod slots                     # what the division is now
+bentod slots set-prefix 25       # divide each user /24 into two halves
+bentod slots give 1 tsukasa      # give the second half to the new machine
+bentod slots plan tsukasa        # what it will be told, before it is told
+```
+
+Subdivision moves nothing. Each old slot splits into children that stay
+with their old owner, and every guest keeps its address and its `/24`
+configuration (MULTI-NODE 17.1). A guest treats the whole user network as
+on-link and asks for a remote address by ARP; the machine it is on
+answers and routes the packet (MULTI-NODE 8.1). Nothing inside a guest
+changes, and nothing needs restarting.
+
+`bentod slots plan` prints the routes, the proxy ARP settings, and the
+firewall a machine will be given, without applying any of it. Read it
+before a prefix change to see what the change will do.
+
+The controller installs the network on its next poll, at most 30 seconds
+later. Check both machines:
+
+```
+ip -4 route | grep 10.100        # a route for each slot another machine owns
+```
+
+**Wait for the image sync.** The new machine fetches the current version
+of every allowlisted image. Creating instances is refused until every
+machine holds the same current version, so `base_checksum` means one
+thing across the deployment. `bentod images` shows which machine holds
+what, and the refusal names the machine that is not ready yet:
+
+```
+the fleet is still fetching debian-13: tsukasa is not ready
+```
+
+This clears by itself. A large image on a slow link takes a while.
+
+> **A machine keeps every version its own guests need.** An image
+> version is the qcow2 backing file of every overlay built from it, so
+> Bento never replaces one; a newer build lands beside it (SPEC 5.1).
+> Pulling a new version with `bentod sync-images` is safe with guests
+> running.
 
 > **The SSH frontend creates nothing.** An unknown key connecting to
 > `bentod sshd` gets a three-minute link to sign in with and nothing
@@ -480,11 +698,19 @@ reading the two conditions in SPEC 5.3.
 
 ### The dashboard charts
 
-The charts read the host every 30 seconds: `/proc/stat` for processor
-time, `/proc/meminfo` for memory, and the storage volume for disk. The
-per-instance figures come from libvirt, and the disk figure of an
-instance is the real size of its overlay rather than the virtual size
+The charts read every machine every 30 seconds: `/proc/stat` for
+processor time, `/proc/meminfo` for memory, and the storage volume for
+disk. The per-instance figures come from libvirt, and the disk figure of
+an instance is the real size of its overlay rather than the virtual size
 that the capacity check counts.
+
+`bentod serve` reads its own machine through the local libvirt socket
+and asks every other machine over the runner endpoint. A machine that
+holds guests therefore needs `bentod-runner` running and its endpoint
+reachable, or its guests have no charts. The front page shows one card
+for each machine, and each card counts only the instances that machine
+holds. Capacity belongs to a machine, so the tiles above the table show
+a ceiling only when there is one machine to name.
 
 The series live in memory. **A restart of `bentod-serve` empties every
 chart**, and they refill over the following hour. Nothing is lost that
@@ -492,6 +718,8 @@ was not a picture.
 
 Two figures can be missing rather than wrong:
 
+- A machine that did not answer keeps its card, with the size it last
+  reported, and its charts stay flat until it answers again.
 - An instance that is not running has no processor or memory reading.
 - A guest whose balloon driver never reported has no memory reading, so
   its memory chart stays empty while its processor chart fills. The
@@ -540,6 +768,17 @@ dashboard controls, such as the database download.
 `bentod dump-db` writes a consistent copy through the SQLite backup API.
 **Never copy the database file directly** — WAL makes that unsafe. Back
 it up together with the image and storage directories (SPEC 12.1).
+
+`bentod restore-db <copy>` puts one back. Stop the three units first: a
+restore replaces the whole database and does not coordinate with a
+running writer. It copies the current database aside before it replaces
+it, to `<db_path>.before-restore-<stamp>`, so a restore of the wrong file
+is still recoverable. It then applies any schema migrations the copy has
+not had, which is what lets an older backup come back on a newer build.
+
+`bento-monitor` has both on the Config tab: `b` copies the database
+beside itself, and `r` offers the newest copy that is there. Take a copy
+before an upgrade that carries a schema migration.
 
 ## Known operator gaps
 

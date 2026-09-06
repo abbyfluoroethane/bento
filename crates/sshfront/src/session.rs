@@ -1167,6 +1167,7 @@ mod tests {
             visibility: Visibility::Off,
             created_at: OffsetDateTime::UNIX_EPOCH,
             last_seen_at: None,
+            slot: None,
         }
     }
 

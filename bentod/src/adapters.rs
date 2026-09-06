@@ -3,11 +3,12 @@
 
 use std::collections::HashSet;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use anyhow::Context as _;
 use async_trait::async_trait;
 use bento_api::{BoxError as ApiError, StatusError as ApiStatusError, StoreError as ApiStoreError};
 use bento_auth::{BoxError as AuthError, TokenLookup};
@@ -177,7 +178,17 @@ impl ReportSource for ImageReport {
 
 // ---- lifecycle dependencies and backends ----
 
-pub(crate) struct LifecycleStore(pub(crate) Store);
+/// What this machine is, so a ceiling can be read for it without asking
+/// it to report one (SPEC 6.1, MULTI-NODE 12).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct LocalCapacity {
+    pub(crate) host_id: i64,
+    pub(crate) capacity: Capacity,
+    /// A deployment setting, so it applies to every machine's memory.
+    pub(crate) overcommit_ratio: f64,
+}
+
+pub(crate) struct LifecycleStore(pub(crate) Store, pub(crate) LocalCapacity);
 
 #[async_trait]
 impl bento_lifecycle::Store for LifecycleStore {
@@ -198,8 +209,11 @@ impl bento_lifecycle::Store for LifecycleStore {
     async fn instances(&self) -> Result<Vec<Instance>, LifecycleError> {
         Ok(self.0.instances().await?)
     }
-    async fn instances_to_restore(&self) -> Result<Vec<Instance>, LifecycleError> {
-        Ok(self.0.instances_to_restore().await?)
+    async fn instances_on_host(&self, host_id: i64) -> Result<Vec<Instance>, LifecycleError> {
+        Ok(self.0.instances_on_host(host_id).await?)
+    }
+    async fn instances_to_restore(&self, host_id: i64) -> Result<Vec<Instance>, LifecycleError> {
+        Ok(self.0.instances_to_restore(host_id).await?)
     }
     async fn image(&self, name: &str) -> Result<Image, LifecycleError> {
         Ok(self.0.image(name).await?)
@@ -207,6 +221,62 @@ impl bento_lifecycle::Store for LifecycleStore {
     async fn image_version(&self, checksum: &str) -> Result<ImageVersion, LifecycleError> {
         Ok(self.0.image_version(checksum).await?)
     }
+    async fn hosts_missing_image(
+        &self,
+        image_name: &str,
+        checksum: &str,
+    ) -> Result<Vec<String>, LifecycleError> {
+        Ok(self.0.hosts_missing_image(image_name, checksum).await?)
+    }
+    async fn host_capacity(&self, host_id: i64) -> Result<Capacity, LifecycleError> {
+        // This machine's ceiling is read from the machine itself at
+        // startup, which is more accurate than an observation and is what
+        // a single-machine deployment has always used (SPEC 6.1).
+        if host_id == self.1.host_id {
+            return Ok(self.1.capacity);
+        }
+        // Another machine's ceiling comes from what it last reported. The
+        // same overcommit ratio applies, because it is a deployment
+        // setting rather than a property of one machine.
+        let seen = self.0.host_observation(host_id).await?;
+        let Some(seen) = seen else {
+            return Err(Box::new(SimpleError(format!(
+                "machine {host_id} has not reported its capacity yet"
+            ))));
+        };
+        Ok(Capacity {
+            memory_mib: (seen.memory_total_mib.unwrap_or(0) as f64 * self.1.overcommit_ratio)
+                as i64,
+            disk_gib: seen.storage_total_gib.unwrap_or(0),
+        })
+    }
+
+    async fn choose_host(&self, want: bento_types::Placing) -> Result<i64, LifecycleError> {
+        Ok(self.0.choose_host(want).await?.host.id)
+    }
+
+    async fn placeable_hosts(&self) -> Result<usize, LifecycleError> {
+        // Enabled and active is the widest test a create can apply
+        // cheaply. Health, slot ownership, architecture, and room are
+        // weighed inside `choose_host`, which reports why it rejected
+        // each machine (MULTI-NODE 12).
+        Ok(self
+            .0
+            .hosts()
+            .await?
+            .into_iter()
+            .filter(|host| host.enabled && host.placement == bento_types::Placement::Active)
+            .count())
+    }
+
+    async fn deployment(&self) -> Result<bento_types::Deployment, LifecycleError> {
+        Ok(self.0.deployment().await?)
+    }
+
+    async fn slots(&self) -> Result<Vec<bento_types::Slot>, LifecycleError> {
+        Ok(self.0.slots().await?)
+    }
+
     async fn user_by_id(&self, id: i64) -> Result<User, LifecycleError> {
         Ok(self.0.user_by_id(id).await?)
     }
@@ -250,22 +320,185 @@ impl bento_lifecycle::Store for LifecycleStore {
     }
 }
 
-pub(crate) struct LifecycleImages(pub(crate) Arc<bento_images::Store>);
+/// Builds an instance on whichever machine will run it
+/// (MULTI-NODE 13.1).
+///
+/// The controller's own machine is not a special case in the protocol,
+/// only in the transport: it is reached through the same runner service
+/// as any other machine, so one code path builds every instance. What
+/// differs is that a machine other than this one must be looked up to
+/// find its endpoint.
+pub(crate) struct RunnerFleet {
+    pub(crate) store: Store,
+    pub(crate) images: Arc<bento_images::Store>,
+    pub(crate) seeds: Arc<bento_cloudinit::Builder>,
+    pub(crate) hypervisor: Arc<bento_hypervisor::Client>,
+    pub(crate) storage_dir: PathBuf,
+    /// This machine.
+    pub(crate) host_id: i64,
+    /// Sends work to another machine. Absent when the deployment has one
+    /// machine and no runner service is configured.
+    pub(crate) runners: Option<crate::runners::InstanceSync>,
+}
 
-#[async_trait]
-impl bento_lifecycle::ImageStore for LifecycleImages {
-    async fn create_overlay(
-        &self,
-        checksum: &str,
-        overlay_path: &Path,
-        disk_gib: i64,
-    ) -> Result<(), LifecycleError> {
-        Ok(self
-            .0
-            .create_overlay(checksum, overlay_path, disk_gib)
-            .await?)
+impl RunnerFleet {
+    fn overlay_path(&self, uuid: &str) -> PathBuf {
+        self.storage_dir.join(format!("{uuid}.qcow2"))
+    }
+
+    fn seed_iso_path(&self, uuid: &str) -> PathBuf {
+        self.storage_dir.join(format!("{uuid}-seed.iso"))
+    }
+
+    /// Builds an instance on this machine, cleaning up after itself when
+    /// a step fails.
+    async fn provision_here(&self, spec: &bento_lifecycle::ProvisionSpec) -> anyhow::Result<State> {
+        let uuid = &spec.instance.uuid;
+        let overlay = self.overlay_path(uuid);
+        let seed_iso = self.seed_iso_path(uuid);
+
+        self.images
+            .create_overlay(
+                &spec.instance.base_checksum,
+                &overlay,
+                spec.instance.disk_gib,
+            )
+            .await
+            .with_context(|| format!("overlay for {uuid}"))?;
+
+        let built = async {
+            if spec.with_seed_iso {
+                self.seeds
+                    .build(&spec.seed, &seed_iso)
+                    .await
+                    .with_context(|| format!("seed image for {uuid}"))?;
+            }
+            let xml = bento_hypervisor::domain_xml(&bento_hypervisor::DomainSpec {
+                name: spec.instance.name.clone(),
+                uuid: uuid.clone(),
+                vcpu: spec.instance.vcpu,
+                memory_mib: spec.instance.memory_mib,
+                disk_path: overlay.display().to_string(),
+                iso_path: if spec.with_seed_iso {
+                    seed_iso.display().to_string()
+                } else {
+                    String::new()
+                },
+                network: spec.network.clone(),
+                mac: spec.instance.mac.clone(),
+                nested: spec.instance.nested,
+                ksm: spec.instance.ksm,
+                arch: String::new(),
+            })?;
+            if spec.start {
+                bento_hypervisor::Hypervisor::create(self.hypervisor.as_ref(), &xml).await?;
+            } else {
+                bento_hypervisor::Definer::define(self.hypervisor.as_ref(), &xml).await?;
+            }
+            anyhow::Ok(())
+        }
+        .await;
+
+        if let Err(error) = built {
+            self.remove_files(uuid).await;
+            return Err(error);
+        }
+        Ok(match self.hypervisor.state(&spec.instance.name).await {
+            Ok(state) => state,
+            Err(_) => State::Stopped,
+        })
+    }
+
+    /// Removes the overlay and seed image of an instance that is gone or
+    /// was never finished. Failures are logged, not returned: the caller
+    /// is already reporting why, and a cleanup error would replace the
+    /// reason with a consequence.
+    async fn remove_files(&self, uuid: &str) {
+        for path in [self.seed_iso_path(uuid), self.overlay_path(uuid)] {
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => tracing::warn!(
+                    path = %path.display(),
+                    %error,
+                    "could not remove the file of an instance that is gone"
+                ),
+            }
+        }
     }
 }
+
+#[async_trait]
+impl bento_lifecycle::Fleet for RunnerFleet {
+    async fn provision(
+        &self,
+        spec: &bento_lifecycle::ProvisionSpec,
+    ) -> Result<State, LifecycleError> {
+        if spec.host_id == self.host_id {
+            return self
+                .provision_here(spec)
+                .await
+                .map_err(|error| Box::new(SimpleError(error.to_string())) as LifecycleError);
+        }
+        let runners = self.runners.as_ref().ok_or_else(|| {
+            Box::new(SimpleError(
+                "this deployment has no runner endpoints, so it cannot build an \
+                 instance on another machine"
+                    .to_owned(),
+            )) as LifecycleError
+        })?;
+        let host = self
+            .store
+            .host(spec.host_id)
+            .await
+            .map_err(|error| Box::new(SimpleError(error.to_string())) as LifecycleError)?;
+        runners
+            .provision(&host, spec)
+            .await
+            .map_err(|error| Box::new(SimpleError(error.to_string())) as LifecycleError)
+    }
+
+    async fn hypervisor(&self, host_id: i64) -> Option<Arc<dyn bento_hypervisor::Hypervisor>> {
+        if host_id == self.host_id {
+            return Some(self.hypervisor.clone());
+        }
+        // The host row is read on every call rather than cached, because
+        // an endpoint can change while the controller runs, and an action
+        // sent to a stale address would act on nothing and report success.
+        let runners = self.runners.clone()?;
+        let host = self.store.host(host_id).await.ok()?;
+        Some(Arc::new(crate::runners::RunnerHypervisor::new(
+            runners, host,
+        )))
+    }
+
+    async fn deprovision(
+        &self,
+        host_id: i64,
+        instance: &bento_types::Instance,
+    ) -> Result<(), LifecycleError> {
+        if host_id == self.host_id {
+            self.remove_files(&instance.uuid).await;
+            return Ok(());
+        }
+        // A machine other than this one removed its own files when it
+        // undefined the domain, so there is nothing left here to do.
+        Ok(())
+    }
+}
+
+/// An error with nothing but a sentence, for a seam whose caller only
+/// prints it.
+#[derive(Debug)]
+struct SimpleError(String);
+
+impl std::fmt::Display for SimpleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for SimpleError {}
 
 pub(crate) struct Backend {
     pub(crate) manager: Arc<Manager>,
@@ -455,7 +688,10 @@ pub(crate) struct ApiBackend(pub(crate) Backend);
 /// capacity refusal, a taken name, a name still in cooldown, or a missing
 /// row raised inside a lifecycle action reached the client as a bare 500
 /// rather than the documented 409 or 404 (SPEC 6.1, 7.2, 12).
-fn api_lifecycle_error(error: bento_lifecycle::Error) -> ApiError {
+pub(crate) fn api_lifecycle_error(error: bento_lifecycle::Error) -> ApiError {
+    if matches!(&error, bento_lifecycle::Error::FleetImageNotReady { .. }) {
+        return Box::new(ApiStatusError::new(StatusCode::CONFLICT, error.to_string()));
+    }
     let mut candidate: Option<&(dyn std::error::Error + 'static)> = Some(&error);
     while let Some(current) = candidate {
         if let Some(store_error) = current.downcast_ref::<StoreError>()
@@ -887,7 +1123,10 @@ impl NetworkEnsurer for bento_hypervisor::Client {
 ///
 /// This is the only thing that creates a user. The SSH frontend no longer
 /// does, so the identity provider is the sole gate on who has an account.
-pub(crate) struct Provisioner {
+///
+/// It creates accounts, never instances. [`RunnerFleet`] is the one
+/// that builds an instance on a machine.
+pub(crate) struct AccountProvisioner {
     pub(crate) store: Store,
     pub(crate) plan: Plan,
     pub(crate) networks: Option<Arc<dyn NetworkEnsurer>>,
@@ -895,7 +1134,7 @@ pub(crate) struct Provisioner {
 }
 
 #[async_trait]
-impl bento_auth::Provisioner for Provisioner {
+impl bento_auth::Provisioner for AccountProvisioner {
     async fn provision(&self, account: bento_auth::NewAccount) -> Result<User, AuthError> {
         // The name comes from claims the provider chose, so a collision is
         // ordinary rather than exceptional; the store suffixes it.
@@ -914,7 +1153,7 @@ impl bento_auth::Provisioner for Provisioner {
     }
 }
 
-impl Provisioner {
+impl AccountProvisioner {
     /// Defines the user's network and reloads the firewall. Neither
     /// failure blocks the account: the control-plane convergence loop
     /// re-ensures both every tick (SPEC 6.2, 6.3).

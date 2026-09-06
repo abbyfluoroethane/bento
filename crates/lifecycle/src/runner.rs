@@ -46,7 +46,7 @@ impl std::error::Error for RunError {
 /// Executes a host command such as `qemu-img`. Tests inject a fake so no
 /// process runs on a development host.
 #[async_trait]
-pub trait Runner: Send + Sync {
+pub trait CommandRunner: Send + Sync {
     async fn run(&self, name: &OsStr, args: &[OsString]) -> std::result::Result<Vec<u8>, RunError>;
 }
 
@@ -54,7 +54,7 @@ pub trait Runner: Send + Sync {
 struct ExecRunner;
 
 #[async_trait]
-impl Runner for ExecRunner {
+impl CommandRunner for ExecRunner {
     async fn run(&self, name: &OsStr, args: &[OsString]) -> std::result::Result<Vec<u8>, RunError> {
         let mut child = Command::new(name)
             .args(args)
@@ -91,7 +91,7 @@ impl Runner for ExecRunner {
 
 /// Grows qcow2 overlays using `qemu-img resize` (SPEC 11.1).
 pub struct QemuImgResizer {
-    runner: Arc<dyn Runner>,
+    runner: Arc<dyn CommandRunner>,
     qemu_img: PathBuf,
 }
 
@@ -106,7 +106,7 @@ impl Default for QemuImgResizer {
 
 impl QemuImgResizer {
     #[must_use]
-    pub fn with_runner(mut self, runner: Arc<dyn Runner>) -> Self {
+    pub fn with_runner(mut self, runner: Arc<dyn CommandRunner>) -> Self {
         self.runner = runner;
         self
     }

@@ -281,6 +281,70 @@ pub trait DB: Send + Sync {
     async fn checksum_in_use(&self, checksum: &str) -> std::result::Result<bool, DynError>;
 }
 
+/// The database of a machine that has none (MULTI-NODE 11.2).
+///
+/// A runner knows its own machine, not the deployment, so it never reads
+/// the allowlist. Every method here refuses with the same sentence, which
+/// is a clearer failure than a store that appears to hold no images.
+struct NoDatabase;
+
+fn no_database<T>() -> std::result::Result<T, DynError> {
+    Err(Box::new(Error::Invalid(
+        "this machine has no image database; it can make overlays and \
+         nothing else (MULTI-NODE 11.2)"
+            .to_owned(),
+    )))
+}
+
+#[async_trait]
+impl DB for NoDatabase {
+    async fn insert_image(&self, _: Image) -> std::result::Result<bool, DynError> {
+        no_database()
+    }
+    async fn delete_unbuilt_image(&self, _: &str) -> std::result::Result<bool, DynError> {
+        no_database()
+    }
+    async fn upsert_image(&self, _: Image) -> std::result::Result<(), DynError> {
+        no_database()
+    }
+    async fn images(&self) -> std::result::Result<Vec<Image>, DynError> {
+        no_database()
+    }
+    async fn has_image_version(&self, _: &str) -> std::result::Result<bool, DynError> {
+        no_database()
+    }
+    async fn insert_image_version(&self, _: ImageVersion) -> std::result::Result<(), DynError> {
+        no_database()
+    }
+    async fn set_current_checksum(&self, _: &str, _: &str) -> std::result::Result<(), DynError> {
+        no_database()
+    }
+    async fn image_versions(&self) -> std::result::Result<Vec<ImageVersion>, DynError> {
+        no_database()
+    }
+    async fn image_version_for_source(
+        &self,
+        _: &str,
+        _: &str,
+    ) -> std::result::Result<Option<ImageVersion>, DynError> {
+        no_database()
+    }
+    async fn record_image_source(
+        &self,
+        _: &str,
+        _: &str,
+        _: &str,
+    ) -> std::result::Result<(), DynError> {
+        no_database()
+    }
+    async fn delete_image_version(&self, _: &str) -> std::result::Result<(), DynError> {
+        no_database()
+    }
+    async fn checksum_in_use(&self, _: &str) -> std::result::Result<bool, DynError> {
+        no_database()
+    }
+}
+
 #[async_trait]
 impl<T: DB + ?Sized> DB for Arc<T> {
     async fn insert_image(&self, image: Image) -> std::result::Result<bool, DynError> {
@@ -399,6 +463,20 @@ impl Store {
             lock: Arc::new(Mutex::new(())),
             oci_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    /// Returns a store that can make overlays but cannot read or write
+    /// the allowlist.
+    ///
+    /// A runner has no controller database and must not open one
+    /// (MULTI-NODE 11.2): it knows its own machine, not the deployment.
+    /// It still has to make an overlay when it is told to provision an
+    /// instance, and that work needs only the image directory and
+    /// `qemu-img`. Every database method on this store returns an error
+    /// naming the reason, so a call that needs the allowlist fails with a
+    /// sentence rather than reading something that is not there.
+    pub fn for_overlays(dir: impl Into<PathBuf>) -> Self {
+        Self::new(dir, NoDatabase)
     }
 
     /// Sets the HTTP client used to download images.

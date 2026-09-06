@@ -10,6 +10,7 @@ members = [
     "crates/cloudinit",
     "crates/network",
     "crates/lifecycle",
+    "crates/runner",
     "crates/tlscert",
     "crates/proxy",
     "crates/auth",
@@ -39,6 +40,7 @@ bento-images = { path = "crates/images" }
 bento-cloudinit = { path = "crates/cloudinit" }
 bento-network = { path = "crates/network" }
 bento-lifecycle = { path = "crates/lifecycle" }
+bento-runner = { path = "crates/runner" }
 bento-tlscert = { path = "crates/tlscert" }
 bento-proxy = { path = "crates/proxy" }
 bento-auth = { path = "crates/auth" }

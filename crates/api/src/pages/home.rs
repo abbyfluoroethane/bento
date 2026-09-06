@@ -82,8 +82,15 @@ fn mib(value: f64) -> String {
     super::mib(value.round() as i64)
 }
 
+/// One machine's card on the front page: its charts and its bars.
+///
+/// Capacity belongs to a machine (SPEC 6.1, MULTI-NODE 12), so every
+/// figure here is about one machine and nothing is summed across the
+/// deployment.
 #[derive(Debug, Serialize)]
 pub(crate) struct HostFigures {
+    host_id: i64,
+    host_name: String,
     memory_total_mib: i64,
     memory_provisioned_mib: i64,
     memory: Bar,
@@ -101,7 +108,11 @@ struct HomeData {
     instances: Vec<VmView>,
     counts: StateCounts,
     tiles: Vec<UsageTile>,
-    host: HostFigures,
+    /// What the tiles are measured against, which depends on how many
+    /// machines the deployment has.
+    tiles_note: &'static str,
+    /// One entry for each machine, in host row order.
+    hosts: Vec<HostFigures>,
 }
 
 #[derive(Debug, Default, Serialize)]
@@ -120,13 +131,21 @@ fn ratio(used: f64, max: f64) -> f64 {
     }
 }
 
-/// The viewer's provisioned resources against the host's totals. There
-/// are no per-user quotas: the host is the only limit.
+/// The viewer's provisioned resources. There are no per-user quotas
+/// (issue #22): the machines are the only limit.
+///
+/// A ceiling is shown only when the deployment has one machine. Adding
+/// the memory of machines that cannot share it would describe a machine
+/// that does not exist, and no VM could ever use that figure
+/// (MULTI-NODE 20). With more than one machine the tiles state what the
+/// account has taken, and the per-machine cards below carry the
+/// capacity, one machine at a time.
 async fn usage_tiles(
     state: &AppState,
     user: &User,
-    host: &crate::HostMetrics,
+    hosts: &[crate::HostMetrics],
 ) -> Result<Vec<UsageTile>, crate::BoxError> {
+    let host = (hosts.len() == 1).then(|| &hosts[0]);
     let usage = state.0.store.usage_for(user.id).await?;
     let tile = |label, used: i64, max: Option<i64>, fmt: fn(i64) -> String| UsageTile {
         label,
@@ -137,29 +156,42 @@ async fn usage_tiles(
     };
     Ok(vec![
         tile("VMs", usage.instances, None, |n| n.to_string()),
-        tile("vCPU", usage.vcpu, Some(host.cpu_count), |n| n.to_string()),
+        tile(
+            "vCPU",
+            usage.vcpu,
+            host.map(|host| host.cpu_count),
+            |n| n.to_string(),
+        ),
         tile(
             "Memory",
             usage.memory_mib,
-            Some(host.memory_total_mib),
+            host.map(|host| host.memory_total_mib),
             super::mib,
         ),
-        tile("Disk", usage.disk_gib, Some(host.storage_total_gib), |n| {
-            format!("{n} GiB")
-        }),
+        tile(
+            "Disk",
+            usage.disk_gib,
+            host.map(|host| host.storage_total_gib),
+            |n| format!("{n} GiB"),
+        ),
     ])
 }
 
-/// Provisioned figures are real (summed from the instance rows); usage
-/// figures come from [`crate::Metrics`], which may be the placeholder.
-async fn host_figures(
-    state: &AppState,
-    host: &crate::HostMetrics,
-) -> Result<HostFigures, crate::BoxError> {
-    let all = state.0.store.instances().await?;
-    let memory_provisioned_mib: i64 = all.iter().map(|i| i.memory_mib).sum();
-    let storage_provisioned_gib: i64 = all.iter().map(|i| i.disk_gib).sum();
-    Ok(HostFigures {
+/// Provisioned figures are real (summed from the instance rows that
+/// this machine holds); usage figures come from [`crate::Metrics`],
+/// which may be the placeholder.
+fn host_figures(all: &[bento_types::Instance], host: &crate::HostMetrics) -> HostFigures {
+    // Only the instances on this machine count against it. Summing the
+    // whole deployment against one machine's size would show a machine
+    // as full because another one is (SPEC 6.1).
+    let mine = all.iter().filter(|i| i.host_id == host.host_id);
+    let (memory_provisioned_mib, storage_provisioned_gib) = mine
+        .fold((0, 0), |(memory, disk), i| {
+            (memory + i.memory_mib, disk + i.disk_gib)
+        });
+    HostFigures {
+        host_id: host.host_id,
+        host_name: host.host_name.clone(),
         memory_total_mib: host.memory_total_mib,
         memory_provisioned_mib,
         memory: Bar::split(
@@ -184,7 +216,7 @@ async fn host_figures(
             gib,
         ),
         placeholder: host.placeholder,
-    })
+    }
 }
 
 async fn views(
@@ -213,13 +245,30 @@ pub(crate) async fn home(
     let result = async {
         let shell = shell(&state, &user, "/", &params).await?;
         let (instances, counts) = views(&state, &user).await?;
-        let host = state.0.metrics.host(Duration::from_secs(60)).await?;
+        // A control plane that has not taken its first reading yet
+        // reports no machine. The page still renders: the instance table
+        // is the primary view, and a chart that is not there yet is not
+        // an error (SPEC 14.4).
+        let hosts = state.0.metrics.hosts(Duration::from_secs(60)).await?;
+        let tiles = usage_tiles(&state, &user, &hosts).await?;
+        // Every machine gets its own card. Capacity belongs to a machine
+        // (MULTI-NODE 12), so the deployment is shown one machine at a
+        // time rather than as one total that belongs to nobody.
+        let all = state.0.store.instances().await?;
+        let hosts = hosts
+            .iter()
+            .map(|host| host_figures(&all, host))
+            .collect::<Vec<_>>();
         let data = HomeData {
             title: "Virtual Machines",
             instances,
             counts,
-            tiles: usage_tiles(&state, &user, &host).await?,
-            host: host_figures(&state, &host).await?,
+            tiles,
+            tiles_note: match hosts.len() {
+                0 | 1 => "provisioned, out of the host",
+                _ => "provisioned, across every machine",
+            },
+            hosts,
         };
         Ok::<_, crate::BoxError>(render(StatusCode::OK, "home.html", &Page { shell, data }))
     }
@@ -303,7 +352,20 @@ pub(crate) async fn host_metrics(
     axum::extract::Query(params): Params,
 ) -> Response {
     let window = window_from(&params);
-    match state.0.metrics.host(window).await {
+    let result = async {
+        let hosts = state.0.metrics.hosts(window).await?;
+        let host = match params.get("host") {
+            Some(host_id) => host_id
+                .parse::<i64>()
+                .ok()
+                .and_then(|host_id| hosts.into_iter().find(|host| host.host_id == host_id)),
+            None => hosts.into_iter().next(),
+        }
+        .ok_or_else(|| Box::new(crate::StoreError::NotFound) as crate::BoxError)?;
+        Ok::<_, crate::BoxError>(host)
+    }
+    .await;
+    match result {
         Ok(host) => json(&HostMetricsJson {
             placeholder: host.placeholder,
             cpu_pct: series(&host.cpu_pct),

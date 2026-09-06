@@ -30,9 +30,11 @@ struct UsersData {
     title: &'static str,
     tab: &'static str,
     users: Vec<UserRow>,
-    host_cpu_count: i64,
-    host_memory_mib: i64,
-    host_storage_gib: i64,
+    /// The ceiling to compare against, when there is exactly one
+    /// machine to name. `None` in a deployment with more than one.
+    host_cpu_count: Option<i64>,
+    host_memory_mib: Option<i64>,
+    host_storage_gib: Option<i64>,
 }
 
 async fn operator_only(
@@ -93,11 +95,18 @@ pub(crate) async fn users(
             });
         }
         rows.sort_by(|left, right| left.name.cmp(&right.name));
-        let host = state
+        let hosts = state
             .0
             .metrics
-            .host(std::time::Duration::from_secs(60))
+            .hosts(std::time::Duration::from_secs(60))
             .await?;
+        // A denominator names one machine, so it is shown only when the
+        // deployment has one. Capacity belongs to a machine, and adding
+        // the machines together would name a machine that does not exist
+        // (MULTI-NODE 12, MULTI-NODE 20). With more than one, the row
+        // states what the account has taken and the front page carries
+        // the capacity, one machine at a time.
+        let host = (hosts.len() == 1).then(|| hosts[0].clone());
         Ok::<_, crate::BoxError>((rows, host))
     }
     .await;
@@ -111,9 +120,9 @@ pub(crate) async fn users(
                     title: "Settings",
                     tab: "users",
                     users,
-                    host_cpu_count: host.cpu_count,
-                    host_memory_mib: host.memory_total_mib,
-                    host_storage_gib: host.storage_total_gib,
+                    host_cpu_count: host.as_ref().map(|host| host.cpu_count),
+                    host_memory_mib: host.as_ref().map(|host| host.memory_total_mib),
+                    host_storage_gib: host.as_ref().map(|host| host.storage_total_gib),
                 },
             },
         ),

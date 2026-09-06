@@ -6,7 +6,7 @@ use crate::builder::Error;
 /// The data for one NoCloud seed: hostname, one user account with the
 /// owner's public keys, and the static network configuration that Bento
 /// assigned (SPEC sections 5.2 and 6.2).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Seed {
     /// Becomes the NoCloud instance-id. Use the instance UUID.
     pub instance_id: String,
