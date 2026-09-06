@@ -3,23 +3,16 @@
 </header>
 <section>
   <a class="btn new-vm" href="/new"{% if path == "/new" %} aria-current="page"{% endif %}>New VM <span aria-hidden="true">+</span></a>
-  <div class="vm-list">
-    <div role="group" aria-label="Virtual machines" class="button-group vm-group">
-      <a class="btn" data-variant="outline" href="/"{% if path == "/" %} aria-current="page"{% endif %}>Virtual Machines</a>
-      <button type="button" class="btn" data-variant="outline" data-size="icon" aria-label="Show or hide the VM list" aria-expanded="true" aria-controls="vm-tree" data-vm-tree-toggle>
-        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg>
-      </button>
-    </div>
-    <div id="vm-tree">
-      <ul id="vm-list" hx-get="/fragments/sidebar" hx-select="#vm-list" hx-target="this" hx-swap="outerHTML" hx-trigger="every 15s" hx-boost="false">
-        {% for vm in vms %}
-        <li><a href="/vm/{{ vm.uuid }}"{% if path|startswith("/vm/" ~ vm.uuid) %} aria-current="page"{% endif %}><i class="dot state-{{ vm.state }}" aria-hidden="true"></i>{{ vm.name }}{% if vm.shared %}<span class="shared">shared</span>{% endif %}</a></li>
-        {% else %}
-        <li class="none">No VMs yet.</li>
-        {% endfor %}
-      </ul>
-    </div>
-  </div>
+  <nav class="vm-list" aria-label="Virtual machines">
+    <a class="btn vm-root" data-variant="outline" href="/"{% if path == "/" %} aria-current="page"{% endif %}>Virtual Machines</a>
+    <ul id="vm-list" class="vm-tree" hx-get="/fragments/sidebar" hx-select="#vm-list" hx-target="this" hx-swap="outerHTML" hx-trigger="every 15s" hx-boost="false">
+      {% for vm in vms %}
+      <li><a href="/vm/{{ vm.uuid }}"{% if path|startswith("/vm/" ~ vm.uuid) %} aria-current="page"{% endif %}><i class="dot state-{{ vm.state }}" aria-hidden="true"></i>{{ vm.name }}{% if vm.shared %}<span class="shared">shared</span>{% endif %}</a></li>
+      {% else %}
+      <li class="none">No VMs yet.</li>
+      {% endfor %}
+    </ul>
+  </nav>
 </section>
 <footer>
   <div class="dropdown-menu account-menu" id="account-menu"{% if path|startswith("/settings") %} data-current{% endif %}>
