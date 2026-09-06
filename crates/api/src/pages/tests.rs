@@ -54,7 +54,7 @@ fn location(response: &TestResponse) -> String {
 }
 
 #[tokio::test]
-async fn home_lists_machines_quota_and_host_figures() {
+async fn home_lists_machines_and_host_figures() {
     let fx = fixture();
     let response = get(&fx.pages, "/").await;
     assert_eq!(response.status, StatusCode::OK);

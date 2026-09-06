@@ -14,13 +14,6 @@ impl Cli {
         if !env.args.is_empty() {
             return env.usage("ls");
         }
-        // SPEC 15/6.1: ls shows the quota use.
-        let quota = match self.quota_line(env.user.id).await {
-            Ok(quota) => quota,
-            Err(error) => return env.fail(error),
-        };
-        let _ = writeln!(env.out, "{quota}");
-
         let mut own = match self.store.instances_by_owner(env.user.id).await {
             Ok(instances) => instances,
             Err(error) => return env.fail(error),
@@ -401,17 +394,12 @@ impl Cli {
         if !env.args.is_empty() {
             return env.usage("whoami");
         }
-        let quota = match self.quota_line(env.user.id).await {
-            Ok(quota) => quota,
-            Err(error) => return env.fail(error),
-        };
         render_table(
             env.out,
             &[
                 vec!["name".into(), env.user.name.clone()],
                 vec!["email".into(), env.user.email.clone()],
                 vec!["subnet".into(), env.user.subnet.clone()],
-                vec!["quota".into(), quota],
             ],
         );
         0

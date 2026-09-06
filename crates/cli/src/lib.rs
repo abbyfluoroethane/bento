@@ -20,8 +20,8 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::Arc;
 use std::time::Duration;
 
-use bento_store::{Error as StoreError, Usage};
-use bento_types::{Instance, Quota, User};
+use bento_store::Error as StoreError;
+use bento_types::{Instance, User};
 use time::OffsetDateTime;
 
 use parse::format_cooldown;
@@ -129,7 +129,7 @@ const HELP_COMMANDS: [(&str, &str); 16] = [
         "list or add allowed images",
     ),
     ("ssh-key [add|list|remove]", "manage your SSH keys"),
-    ("whoami", "show your account and quota"),
+    ("whoami", "show your account"),
 ];
 
 /// Indent of every command line on the help screen.
@@ -271,16 +271,6 @@ impl Cli {
         Some(instance)
     }
 
-    async fn quota_line(&self, user_id: i64) -> Result<String, BoxError> {
-        let usage = self.store.usage_for(user_id).await?;
-        let quota = match self.store.quota_for(user_id).await {
-            Ok(quota) => Some(quota),
-            Err(error) if is_not_found(error.as_ref()) => None,
-            Err(error) => return Err(error),
-        };
-        Ok(render_quota(usage, quota))
-    }
-
     fn ssh_host(&self) -> &str {
         if self.options.domain.is_empty() {
             "bento"
@@ -323,15 +313,15 @@ impl Env<'_> {
                     );
                     return 1;
                 }
-                StoreError::Quota {
-                    limit,
+                StoreError::Capacity {
+                    resource,
                     used,
                     requested,
-                    max,
+                    limit,
                 } => {
                     let _ = writeln!(
                         self.err,
-                        "bento: quota exceeded: the {limit} limit is {max}, {used} in use, {requested} requested"
+                        "bento: the host has no room: the {resource} limit is {limit}, {used} provisioned, {requested} requested"
                     );
                     return 1;
                 }
@@ -374,21 +364,6 @@ fn is_not_found(error: &(dyn StdError + 'static)) -> bool {
     matches!(
         error.downcast_ref::<StoreError>(),
         Some(StoreError::NotFound)
-    )
-}
-
-fn render_quota(usage: Usage, quota: Option<Quota>) -> String {
-    let limit = |value: Option<i64>| value.map_or_else(|| "-".to_owned(), |v| v.to_string());
-    format!(
-        "instances {}/{} · vcpu {}/{} · memory {}/{} MiB · disk {}/{} GiB",
-        usage.instances,
-        limit(quota.map(|q| q.max_instances)),
-        usage.vcpu,
-        limit(quota.map(|q| q.max_vcpu)),
-        usage.memory_mib,
-        limit(quota.map(|q| q.max_memory_mib)),
-        usage.disk_gib,
-        limit(quota.map(|q| q.max_disk_gib))
     )
 }
 

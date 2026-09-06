@@ -350,6 +350,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bento-hostinfo"
+version = "0.9.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "bento-hypervisor"
 version = "0.9.0"
 dependencies = [
@@ -400,6 +407,7 @@ name = "bento-monitor"
 version = "0.9.0"
 dependencies = [
  "bento-config",
+ "bento-hostinfo",
  "bento-hypervisor",
  "bento-types",
  "libc",
@@ -510,6 +518,7 @@ dependencies = [
  "bento-cloudinit",
  "bento-config",
  "bento-dashboard",
+ "bento-hostinfo",
  "bento-hypervisor",
  "bento-images",
  "bento-lifecycle",

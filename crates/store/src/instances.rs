@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
 
-use bento_types::{DesiredState, Instance, Quota, State, Visibility};
+use bento_types::{Capacity, DesiredState, Instance, State, Visibility};
 use rusqlite::types::Value;
 use rusqlite::{OptionalExtension, Transaction, params, params_from_iter};
 
@@ -14,23 +14,20 @@ const INSTANCE_COLUMNS: &str = "uuid, name, owner_id, host_id, image_name, base_
      http_port, visibility, created_at, last_seen_at";
 
 impl Store {
-    /// Inserts an instance after checking name cooldown (SPEC 7.2) and all
-    /// four quota limits (SPEC 6.1) in the same transaction. Concurrent
-    /// creates cannot both pass when only one fits. No quota row means
-    /// unlimited.
-    pub async fn create_instance(&self, instance: Instance, name_cooldown: Duration) -> Result<()> {
+    /// Inserts an instance after checking name cooldown (SPEC 7.2) and
+    /// host capacity (SPEC 6.1) in the same transaction. The check and
+    /// the insert share a transaction so that two concurrent creates
+    /// cannot both pass when only one fits.
+    pub async fn create_instance(
+        &self,
+        instance: Instance,
+        name_cooldown: Duration,
+        capacity: Capacity,
+    ) -> Result<()> {
         let now = self.clock();
         self.with_tx(move |tx| {
             claim_name_tx(tx, &instance.name, instance.owner_id, name_cooldown, now())?;
-            check_quota_tx(
-                tx,
-                instance.owner_id,
-                "",
-                1,
-                i64::from(instance.vcpu),
-                instance.memory_mib,
-                instance.disk_gib,
-            )?;
+            check_capacity_tx(tx, "", instance.memory_mib, instance.disk_gib, capacity)?;
             let created_at = if instance.created_at == time::OffsetDateTime::UNIX_EPOCH {
                 now()
             } else {
@@ -110,9 +107,9 @@ impl Store {
         .await
     }
 
-    /// Updates vCPU, memory, disk, and nested virtualization, rerunning the
-    /// quota check with the instance's own old use excluded (SPEC 6.1,
-    /// 11.1).
+    /// Updates vCPU, memory, disk, and nested virtualization, rerunning
+    /// the capacity check with the instance's own current figures
+    /// excluded (SPEC 6.1, 11.1).
     pub async fn resize(
         &self,
         uuid: impl Into<String>,
@@ -120,19 +117,15 @@ impl Store {
         memory_mib: i64,
         disk_gib: i64,
         nested: bool,
+        capacity: Capacity,
     ) -> Result<()> {
         let uuid = uuid.into();
         self.with_tx(move |tx| {
-            let instance = get_instance_tx(tx, "uuid", &uuid)?;
-            check_quota_tx(
-                tx,
-                instance.owner_id,
-                &uuid,
-                1,
-                i64::from(vcpu),
-                memory_mib,
-                disk_gib,
-            )?;
+            // Read only to fail with NotFound on an unknown UUID. The
+            // capacity check below sums every row, so it would otherwise
+            // pass for an instance that does not exist.
+            get_instance_tx(tx, "uuid", &uuid)?;
+            check_capacity_tx(tx, &uuid, memory_mib, disk_gib, capacity)?;
             tx.execute(
                 "UPDATE instances SET vcpu = ?, memory = ?, disk = ?, nested = ? WHERE uuid = ?",
                 params![vcpu, memory_mib, disk_gib, nested, uuid],
@@ -289,53 +282,40 @@ fn get_instance_tx(tx: &Transaction<'_>, column: &str, value: &str) -> Result<In
         .ok_or(Error::NotFound)
 }
 
-fn check_quota_tx(
+/// Refuses a create or a resize that would provision more memory or more
+/// virtual disk than the host holds (SPEC 6.1).
+///
+/// The sums cover every instance on the host, not one owner's, because
+/// the ceiling is the host. `exclude_uuid` drops the row being resized
+/// from the sums, so that a resize is measured against its own new
+/// figures rather than against its old ones twice. A create passes an
+/// empty string, which matches no row.
+///
+/// A ceiling of zero bounds nothing, so that check is skipped. See
+/// [`Capacity::unbounded`].
+fn check_capacity_tx(
     tx: &Transaction<'_>,
-    owner_id: i64,
     exclude_uuid: &str,
-    add_instances: i64,
-    add_vcpu: i64,
     add_memory: i64,
     add_disk: i64,
+    capacity: Capacity,
 ) -> Result<()> {
-    let quota = tx
-        .query_row(
-            "SELECT user_id, max_instances, max_vcpu, max_memory, max_disk \
-             FROM quotas WHERE user_id = ?",
-            [owner_id],
-            |row| {
-                Ok(Quota {
-                    user_id: row.get(0)?,
-                    max_instances: row.get(1)?,
-                    max_vcpu: row.get(2)?,
-                    max_memory_mib: row.get(3)?,
-                    max_disk_gib: row.get(4)?,
-                })
-            },
-        )
-        .optional()?;
-    let Some(quota) = quota else {
-        return Ok(());
-    };
-
-    let (instances, vcpu, memory, disk) = tx.query_row(
-        "SELECT COUNT(*), COALESCE(SUM(vcpu), 0), COALESCE(SUM(memory), 0), \
-         COALESCE(SUM(disk), 0) FROM instances WHERE owner_id = ? AND uuid != ?",
-        params![owner_id, exclude_uuid],
-        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+    let (memory, disk) = tx.query_row(
+        "SELECT COALESCE(SUM(memory), 0), COALESCE(SUM(disk), 0) \
+         FROM instances WHERE uuid != ?",
+        params![exclude_uuid],
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    for (limit, used, requested, max) in [
-        ("instances", instances, add_instances, quota.max_instances),
-        ("vcpu", vcpu, add_vcpu, quota.max_vcpu),
-        ("memory", memory, add_memory, quota.max_memory_mib),
-        ("disk", disk, add_disk, quota.max_disk_gib),
+    for (resource, used, requested, limit) in [
+        ("memory", memory, add_memory, capacity.memory_mib),
+        ("disk", disk, add_disk, capacity.disk_gib),
     ] {
-        if used + requested > max {
-            return Err(Error::Quota {
-                limit,
+        if limit > 0 && used + requested > limit {
+            return Err(Error::Capacity {
+                resource,
                 used,
                 requested,
-                max,
+                limit,
             });
         }
     }
@@ -393,7 +373,7 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use bento_types::{DesiredState, Quota, State, Visibility};
+    use bento_types::{Capacity, DesiredState, State, Visibility};
     use time::Duration as TimeDuration;
 
     use crate::Error;
@@ -402,101 +382,102 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn create_instance_quota_limits() {
-        for (case, expected_limit) in [
+    async fn create_instance_capacity_limits() {
+        for (case, expected) in [
             ("fits", None),
-            ("vcpu", Some("vcpu")),
             ("memory", Some("memory")),
             ("disk", Some("disk")),
+            // Processor time is shared, so vCPU has no ceiling. A second
+            // instance with more vCPUs than the host has cores passes.
+            ("vcpu", None),
         ] {
             let store = new_test_store().await;
             let (owner, host) = seed_store(&store).await;
-            store
-                .set_quota(Quota {
-                    user_id: owner.id,
-                    max_instances: 2,
-                    max_vcpu: 4,
-                    max_memory_mib: 4096,
-                    max_disk_gib: 50,
-                })
-                .await
-                .unwrap();
+            let capacity = Capacity {
+                memory_mib: 4096,
+                disk_gib: 50,
+            };
             let mut first = test_instance(1, "first", &owner, &host);
             first.memory_mib = 1024;
+            first.disk_gib = 10;
             let mut second = test_instance(2, "second", &owner, &host);
             second.memory_mib = 1024;
+            second.disk_gib = 10;
             match case {
-                "vcpu" => second.vcpu = 4,
                 "memory" => second.memory_mib = 4000,
                 "disk" => second.disk_gib = 41,
+                "vcpu" => second.vcpu = 512,
                 _ => {}
             }
-            store.create_instance(first, Duration::ZERO).await.unwrap();
-            let result = store.create_instance(second, Duration::ZERO).await;
-            match expected_limit {
+            store
+                .create_instance(first, Duration::ZERO, capacity)
+                .await
+                .unwrap();
+            let result = store
+                .create_instance(second, Duration::ZERO, capacity)
+                .await;
+            match expected {
                 None => assert!(result.is_ok(), "{case}: {result:?}"),
-                Some(expected) => match result.unwrap_err() {
-                    Error::Quota { limit, .. } => assert_eq!(limit, expected, "{case}"),
-                    error => panic!("{case}: got {error}, want quota error"),
+                Some(want) => match result.unwrap_err() {
+                    Error::Capacity { resource, .. } => assert_eq!(resource, want, "{case}"),
+                    error => panic!("{case}: got {error}, want a capacity error"),
                 },
             }
         }
     }
 
     #[tokio::test]
-    async fn create_instance_count_limit() {
+    async fn capacity_counts_every_owner_not_one() {
+        // The ceiling is the host, so another user's instance takes room
+        // from this one. This is the whole difference from the per-user
+        // quota that section 6.1 used to describe.
         let store = new_test_store().await;
         let (owner, host) = seed_store(&store).await;
-        store
-            .set_quota(Quota {
-                user_id: owner.id,
-                max_instances: 1,
-                max_vcpu: 100,
-                max_memory_mib: 1 << 20,
-                max_disk_gib: 1 << 20,
-            })
+        let other = store
+            .register_user("bob", "bob@example.org", None, test_range())
             .await
             .unwrap();
+        let capacity = Capacity {
+            memory_mib: 2048,
+            disk_gib: 100,
+        };
+        let mut theirs = test_instance(1, "theirs", &other, &host);
+        theirs.memory_mib = 1536;
         store
-            .create_instance(test_instance(1, "first", &owner, &host), Duration::ZERO)
+            .create_instance(theirs, Duration::ZERO, capacity)
             .await
             .unwrap();
+
+        let mut mine = test_instance(2, "mine", &owner, &host);
+        mine.memory_mib = 1024;
         assert!(matches!(
-            store
-                .create_instance(test_instance(2, "second", &owner, &host), Duration::ZERO)
-                .await,
-            Err(Error::Quota {
-                limit: "instances",
+            store.create_instance(mine, Duration::ZERO, capacity).await,
+            Err(Error::Capacity {
+                resource: "memory",
                 ..
             })
         ));
     }
 
     #[tokio::test]
-    async fn create_instance_concurrent_quota() {
+    async fn create_instance_concurrent_capacity() {
         let store = new_test_store().await;
         let (owner, host) = seed_store(&store).await;
-        store
-            .set_quota(Quota {
-                user_id: owner.id,
-                max_instances: 1,
-                max_vcpu: 100,
-                max_memory_mib: 1 << 20,
-                max_disk_gib: 1 << 20,
-            })
-            .await
-            .unwrap();
+        // Room for exactly one of the eight racers below.
+        let capacity = Capacity {
+            memory_mib: 1024,
+            disk_gib: 1 << 20,
+        };
         let mut tasks = Vec::new();
         for number in 0..8 {
             let store = store.store.clone();
             let owner = owner.clone();
             let host = host.clone();
             tasks.push(tokio::spawn(async move {
+                let mut instance = test_instance(number, &format!("racer-{number}"), &owner, &host);
+                instance.memory_mib = 1024;
                 store
-                    .create_instance(
-                        test_instance(number, &format!("racer-{number}"), &owner, &host),
-                        Duration::ZERO,
-                    )
+                    .create_instance(instance, Duration::ZERO, capacity)
                     .await
             }));
         }
@@ -504,8 +485,8 @@ mod tests {
         for task in tasks {
             match task.await.unwrap() {
                 Ok(()) => successes += 1,
-                Err(Error::Quota { .. }) => {}
-                Err(error) => panic!("loser got {error}, want quota error"),
+                Err(Error::Capacity { .. }) => {}
+                Err(error) => panic!("loser got {error}, want a capacity error"),
             }
         }
         assert_eq!(successes, 1);
@@ -513,15 +494,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_instance_no_quota_row_is_unlimited() {
+    async fn a_zero_ceiling_bounds_nothing() {
         let store = new_test_store().await;
         let (owner, host) = seed_store(&store).await;
         for number in 0..3 {
+            let mut instance = test_instance(number, &format!("inst-{number}"), &owner, &host);
+            instance.memory_mib = 1 << 30;
+            instance.disk_gib = 1 << 30;
             store
-                .create_instance(
-                    test_instance(number, &format!("inst-{number}"), &owner, &host),
-                    Duration::ZERO,
-                )
+                .create_instance(instance, Duration::ZERO, Capacity::unbounded())
                 .await
                 .unwrap();
         }
@@ -538,7 +519,7 @@ mod tests {
         expected.http_port = 3000;
         expected.visibility = Visibility::Public;
         store
-            .create_instance(expected.clone(), Duration::ZERO)
+            .create_instance(expected.clone(), Duration::ZERO, Capacity::unbounded())
             .await
             .unwrap();
         expected.created_at = clock.now();
@@ -556,7 +537,7 @@ mod tests {
             .unwrap();
         let instance = test_instance(1, "web", &owner, &host);
         store
-            .create_instance(instance.clone(), Duration::ZERO)
+            .create_instance(instance.clone(), Duration::ZERO, Capacity::unbounded())
             .await
             .unwrap();
         store.add_share(&instance.uuid, other.id).await.unwrap();
@@ -584,7 +565,11 @@ mod tests {
         let (owner, host) = seed_store(&store).await;
         for (number, name) in ["a", "b", "c"].into_iter().enumerate() {
             store
-                .create_instance(test_instance(number, name, &owner, &host), Duration::ZERO)
+                .create_instance(
+                    test_instance(number, name, &owner, &host),
+                    Duration::ZERO,
+                    Capacity::unbounded(),
+                )
                 .await
                 .unwrap();
         }
@@ -621,10 +606,13 @@ mod tests {
         let mine = test_instance(1, "mine", &owner, &host);
         let theirs = test_instance(2, "theirs", &other, &host);
         store
-            .create_instance(mine.clone(), Duration::ZERO)
+            .create_instance(mine.clone(), Duration::ZERO, Capacity::unbounded())
             .await
             .unwrap();
-        store.create_instance(theirs, Duration::ZERO).await.unwrap();
+        store
+            .create_instance(theirs, Duration::ZERO, Capacity::unbounded())
+            .await
+            .unwrap();
         assert_eq!(store.instances().await.unwrap().len(), 2);
         let owned = store.instances_by_owner(owner.id).await.unwrap();
         assert_eq!(owned.len(), 1);
@@ -650,7 +638,7 @@ mod tests {
         let (owner, host) = seed_store(&store).await;
         let instance = test_instance(1, "web", &owner, &host);
         store
-            .create_instance(instance.clone(), Duration::ZERO)
+            .create_instance(instance.clone(), Duration::ZERO, Capacity::unbounded())
             .await
             .unwrap();
         assert_eq!(
@@ -666,29 +654,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resize_quota() {
+    async fn resize_excludes_the_instance_being_resized() {
         let store = new_test_store().await;
         let (owner, host) = seed_store(&store).await;
-        store
-            .set_quota(Quota {
-                user_id: owner.id,
-                max_instances: 2,
-                max_vcpu: 4,
-                max_memory_mib: 4096,
-                max_disk_gib: 40,
-            })
-            .await
-            .unwrap();
+        // Exactly enough for the instance below at its larger size. A
+        // check that counted the old figures as well as the new ones
+        // would refuse the growth that fills the host precisely.
+        let capacity = Capacity {
+            memory_mib: 4096,
+            disk_gib: 40,
+        };
         let mut instance = test_instance(1, "web", &owner, &host);
         instance.vcpu = 2;
         instance.memory_mib = 2048;
         instance.disk_gib = 20;
         store
-            .create_instance(instance.clone(), Duration::ZERO)
+            .create_instance(instance.clone(), Duration::ZERO, capacity)
             .await
             .unwrap();
         store
-            .resize(&instance.uuid, 4, 4096, 40, true)
+            .resize(&instance.uuid, 4, 4096, 40, true, capacity)
             .await
             .unwrap();
         let resized = store.instance(&instance.uuid).await.unwrap();
@@ -696,9 +681,27 @@ mod tests {
         assert_eq!(resized.memory_mib, 4096);
         assert_eq!(resized.disk_gib, 40);
         assert!(resized.nested);
+
+        // One MiB past the host refuses, and changes nothing.
         assert!(matches!(
-            store.resize(&instance.uuid, 5, 4096, 40, true).await,
-            Err(Error::Quota { limit: "vcpu", .. })
+            store
+                .resize(&instance.uuid, 4, 4097, 40, true, capacity)
+                .await,
+            Err(Error::Capacity {
+                resource: "memory",
+                ..
+            })
+        ));
+        assert_eq!(
+            store.instance(&instance.uuid).await.unwrap().memory_mib,
+            4096
+        );
+
+        // A resize of an instance that does not exist is still a 404,
+        // not a pass because the sums happen to fit.
+        assert!(matches!(
+            store.resize("no-such-uuid", 1, 1, 1, false, capacity).await,
+            Err(Error::NotFound)
         ));
     }
 }

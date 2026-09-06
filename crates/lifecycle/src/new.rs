@@ -30,8 +30,8 @@ pub struct NewRequest {
 }
 
 impl Manager {
-    /// Creates a quota-checked row, assigns network identity, creates the
-    /// overlay and seed, then defines and starts the domain, in that order
+    /// Creates a capacity-checked row, assigns network identity, creates
+    /// the overlay and seed, then defines and starts the domain, in order
     /// (SPEC sections 5.2, 6.1, and 11.1). Failure after insertion unwinds
     /// all partial work so retry starts clean.
     pub async fn create(&self, request: NewRequest) -> Result<Instance> {
@@ -98,7 +98,7 @@ impl Manager {
             last_seen_at: None,
         };
         self.store
-            .create_instance(instance.clone(), self.cooldown)
+            .create_instance(instance.clone(), self.cooldown, self.capacity)
             .await
             .map_err(Error::caused)?;
         let overlay = self.overlay_path(&uuid);

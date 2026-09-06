@@ -442,7 +442,7 @@ Read-only from the start: with no configuration and no units installed,
 every screen still draws, and the Install tab is the list of what is
 missing.
 
-## 7. Users, quota, and the dashboard
+## 7. Users, capacity, and the dashboard
 
 A user signs in to the dashboard through OIDC; the first such login
 creates the account and allocates its /24 and libvirt network. To use
@@ -450,17 +450,33 @@ the command line, they then run `ssh bento.example.org`, open the link
 it prints, and confirm the fingerprint. The same flow adds a second key
 later — a laptop, a phone — from an already signed-in browser.
 
-**A user with no `quotas` row is unlimited.** The quota check returns
-early when the row is missing, so a new user has no ceiling until an
-operator adds one. Add the row as soon as the account exists.
+**There is no per-user quota, and nothing to grant.** An account can use
+whatever the host still has. The only ceiling is the host itself
+(SPEC 6.1). Bento refuses a create or a resize in two cases. The first
+is when the memory of every instance together would pass the host memory
+times `overcommit_ratio`. The second is when the virtual disk of every
+instance together would pass the size of the storage volume. Bento sets
+no ceiling on vCPU.
 
-There is no operator command for this yet — no `bentod quota`, no
-`SetQuota` caller — so it is a direct database write:
+`bentod serve` reads both figures once at startup and logs them:
 
-```sql
-INSERT INTO quotas (user_id, max_instances, max_vcpu, max_memory, max_disk)
-VALUES (1, 4, 8, 8192, 100);
 ```
+host capacity: the ceiling on create and resize (SPEC 6.1)
+  memory_mib=65536 disk_gib=900 overcommit_ratio=1
+```
+
+Two consequences are easy to miss:
+
+- The sums cover **every** instance on the host, so the machines of one
+  user take room from another user. A refusal names the resource, the
+  ceiling, and what the host already holds.
+- The disk figure is the whole filesystem that holds `storage_dir`. If
+  that directory sits on the root filesystem, the ceiling is the root
+  filesystem, not a share of it. Give storage its own volume when that
+  matters.
+
+Raise `overcommit_ratio` to fit more memory than the host has, after
+reading the two conditions in SPEC 5.3.
 
 ### OIDC
 
@@ -504,13 +520,12 @@ it up together with the image and storage directories (SPEC 12.1).
 
 ## Known operator gaps
 
-Things that currently need a direct database write, because no command
+One thing still needs a direct database write, because no command
 exists:
 
-- granting quota (`Store::set_quota` has no caller)
 - setting `oidc_subject` on an existing user
 
-Both are a `sqlite3` one-liner against the database. Install `sqlite3`
+It is a `sqlite3` one-liner against the database. Install `sqlite3`
 first if the host lacks it — a host without it needs a throwaway program
 instead, which is a great deal more work for one `UPDATE`. Stop
 `bentod serve` first, or rely on the WAL busy timeout for a single small

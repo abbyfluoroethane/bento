@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bento_hypervisor::StopResult;
-use bento_store::{Error as StoreError, Usage};
-use bento_types::{DesiredState, Image, Instance, Quota, Share, SshKey, State, User, Visibility};
+use bento_store::Error as StoreError;
+use bento_types::{DesiredState, Image, Instance, Share, SshKey, State, User, Visibility};
 use russh::keys::ssh_key::{HashAlg, PublicKey};
 use time::OffsetDateTime;
 
@@ -15,8 +15,6 @@ use super::*;
 #[derive(Default)]
 struct StoreData {
     users: HashMap<i64, User>,
-    quota: Option<Quota>,
-    usage: Usage,
     instances: Vec<Instance>,
     shared: Vec<Instance>,
     access: HashMap<String, Vec<i64>>,
@@ -67,14 +65,6 @@ impl Store for FakeStore {
             .find(|user| user.name == name)
             .cloned()
             .ok_or_else(not_found)
-    }
-
-    async fn quota_for(&self, _user_id: i64) -> Result<Quota, BoxError> {
-        self.0.lock().unwrap().quota.ok_or_else(not_found)
-    }
-
-    async fn usage_for(&self, _user_id: i64) -> Result<Usage, BoxError> {
-        Ok(self.0.lock().unwrap().usage)
     }
 
     async fn instance_by_name(&self, name: &str) -> Result<Instance, BoxError> {
@@ -195,7 +185,7 @@ impl Store for FakeStore {
 #[derive(Clone)]
 enum Failure {
     Cooldown { name: String, remaining: Duration },
-    Quota,
+    Capacity,
 }
 
 #[derive(Default)]
@@ -229,11 +219,11 @@ impl FakeLifecycle {
                 Failure::Cooldown { name, remaining } => {
                     Box::new(StoreError::NameCooldown { name, remaining }) as BoxError
                 }
-                Failure::Quota => Box::new(StoreError::Quota {
-                    limit: "memory",
+                Failure::Capacity => Box::new(StoreError::Capacity {
+                    resource: "memory",
                     used: 6144,
                     requested: 4096,
-                    max: 8192,
+                    limit: 8192,
                 }),
             })
     }
@@ -460,19 +450,6 @@ fn fixture() -> (Arc<FakeStore>, Arc<FakeLifecycle>, Cli) {
     );
     let store = Arc::new(FakeStore(Mutex::new(StoreData {
         users: HashMap::from([(1, alice), (2, bob)]),
-        quota: Some(Quota {
-            user_id: 1,
-            max_instances: 4,
-            max_vcpu: 8,
-            max_memory_mib: 8192,
-            max_disk_gib: 100,
-        }),
-        usage: Usage {
-            instances: 2,
-            vcpu: 6,
-            memory_mib: 6144,
-            disk_gib: 60,
-        },
         instances: vec![web, db, theirs],
         access: HashMap::from([("uuid-theirs".into(), vec![1])]),
         ..StoreData::default()
@@ -589,13 +566,13 @@ async fn new_reports_cooldown() {
 }
 
 #[tokio::test]
-async fn new_reports_quota() {
+async fn new_reports_a_full_host() {
     let (_, lifecycle, cli) = fixture();
-    lifecycle.0.lock().unwrap().failure = Some(Failure::Quota);
+    lifecycle.0.lock().unwrap().failure = Some(Failure::Capacity);
     let (code, _, error) = run(&cli, user(1, "alice"), "", &["new", "box"]).await;
     assert_eq!(code, 1);
     assert!(
-        error.contains("quota exceeded") && error.contains("memory limit is 8192"),
+        error.contains("the host has no room") && error.contains("memory limit is 8192"),
         "{error}"
     );
 }
@@ -815,23 +792,13 @@ async fn ls_output() {
     assert_eq!(code, 0, "{error}");
     assert_eq!(
         output,
-        "instances 2/4 · vcpu 6/8 · memory 6144/8192 MiB · disk 60/100 GiB\n\
-NAME  STATE    ADDRESS     IMAGE      VISIBILITY  LAST USE\n\
+        "NAME  STATE    ADDRESS     IMAGE      VISIBILITY  LAST USE\n\
 db    stopped  10.100.0.3  debian-13  public      never\n\
 web   running  10.100.0.2  debian-13  off         3h ago\n\
 \nshared with you:\n\
 NAME    STATE    ADDRESS     OWNER  LAST USE\n\
 theirs  stopped  10.100.1.2  bob    never\n"
     );
-}
-
-#[tokio::test]
-async fn ls_unlimited_quota() {
-    let (store, _, cli) = fixture();
-    store.0.lock().unwrap().quota = None;
-    let (code, output, _) = run(&cli, user(1, "alice"), "", &["ls"]).await;
-    assert_eq!(code, 0);
-    assert!(output.contains("instances 2/- · vcpu 6/-"));
 }
 
 #[tokio::test]
@@ -1054,14 +1021,11 @@ async fn whoami() {
     let (_, _, cli) = fixture();
     let (code, output, _) = run(&cli, user(1, "alice"), "", &["whoami"]).await;
     assert_eq!(code, 0);
-    for expected in [
-        "alice",
-        "alice@example.com",
-        "10.100.0.0/24",
-        "instances 2/4",
-    ] {
+    for expected in ["alice", "alice@example.com", "10.100.0.0/24"] {
         assert!(output.contains(expected), "{output}");
     }
+    // No per-user limit is reported anywhere (SPEC 6.1, 15).
+    assert!(!output.contains("quota"), "{output}");
 }
 
 #[tokio::test]

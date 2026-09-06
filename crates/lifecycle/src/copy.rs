@@ -86,7 +86,7 @@ impl Manager {
             last_seen_at: None,
         };
         self.store
-            .create_instance(instance.clone(), self.cooldown)
+            .create_instance(instance.clone(), self.cooldown, self.capacity)
             .await
             .map_err(crate::actions::external)?;
         if let Err(error) =

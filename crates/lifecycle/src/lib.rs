@@ -55,9 +55,9 @@ pub enum Error {
     /// error source.
     ///
     /// The text alone is not enough. A caller has to be able to tell a
-    /// quota refusal from a name cooldown from a missing row, because
+    /// capacity refusal from a name cooldown from a missing row, because
     /// each has its own answer (SPEC 6.1, 7.2, 12): the HTTP layer
-    /// matches on the store's error type and returns 409 with the limits,
+    /// matches on the store's error type and returns 409 with the figures,
     /// 409 with the remaining cooldown, or 404. Flattening the cause to a
     /// string erased that type and turned every one of them into a 500.
     #[error("{message}")]

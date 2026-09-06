@@ -2,12 +2,13 @@ use std::collections::HashSet;
 use std::net::Ipv4Addr;
 
 use bento_config::Ipv4Prefix;
-use bento_types::{Quota, User};
+use bento_types::User;
 use rusqlite::{OptionalExtension, params};
 
 use crate::{Error, Result, Store, format_time, parse_time};
 
-/// Current consumption of the four per-user limits (SPEC 6.1).
+/// What one user has provisioned (SPEC 6.1). There is no per-user
+/// limit to compare it against; the dashboard shows it against the host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Usage {
     pub instances: i64,
@@ -156,56 +157,7 @@ impl Store {
         .await
     }
 
-    /// Inserts or replaces all four limits for a user (SPEC 6.1).
-    pub async fn set_quota(&self, quota: Quota) -> Result<()> {
-        self.with_conn(move |conn| {
-            conn.execute(
-                "INSERT INTO quotas (user_id, max_instances, max_vcpu, max_memory, max_disk) \
-                 VALUES (?, ?, ?, ?, ?) \
-                 ON CONFLICT(user_id) DO UPDATE SET \
-                    max_instances = excluded.max_instances, \
-                    max_vcpu = excluded.max_vcpu, \
-                    max_memory = excluded.max_memory, \
-                    max_disk = excluded.max_disk",
-                params![
-                    quota.user_id,
-                    quota.max_instances,
-                    quota.max_vcpu,
-                    quota.max_memory_mib,
-                    quota.max_disk_gib
-                ],
-            )?;
-            Ok(())
-        })
-        .await
-    }
-
-    /// Returns a user's limits, or [`Error::NotFound`] when the operator
-    /// has not set any.
-    pub async fn quota_for(&self, user_id: i64) -> Result<Quota> {
-        self.with_conn(move |conn| {
-            conn.query_row(
-                "SELECT user_id, max_instances, max_vcpu, max_memory, max_disk  \
-                 FROM quotas WHERE user_id = ?",
-                [user_id],
-                |row| {
-                    Ok(Quota {
-                        user_id: row.get(0)?,
-                        max_instances: row.get(1)?,
-                        max_vcpu: row.get(2)?,
-                        max_memory_mib: row.get(3)?,
-                        max_disk_gib: row.get(4)?,
-                    })
-                },
-            )
-            .optional()?
-            .ok_or(Error::NotFound)
-        })
-        .await
-    }
-
-    /// Sums the instances owned by a user against all four limits
-    /// (SPEC 6.1).
+    /// Sums what one user has provisioned (SPEC 6.1).
     pub async fn usage_for(&self, user_id: i64) -> Result<Usage> {
         self.with_conn(move |conn| {
             Ok(conn.query_row(
@@ -309,7 +261,6 @@ fn masked_address(address: Ipv4Addr, bits: u8) -> Ipv4Addr {
 #[cfg(test)]
 mod tests {
     use bento_config::Ipv4Prefix;
-    use bento_types::Quota;
 
     use super::Usage;
     use crate::Error;
@@ -419,26 +370,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quota_round_trip_and_usage() {
+    async fn usage_sums_what_one_user_has_provisioned() {
         let store = new_test_store().await;
         let (user, host) = seed_store(&store).await;
-        assert!(matches!(
-            store.quota_for(user.id).await,
-            Err(Error::NotFound)
-        ));
-
-        let mut quota = Quota {
-            user_id: user.id,
-            max_instances: 5,
-            max_vcpu: 8,
-            max_memory_mib: 8192,
-            max_disk_gib: 100,
-        };
-        store.set_quota(quota).await.unwrap();
-        assert_eq!(store.quota_for(user.id).await.unwrap(), quota);
-        quota.max_instances = 7;
-        store.set_quota(quota).await.unwrap();
-        assert_eq!(store.quota_for(user.id).await.unwrap().max_instances, 7);
 
         for index in 0..2 {
             let mut instance = test_instance(
@@ -451,7 +385,11 @@ mod tests {
             instance.memory_mib = 1024;
             instance.disk_gib = 20;
             store
-                .create_instance(instance, std::time::Duration::ZERO)
+                .create_instance(
+                    instance,
+                    std::time::Duration::ZERO,
+                    bento_types::Capacity::unbounded(),
+                )
                 .await
                 .unwrap();
         }

@@ -43,6 +43,7 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    use bento_types::Capacity;
     use std::time::Duration;
 
     use crate::Store;
@@ -54,7 +55,7 @@ mod tests {
         let (owner, host) = seed_store(&store).await;
         let instance = test_instance(1, "web", &owner, &host);
         store
-            .create_instance(instance.clone(), Duration::ZERO)
+            .create_instance(instance.clone(), Duration::ZERO, Capacity::unbounded())
             .await
             .unwrap();
         store.touch_last_seen(&instance.uuid).await.unwrap();

@@ -20,6 +20,7 @@ bento-cli = { workspace = true }
 bento-cloudinit = { workspace = true }
 bento-config = { workspace = true }
 bento-dashboard = { workspace = true }
+bento-hostinfo = { workspace = true }
 bento-hypervisor = { workspace = true }
 bento-images = { workspace = true }
 bento-lifecycle = { workspace = true }

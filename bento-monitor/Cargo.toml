@@ -11,6 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 bento-config = { workspace = true }
+bento-hostinfo = { workspace = true }
 bento-hypervisor = { workspace = true }
 bento-types = { workspace = true }
 libc = { workspace = true }

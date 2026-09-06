@@ -71,7 +71,8 @@ command, then runs it in your terminal. See `DEPLOYING.md` section 6.
 its /24 (SPEC 13). To use the command line, a user runs
 `ssh bento.example.org` with an unknown key, opens the link it prints, and
 confirms the fingerprint. Set `allow_signup = false` under `[oidc]` to
-freeze the user list. Grant quota with a `quotas` row.
+freeze the user list. There is no per-user quota: an account can use
+whatever the host still has (SPEC 6.1).
 
 Names in `operators` can download the database and can add bootc OCI
 images while Bento runs, from the dashboard or over SSH:

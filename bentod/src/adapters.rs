@@ -20,7 +20,7 @@ use bento_proxy::{Access, BoxError as ProxyError, ProxyBody};
 use bento_sshfront::{BoxError as SshError, PairingRequest, PendingLink};
 use bento_store::{Error as StoreError, Store};
 use bento_types::{
-    DesiredState, Image, ImageVersion, Instance, Quota, Share, SshKey, State, Token, User,
+    Capacity, DesiredState, Image, ImageVersion, Instance, Share, SshKey, State, Token, User,
     Visibility,
 };
 use http::{Request, StatusCode};
@@ -185,8 +185,9 @@ impl bento_lifecycle::Store for LifecycleStore {
         &self,
         instance: Instance,
         cooldown: Duration,
+        capacity: Capacity,
     ) -> Result<(), LifecycleError> {
-        Ok(self.0.create_instance(instance, cooldown).await?)
+        Ok(self.0.create_instance(instance, cooldown, capacity).await?)
     }
     async fn delete_instance(&self, uuid: &str) -> Result<Instance, LifecycleError> {
         Ok(self.0.delete_instance(uuid).await?)
@@ -224,10 +225,11 @@ impl bento_lifecycle::Store for LifecycleStore {
         memory_mib: i64,
         disk_gib: i64,
         nested: bool,
+        capacity: Capacity,
     ) -> Result<(), LifecycleError> {
         Ok(self
             .0
-            .resize(uuid, vcpu, memory_mib, disk_gib, nested)
+            .resize(uuid, vcpu, memory_mib, disk_gib, nested, capacity)
             .await?)
     }
     async fn set_desired_state(
@@ -450,7 +452,7 @@ pub(crate) struct ApiBackend(pub(crate) Backend);
 /// A lifecycle action reaches the database through the lifecycle crate's
 /// own `Store` seam, which boxes the store crate's error type. The HTTP
 /// layer matches on the API crate's type instead, so without this step a
-/// quota refusal, a taken name, a name still in cooldown, or a missing
+/// capacity refusal, a taken name, a name still in cooldown, or a missing
 /// row raised inside a lifecycle action reached the client as a bare 500
 /// rather than the documented 409 or 404 (SPEC 6.1, 7.2, 12).
 fn api_lifecycle_error(error: bento_lifecycle::Error) -> ApiError {
@@ -569,16 +571,16 @@ fn api_store_error_ref(error: &StoreError) -> Option<ApiError> {
     Some(match error {
         StoreError::NotFound => Box::new(ApiStoreError::NotFound),
         StoreError::NameTaken => Box::new(ApiStoreError::NameTaken),
-        StoreError::Quota {
-            limit,
+        StoreError::Capacity {
+            resource,
             used,
             requested,
-            max,
-        } => Box::new(ApiStoreError::Quota {
-            limit: limit.to_string(),
+            limit,
+        } => Box::new(ApiStoreError::Capacity {
+            resource: resource.to_string(),
             used: *used,
             requested: *requested,
-            max: *max,
+            limit: *limit,
         }),
         StoreError::NameCooldown { name, remaining } => Box::new(ApiStoreError::NameCooldown {
             name: name.clone(),
@@ -602,9 +604,6 @@ impl bento_api::Store for ApiStore {
     }
     async fn users(&self) -> Result<Vec<User>, ApiError> {
         self.0.users().await.map_err(api_store_error)
-    }
-    async fn quota_for(&self, user_id: i64) -> Result<Quota, ApiError> {
-        self.0.quota_for(user_id).await.map_err(api_store_error)
     }
     async fn usage_for(&self, user_id: i64) -> Result<bento_store::Usage, ApiError> {
         self.0.usage_for(user_id).await.map_err(api_store_error)

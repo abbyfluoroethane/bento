@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::{
-    AppState, QuotaJson, UsageJson, decode_json, error_response, is_not_found, json_response,
-    mapped_error, owned_instance, rfc3339,
+    AppState, UsageJson, decode_json, error_response, is_not_found, json_response, mapped_error,
+    owned_instance, rfc3339,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -129,7 +129,6 @@ pub(crate) struct UserJson {
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct WhoamiResponse {
     pub(crate) user: UserJson,
-    pub(crate) quota: Option<QuotaJson>,
     pub(crate) usage: UsageJson,
     pub(crate) operator: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -152,11 +151,6 @@ pub(crate) async fn handle_whoami(
         Ok(usage) => usage,
         Err(error) => return mapped_error(error),
     };
-    let quota = match state.0.store.quota_for(user.id).await {
-        Ok(quota) => Some(quota.into()),
-        Err(error) if is_not_found(&error) => None,
-        Err(error) => return mapped_error(error),
-    };
     let operator = is_operator(&state, &user);
     json_response(
         StatusCode::OK,
@@ -167,7 +161,6 @@ pub(crate) async fn handle_whoami(
                 email: user.email,
                 created_at: rfc3339(user.created_at),
             },
-            quota,
             usage: usage.into(),
             operator,
             db_path: if operator {

@@ -1,13 +1,18 @@
 //! What the host has left: processor load, memory, swap, and free space
 //! on the two directories an instance grows into (SPEC 5.1, 5.3).
 //!
-//! Everything here reads `/proc` or `statvfs`. The parsers take text so
-//! that they can be tested without the host they describe.
+//! Memory and filesystem readings come from `bento-hostinfo`, which
+//! `bentod` also reads for the capacity ceiling (SPEC 6.1). What stays
+//! here is the part only this screen needs: processor counters, load,
+//! uptime, and the formatting.
+//!
+//! The parsers take text so that they can be tested without the host
+//! they describe.
 
-use std::ffi::CString;
-use std::io;
 use std::path::Path;
 use std::time::Duration;
+
+pub use bento_hostinfo::{Disk, Memory, disk_usage, parse_meminfo};
 
 /// One reading of the aggregate processor counters of `/proc/stat`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -46,53 +51,6 @@ pub fn busy_fraction(before: CpuTimes, after: CpuTimes) -> Option<f64> {
     Some((total.saturating_sub(idle) as f64 / total as f64).clamp(0.0, 1.0))
 }
 
-/// Memory and swap, in bytes.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Memory {
-    pub total: u64,
-    /// `MemAvailable`, the kernel's own estimate of what a new workload
-    /// can take. It is the number an overcommit decision needs, not
-    /// `MemFree`.
-    pub available: u64,
-    pub swap_total: u64,
-    pub swap_free: u64,
-}
-
-impl Memory {
-    pub fn used(&self) -> u64 {
-        self.total.saturating_sub(self.available)
-    }
-
-    pub fn swap_used(&self) -> u64 {
-        self.swap_total.saturating_sub(self.swap_free)
-    }
-}
-
-pub fn parse_meminfo(meminfo: &str) -> Memory {
-    let mut memory = Memory::default();
-    for line in meminfo.lines() {
-        let Some((key, rest)) = line.split_once(':') else {
-            continue;
-        };
-        let Some(kib) = rest
-            .split_whitespace()
-            .next()
-            .and_then(|value| value.parse::<u64>().ok())
-        else {
-            continue;
-        };
-        let bytes = kib.saturating_mul(1024);
-        match key {
-            "MemTotal" => memory.total = bytes,
-            "MemAvailable" => memory.available = bytes,
-            "SwapTotal" => memory.swap_total = bytes,
-            "SwapFree" => memory.swap_free = bytes,
-            _ => {}
-        }
-    }
-    memory
-}
-
 pub fn parse_loadavg(loadavg: &str) -> Option<[f64; 3]> {
     let mut fields = loadavg.split_whitespace();
     let mut load = [0.0; 3];
@@ -107,39 +65,6 @@ pub fn parse_loadavg(loadavg: &str) -> Option<[f64; 3]> {
 pub fn parse_uptime(uptime: &str) -> Option<Duration> {
     let seconds: f64 = uptime.split_whitespace().next()?.parse().ok()?;
     Duration::try_from_secs_f64(seconds.max(0.0)).ok()
-}
-
-/// Free space on one filesystem.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Disk {
-    pub total: u64,
-    pub available: u64,
-}
-
-impl Disk {
-    pub fn used(&self) -> u64 {
-        self.total.saturating_sub(self.available)
-    }
-}
-
-/// Reads the filesystem that holds `path`. The available count is the
-/// unprivileged one, because the space a reserve holds back is not space
-/// an overlay disk can grow into.
-pub fn disk_usage(path: &Path) -> io::Result<Disk> {
-    let c_path = CString::new(path.as_os_str().as_encoded_bytes())
-        .map_err(|_| io::Error::other("path contains a NUL byte"))?;
-    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
-    // Safety: `statvfs` writes into the struct above and reads a
-    // NUL-terminated path that outlives the call.
-    let code = unsafe { libc::statvfs(c_path.as_ptr(), &mut stats) };
-    if code != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let block = stats.f_frsize as u64;
-    Ok(Disk {
-        total: block.saturating_mul(stats.f_blocks as u64),
-        available: block.saturating_mul(stats.f_bavail as u64),
-    })
 }
 
 /// Every host reading of one frame. A field that the host does not answer
@@ -259,24 +184,6 @@ mod tests {
     }
 
     #[test]
-    fn meminfo_reads_in_bytes() {
-        let memory = parse_meminfo(
-            "MemTotal:       16384 kB\nMemFree:  1024 kB\nMemAvailable:    8192 kB\nSwapTotal: 2048 kB\nSwapFree: 1024 kB\n",
-        );
-        assert_eq!(memory.total, 16_384 * 1024);
-        assert_eq!(memory.available, 8192 * 1024);
-        assert_eq!(memory.used(), 8192 * 1024);
-        assert_eq!(memory.swap_used(), 1024 * 1024);
-    }
-
-    #[test]
-    fn a_host_without_swap_reports_none_used() {
-        let memory = parse_meminfo("MemTotal: 100 kB\nMemAvailable: 50 kB\n");
-        assert_eq!(memory.swap_total, 0);
-        assert_eq!(memory.swap_used(), 0);
-    }
-
-    #[test]
     fn loadavg_and_uptime_read_their_first_fields() {
         assert_eq!(
             parse_loadavg("0.52 0.31 0.10 1/523 44"),
@@ -287,14 +194,6 @@ mod tests {
             parse_uptime("3600.12 7000.00"),
             Some(Duration::from_secs_f64(3600.12))
         );
-    }
-
-    #[test]
-    fn the_root_filesystem_answers_statvfs() {
-        let disk = disk_usage(Path::new("/")).expect("statvfs of /");
-        assert!(disk.total > 0);
-        assert!(disk.available <= disk.total);
-        assert!(disk_usage(Path::new("/no/such/place")).is_err());
     }
 
     #[test]

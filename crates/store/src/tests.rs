@@ -167,7 +167,6 @@ async fn schema_executes() {
 
     for table in [
         "users",
-        "quotas",
         "ssh_keys",
         "hosts",
         "images",

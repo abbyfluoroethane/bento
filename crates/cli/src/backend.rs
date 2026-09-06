@@ -3,8 +3,7 @@ use std::io::{Read, Write};
 
 use async_trait::async_trait;
 use bento_hypervisor::StopResult;
-use bento_store::Usage;
-use bento_types::{Image, Instance, Quota, Share, SshKey, User, Visibility};
+use bento_types::{Image, Instance, Share, SshKey, User, Visibility};
 
 /// An error that can cross a CLI integration seam.
 pub type BoxError = Box<dyn StdError + Send + Sync + 'static>;
@@ -20,8 +19,6 @@ impl<T: Read + Write + Send> ReadWrite for T {}
 pub trait Store: Send + Sync {
     async fn user_by_id(&self, id: i64) -> Result<User, BoxError>;
     async fn user_by_name(&self, name: &str) -> Result<User, BoxError>;
-    async fn quota_for(&self, user_id: i64) -> Result<Quota, BoxError>;
-    async fn usage_for(&self, user_id: i64) -> Result<Usage, BoxError>;
     async fn instance_by_name(&self, name: &str) -> Result<Instance, BoxError>;
     async fn instances_by_owner(&self, owner_id: i64) -> Result<Vec<Instance>, BoxError>;
     async fn instances_shared_with(&self, user_id: i64) -> Result<Vec<Instance>, BoxError>;
@@ -55,12 +52,6 @@ impl Store for bento_store::Store {
     }
     async fn user_by_name(&self, name: &str) -> Result<User, BoxError> {
         Ok(self.user_by_name(name).await?)
-    }
-    async fn quota_for(&self, user_id: i64) -> Result<Quota, BoxError> {
-        Ok(self.quota_for(user_id).await?)
-    }
-    async fn usage_for(&self, user_id: i64) -> Result<Usage, BoxError> {
-        Ok(self.usage_for(user_id).await?)
     }
     async fn instance_by_name(&self, name: &str) -> Result<Instance, BoxError> {
         Ok(self.instance_by_name(name).await?)
@@ -132,7 +123,7 @@ pub struct ResizeRequest {
 }
 
 /// The consumer-side view of the instance lifecycle actions (SPEC 11.1).
-/// Implementations own quota checks, the name cooldown, desired-state
+/// Implementations own the capacity check, the name cooldown, desired-state
 /// bookkeeping, and hypervisor calls.
 #[async_trait]
 pub trait Lifecycle: Send + Sync {

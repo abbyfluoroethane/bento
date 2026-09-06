@@ -227,10 +227,12 @@ async fn the_api_refuses_a_request_with_no_token() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_request_over_quota_is_refused() {
+async fn a_request_larger_than_the_host_is_refused() {
     let bento = Bento::start().await;
 
-    // The seeded quota allows 8192 MiB in total (SPEC 6.1).
+    // The ceiling is the host this suite runs on, so the request has to
+    // be absurd rather than merely large for the assertion to hold on
+    // every machine (SPEC 6.1). A petabyte of RAM is safely absurd.
     let response = bento
         .post(
             "/api/instances",
@@ -238,15 +240,21 @@ async fn a_request_over_quota_is_refused() {
                 "name": "huge",
                 "image": IMAGE_NAME,
                 "vcpu": 1,
-                "memory_mib": 65536,
+                "memory_mib": 1_000_000_000_i64,
                 "disk_gib": 1,
             }),
         )
         .await
         .expect_status(409);
     assert!(
-        response.json()["quota"].is_object(),
-        "the refusal carries no quota detail: {}",
+        response.body.contains("the host has no room"),
+        "the refusal does not name the reason: {}",
+        response.body
+    );
+    // The per-limit JSON detail went with the quota it described.
+    assert!(
+        response.json()["quota"].is_null(),
+        "the refusal still carries a quota detail: {}",
         response.body
     );
     assert!(

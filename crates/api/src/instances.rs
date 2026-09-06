@@ -3,12 +3,12 @@ use axum::extract::{Extension, Path as AxumPath, State};
 use axum::http::{Request, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bento_store::Usage;
-use bento_types::{Instance, Quota, User, Visibility};
+use bento_types::{Instance, User, Visibility};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AppState, BAD_NAME, CreateSpec, ResizeSpec, decode_json, error_response, is_not_found,
-    json_response, mapped_error, optional_rfc3339, rfc3339, valid_name,
+    AppState, BAD_NAME, CreateSpec, ResizeSpec, decode_json, error_response, json_response,
+    mapped_error, optional_rfc3339, rfc3339, valid_name,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -77,25 +77,6 @@ pub(crate) async fn instance_json(
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct QuotaJson {
-    pub(crate) max_instances: i64,
-    pub(crate) max_vcpu: i64,
-    pub(crate) max_memory_mib: i64,
-    pub(crate) max_disk_gib: i64,
-}
-
-impl From<Quota> for QuotaJson {
-    fn from(quota: Quota) -> Self {
-        Self {
-            max_instances: quota.max_instances,
-            max_vcpu: quota.max_vcpu,
-            max_memory_mib: quota.max_memory_mib,
-            max_disk_gib: quota.max_disk_gib,
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct UsageJson {
     pub(crate) instances: i64,
     pub(crate) vcpu: i64,
@@ -117,12 +98,12 @@ impl From<Usage> for UsageJson {
 #[derive(Debug, Serialize, Deserialize)]
 pub(crate) struct InstanceListResponse {
     pub(crate) instances: Vec<InstanceJson>,
-    pub(crate) quota: Option<QuotaJson>,
     pub(crate) usage: UsageJson,
 }
 
 /// Answers the primary dashboard view (SPEC 14.4): owned and shared
-/// instances sorted by name, plus all four quota limits and current use.
+/// instances sorted by name, plus what the viewer has provisioned. There
+/// is no per-user limit to report against it (SPEC 6.1).
 pub(crate) async fn list_instances(
     State(state): State<AppState>,
     Extension(user): Extension<User>,
@@ -139,12 +120,6 @@ pub(crate) async fn list_instances(
         Ok(usage) => usage,
         Err(error) => return mapped_error(error),
     };
-    let quota = match state.0.store.quota_for(user.id).await {
-        Ok(quota) => Some(quota.into()),
-        Err(error) if is_not_found(&error) => None,
-        Err(error) => return mapped_error(error),
-    };
-
     let mut owners = std::collections::HashMap::from([(user.id, user.name.clone())]);
     let mut instances = Vec::with_capacity(owned.len() + shared.len());
     for instance in owned.into_iter().chain(shared) {
@@ -155,7 +130,6 @@ pub(crate) async fn list_instances(
         StatusCode::OK,
         &InstanceListResponse {
             instances,
-            quota,
             usage: usage.into(),
         },
     )

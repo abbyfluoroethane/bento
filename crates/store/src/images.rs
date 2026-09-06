@@ -293,6 +293,7 @@ fn scan_image_version(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImageVersion>
 
 #[cfg(test)]
 mod tests {
+    use bento_types::Capacity;
     use std::time::Duration;
 
     use bento_types::{Image, ImageKind, ImageVersion};
@@ -336,7 +337,7 @@ mod tests {
         let mut instance = test_instance(1, "web", &owner, &host);
         instance.base_checksum = "sha256-old".into();
         store
-            .create_instance(instance, Duration::ZERO)
+            .create_instance(instance, Duration::ZERO, Capacity::unbounded())
             .await
             .unwrap();
         assert!(store.unused_image_versions().await.unwrap().is_empty());
