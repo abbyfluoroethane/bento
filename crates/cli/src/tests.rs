@@ -461,6 +461,7 @@ fn fixture() -> (Arc<FakeStore>, Arc<FakeLifecycle>, Cli) {
         lifecycle.clone(),
         Options {
             domain: "bento.example.org".into(),
+            instance_domain: "example.org".into(),
             reserved_names: vec!["www".into(), "bento".into()],
             default_image: "debian-13".into(),
             now: Arc::new(test_time),
@@ -608,7 +609,7 @@ async fn rename_confirmation_gating() {
         assert_eq!(!lifecycle.0.lock().unwrap().renamed.is_empty(), renamed);
         if prompted {
             for fact in [
-                "https://db.bento.example.org/ stops working",
+                "https://db.example.org/ stops working",
                 "no redirect",
                 "SSH user name changes",
             ] {
@@ -895,7 +896,7 @@ async fn visibility() {
         lifecycle.0.lock().unwrap().set_visibility,
         Some(("uuid-web".into(), Visibility::Public))
     );
-    assert!(output.contains("anyone can reach https://web.bento.example.org/"));
+    assert!(output.contains("anyone can reach https://web.example.org/"));
     assert_eq!(
         run(&cli, user(1, "alice"), "", &["visibility", "web", "hidden"])
             .await
@@ -1097,4 +1098,19 @@ async fn help_lines_up_in_one_column() {
         }
     }
     assert!(body.contains("create an instance"));
+}
+
+/// The published URL follows the instance domain while the SSH host stays on
+/// the control plane (SPEC 7.1).
+#[tokio::test]
+async fn visibility_message_uses_the_instance_domain() {
+    let (_, _, cli) = fixture();
+    let (code, out, error) = run(&cli, user(1, "alice"), "", &["visibility", "web", "public"]).await;
+    assert_eq!(code, 0, "{error}");
+    assert!(out.contains("https://web.example.org/"), "{out}");
+    assert!(!out.contains("bento.example.org"), "{out}");
+
+    let (code, out, error) = run(&cli, user(1, "alice"), "", &["ls"]).await;
+    assert_eq!(code, 0, "{error}");
+    let _ = out;
 }

@@ -291,11 +291,14 @@ impl Cli {
         }
     }
 
+    /// The published URL of an instance. This follows the instance domain,
+    /// not the control plane's own domain (SPEC 7.1): `ssh_host` is the one
+    /// that stays on `base_domain`.
     fn instance_url(&self, name: &str) -> String {
-        if self.options.domain.is_empty() {
+        if self.options.instance_domain.is_empty() {
             format!("the URL of {name}")
         } else {
-            format!("https://{name}.{}/", self.options.domain)
+            format!("https://{name}.{}/", self.options.instance_domain)
         }
     }
 }
