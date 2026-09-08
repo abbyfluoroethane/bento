@@ -10,17 +10,22 @@ use std::time::Duration;
 use bento_config::Config;
 use bento_hypervisor::{CheckConfig, CheckResult};
 
+use crate::fleet::{self, View};
 use crate::host::HostSample;
 use crate::install::{self, HostFacts, Paths, Step, StepKind};
 use crate::libvirt::{self, Census};
+use crate::role::Role;
 use crate::run::Cmd;
 use crate::systemd::{self, UNITS, UnitAction, UnitStatus};
 
-pub const TABS: [&str; 4] = ["Services", "Install", "Config", "Host"];
+/// The Fleet screen sits beside Services because both report what is
+/// running rather than what has to be installed (MULTI-NODE 20).
+pub const TABS: [&str; 5] = ["Services", "Fleet", "Install", "Config", "Host"];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
     Services,
+    Fleet,
     Install,
     Config,
     Host,
@@ -30,17 +35,19 @@ impl Tab {
     pub fn index(self) -> usize {
         match self {
             Tab::Services => 0,
-            Tab::Install => 1,
-            Tab::Config => 2,
-            Tab::Host => 3,
+            Tab::Fleet => 1,
+            Tab::Install => 2,
+            Tab::Config => 3,
+            Tab::Host => 4,
         }
     }
 
     fn from_index(index: usize) -> Tab {
         match index % TABS.len() {
             0 => Tab::Services,
-            1 => Tab::Install,
-            2 => Tab::Config,
+            1 => Tab::Fleet,
+            2 => Tab::Install,
+            3 => Tab::Config,
             _ => Tab::Host,
         }
     }
@@ -77,6 +84,14 @@ pub enum Outcome {
 pub struct App {
     pub paths: Paths,
     pub euid: u32,
+    /// This machine's own identity (MULTI-NODE 16). The hostname drifts;
+    /// this is what a host row is keyed on, so it is what says which row
+    /// of the fleet is this machine.
+    pub machine_id: Option<String>,
+    /// What this machine is meant to run. It decides which units the
+    /// Services and Install tabs expect, and which fleet view the Fleet
+    /// tab can show.
+    pub role: Role,
     pub tab: Tab,
     pub units: Vec<UnitStatus>,
     pub systemctl_error: Option<String>,
@@ -87,6 +102,8 @@ pub struct App {
     pub checks: Vec<CheckResult>,
     pub census: Result<Census, String>,
     pub host: HostSample,
+    pub fleet: View,
+    pub runner_cursor: usize,
     pub modal: Option<Modal>,
     /// The last thing that happened, shown along the bottom.
     pub status: String,
@@ -97,8 +114,10 @@ impl App {
         App {
             paths,
             euid,
+            machine_id: fleet::machine_id(),
+            role: Role::Controller,
             tab: Tab::Services,
-            units: merge_units(&[]),
+            units: merge_units(&[], Role::Controller),
             systemctl_error: None,
             unit_cursor: 0,
             steps: Vec::new(),
@@ -107,6 +126,8 @@ impl App {
             checks: Vec::new(),
             census: Err("not read yet".to_string()),
             host: HostSample::default(),
+            fleet: View::Controller(Err("not read yet".to_string())),
+            runner_cursor: 0,
             modal: None,
             status: if euid == 0 {
                 "running as root".to_string()
@@ -125,16 +146,34 @@ impl App {
         self.steps.get(self.step_cursor)
     }
 
+    /// The runner the Fleet tab has selected, when the fleet read.
+    pub fn selected_runner(&self) -> Option<&fleet::Runner> {
+        match &self.fleet {
+            View::Controller(Ok(fleet)) => fleet.selected(self.runner_cursor),
+            _ => None,
+        }
+    }
+
+    fn runner_count(&self) -> usize {
+        match &self.fleet {
+            View::Controller(Ok(fleet)) => fleet.runners.len(),
+            _ => 0,
+        }
+    }
+
     /// Rereads everything the screen shows. The libvirt census is the only
     /// asynchronous part, so it borrows the caller's runtime.
     pub fn refresh(&mut self, runtime: &tokio::runtime::Runtime) {
-        match systemd::show_command().capture() {
+        let parsed = match systemd::show_command().capture() {
             Ok(output) => {
-                self.units = merge_units(&systemd::parse_show(&output));
                 self.systemctl_error = None;
+                systemd::parse_show(&output)
             }
-            Err(error) => self.systemctl_error = Some(error.to_string()),
-        }
+            Err(error) => {
+                self.systemctl_error = Some(error.to_string());
+                Vec::new()
+            }
+        };
 
         self.config = Config::load(&self.paths.config).map_err(|error| error.to_string());
         // A configuration that loads moves the state directories, so the
@@ -145,8 +184,20 @@ impl App {
             self.paths.key_dir = PathBuf::from(&config.key_dir);
         }
 
+        // The role is decided from the configuration and the unit files
+        // this machine already carries, so it is read after both and
+        // before anything that counts units.
+        self.role = Role::detect(self.config.as_ref().ok(), &parsed);
+        self.units = merge_units(&parsed, self.role);
+
         let facts = HostFacts::probe(&self.paths);
-        self.steps = install::steps(&self.paths, &facts, &self.units, Some(self.config.is_ok()));
+        self.steps = install::steps(
+            &self.paths,
+            &facts,
+            &self.units,
+            Some(self.config.is_ok()),
+            self.role,
+        );
         self.step_cursor = self.step_cursor.min(self.steps.len().saturating_sub(1));
         self.host = HostSample::take(
             Some(&self.host),
@@ -161,6 +212,15 @@ impl App {
             .unwrap_or_default();
         self.checks = self.host_checks(&socket);
         self.census = runtime.block_on(libvirt::census(&socket));
+        self.fleet = View::read(
+            runtime,
+            self.role,
+            self.config.as_ref().ok(),
+            self.machine_id.as_deref(),
+        );
+        self.runner_cursor = self
+            .runner_cursor
+            .min(self.runner_count().saturating_sub(1));
     }
 
     /// The SPEC 4.2 requirement checks, the same ones `bentod serve` runs
@@ -199,7 +259,7 @@ impl App {
             Key::Left | Key::BackTab => {
                 self.tab = Tab::from_index(self.tab.index() + TABS.len() - 1);
             }
-            Key::Char(digit @ '1'..='4') => {
+            Key::Char(digit @ '1'..='5') => {
                 self.tab = Tab::from_index(digit as usize - '1' as usize);
             }
             Key::Up => self.move_cursor(-1),
@@ -234,9 +294,11 @@ impl App {
     }
 
     fn move_cursor(&mut self, delta: isize) {
+        let runners = self.runner_count();
         let (cursor, len) = match self.tab {
             Tab::Services => (&mut self.unit_cursor, self.units.len()),
             Tab::Install => (&mut self.step_cursor, self.steps.len()),
+            Tab::Fleet => (&mut self.runner_cursor, runners),
             _ => return,
         };
         if len == 0 {
@@ -249,6 +311,7 @@ impl App {
     fn on_tab_key(&mut self, key: Key) -> Outcome {
         match self.tab {
             Tab::Services => self.on_services_key(key),
+            Tab::Fleet => self.on_fleet_key(key),
             Tab::Install => self.on_install_key(key),
             Tab::Config => self.on_config_key(key),
             Tab::Host => Outcome::None,
@@ -276,20 +339,82 @@ impl App {
             }
             _ => return Outcome::None,
         };
-        let unit = self.selected_unit().name.clone();
-        if !self.selected_unit().installed() && !matches!(action, UnitAction::Logs) {
-            self.modal = Some(Modal::Message {
-                title: "no unit file".to_string(),
-                body: format!(
-                    "{unit} is not installed. Run the unit-file step on the Install tab first."
-                ),
-            });
+        let selected = self.selected_unit();
+        let unit = selected.name.clone();
+        if !selected.installed() && !matches!(action, UnitAction::Logs) {
+            let (title, body) = if selected.wanted {
+                (
+                    "no unit file".to_string(),
+                    format!(
+                        "{unit} is not installed. Run the unit-file step on the Install tab first."
+                    ),
+                )
+            } else {
+                (
+                    format!("not a {} unit", self.role.label()),
+                    self.role.not_here(&unit),
+                )
+            };
+            self.modal = Some(Modal::Message { title, body });
             return Outcome::None;
         }
         self.confirm(
             format!("{} {unit}", action.label()),
             vec![action.command(&unit, self.euid)],
         );
+        Outcome::None
+    }
+
+    /// The Fleet tab reads; it does not dispatch. Every change to a
+    /// runner goes through the controller, which holds the lease
+    /// (MULTI-NODE 11.3), so what the keys here offer is the operator
+    /// command that reports more than one screen can hold.
+    fn on_fleet_key(&mut self, key: Key) -> Outcome {
+        let Key::Char(c) = key else {
+            return Outcome::None;
+        };
+        if self.role == Role::Runner {
+            self.modal = Some(Modal::Message {
+                title: "no fleet here".to_string(),
+                body: "This machine holds guests for a controller elsewhere. Slots and\n                       placement are the controller's to report; run bentod there."
+                    .to_string(),
+            });
+            return Outcome::None;
+        }
+        match c {
+            's' => self.confirm(
+                "the slot table and who owns each slot".to_string(),
+                vec![self.bentod("slots", Vec::new())],
+            ),
+            'p' => {
+                let machine = self
+                    .selected_runner()
+                    .map(|runner| runner.name.clone())
+                    .unwrap_or_default();
+                let args = if machine.is_empty() {
+                    Vec::new()
+                } else {
+                    vec![machine.clone()]
+                };
+                self.confirm(
+                    if machine.is_empty() {
+                        "the slot plan".to_string()
+                    } else {
+                        format!("the slot plan for {machine}")
+                    },
+                    vec![self.bentod("slots", {
+                        let mut rest = vec!["plan".to_string()];
+                        rest.extend(args);
+                        rest
+                    })],
+                );
+            }
+            'c' => self.confirm(
+                "report libvirt and database disagreements".to_string(),
+                vec![self.bentod("reconcile", Vec::new())],
+            ),
+            _ => {}
+        }
         Outcome::None
     }
 
@@ -315,7 +440,7 @@ impl App {
             });
             return;
         }
-        match install::commands(kind, &self.paths, self.euid) {
+        match install::commands(kind, &self.paths, self.euid, self.role) {
             Ok(commands) => self.confirm(title.to_string(), commands),
             Err(error) => {
                 self.modal = Some(Modal::Message {
@@ -345,7 +470,7 @@ impl App {
         }
         let mut commands = Vec::new();
         for kind in pending {
-            match install::commands(kind, &self.paths, self.euid) {
+            match install::commands(kind, &self.paths, self.euid, self.role) {
                 Ok(mut list) => commands.append(&mut list),
                 Err(error) => {
                     self.modal = Some(Modal::Message {
@@ -359,23 +484,25 @@ impl App {
         self.confirm("install everything that is missing".to_string(), commands);
     }
 
+    /// One `bentod` operator command, with the same configuration the
+    /// units run with.
+    fn bentod(&self, subcommand: &str, extra: Vec<String>) -> Cmd {
+        let mut args = Vec::new();
+        if let Some(path) = self.paths.config_flag() {
+            args.push("-config".to_string());
+            args.push(path.to_string());
+        }
+        args.push(subcommand.to_string());
+        args.extend(extra);
+        Cmd::owned(self.paths.binary.display().to_string(), args).privileged(self.euid)
+    }
+
     fn on_config_key(&mut self, key: Key) -> Outcome {
         let Key::Char(c) = key else {
             return Outcome::None;
         };
         let config = self.paths.config.display().to_string();
-        let binary = self.paths.binary.display().to_string();
-        // The operator commands need the same configuration the units use.
-        let bentod_with = |subcommand: &str, extra: Vec<String>| {
-            let mut args = Vec::new();
-            if let Some(path) = self.paths.config_flag() {
-                args.push("-config".to_string());
-                args.push(path.to_string());
-            }
-            args.push(subcommand.to_string());
-            args.extend(extra);
-            Cmd::owned(binary.clone(), args).privileged(self.euid)
-        };
+        let bentod_with = |subcommand: &str, extra: Vec<String>| self.bentod(subcommand, extra);
         let bentod = |subcommand: &str| bentod_with(subcommand, Vec::new());
         match c {
             'e' => {
@@ -497,11 +624,15 @@ pub fn newest_backup(db: &str) -> Option<String> {
 /// One entry per unit of [`UNITS`], in that order, whatever `systemctl`
 /// answered. A unit the host has never heard of still needs a row, because
 /// that row is what says it has to be installed.
-pub fn merge_units(parsed: &[UnitStatus]) -> Vec<UnitStatus> {
+///
+/// `role` marks which of them this machine is meant to run. Every unit
+/// keeps its row either way: a controller unit left running on a runner
+/// is exactly what an operator has to see (MULTI-NODE 19).
+pub fn merge_units(parsed: &[UnitStatus], role: Role) -> Vec<UnitStatus> {
     UNITS
         .iter()
         .map(|unit| {
-            parsed
+            let mut status = parsed
                 .iter()
                 .find(|status| status.name == unit.name)
                 .cloned()
@@ -509,7 +640,16 @@ pub fn merge_units(parsed: &[UnitStatus]) -> Vec<UnitStatus> {
                     name: unit.name.to_string(),
                     description: unit.description.to_string(),
                     ..Default::default()
-                })
+                });
+            // systemd answers for a unit it has no file for by repeating
+            // the name as the description. The built-in one says what the
+            // unit would do, which is what a machine that has not
+            // installed it needs to read.
+            if status.description.is_empty() || status.description == status.name {
+                unit.description.clone_into(&mut status.description);
+            }
+            status.wanted = role.wants(unit.name);
+            status
         })
         .collect()
 }
@@ -538,22 +678,28 @@ pub const REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::install::{DEFAULT_BINARY, DEFAULT_CONFIG, UNIT_DIR};
+    use crate::install::{DEFAULT_BINARY, DEFAULT_CONFIG, DEFAULT_MONITOR, UNIT_DIR};
 
-    /// A host with the binary in place and nothing else. The facts are
+    /// A host with the binaries in place and nothing else. The facts are
     /// stated rather than probed, so that these tests do not depend on
     /// what the machine running them has installed.
     fn facts() -> HostFacts {
         HostFacts {
-            binary_installed: true,
+            missing_binaries: Vec::new(),
+            stale_binaries: Vec::new(),
             config_installed: false,
             missing_directories: vec!["/var/lib/bento/storage".to_string()],
         }
     }
 
     fn app() -> App {
+        app_as(Role::Controller)
+    }
+
+    fn app_as(role: Role) -> App {
         let paths = Paths {
             binary: PathBuf::from(DEFAULT_BINARY),
+            monitor: PathBuf::from(DEFAULT_MONITOR),
             config: PathBuf::from(DEFAULT_CONFIG),
             unit_dir: PathBuf::from(UNIT_DIR),
             image_dir: PathBuf::from("/var/lib/bento/images"),
@@ -562,23 +708,46 @@ mod tests {
             source: Some(PathBuf::from("/srv/bento")),
         };
         let mut app = App::new(paths, 1000);
-        app.units = merge_units(&[UnitStatus {
-            name: systemd::SERVE.to_string(),
-            load_state: "loaded".to_string(),
-            fragment_path: format!("{UNIT_DIR}/{}", systemd::SERVE),
-            active_state: "active".to_string(),
-            ..Default::default()
-        }]);
-        app.steps = install::steps(&app.paths, &facts(), &app.units, Some(true));
+        app.role = role;
+        app.units = merge_units(
+            &[UnitStatus {
+                name: systemd::SERVE.to_string(),
+                load_state: "loaded".to_string(),
+                fragment_path: format!("{UNIT_DIR}/{}", systemd::SERVE),
+                active_state: "active".to_string(),
+                ..Default::default()
+            }],
+            role,
+        );
+        app.steps = install::steps(&app.paths, &facts(), &app.units, Some(true), role);
         app
     }
 
     #[test]
+    fn a_unit_with_no_file_still_says_what_it_would_do() {
+        let parsed = vec![UnitStatus {
+            name: systemd::SERVE.to_string(),
+            // What systemd answers for a unit it has no file for.
+            description: systemd::SERVE.to_string(),
+            load_state: "not-found".to_string(),
+            ..Default::default()
+        }];
+        let units = merge_units(&parsed, Role::Runner);
+        assert_eq!(units[0].description, "Bento control plane");
+    }
+
+    #[test]
     fn every_unit_gets_a_row_even_when_systemd_never_heard_of_it() {
-        let units = merge_units(&[]);
+        let units = merge_units(&[], Role::Controller);
         assert_eq!(units.len(), UNITS.len());
         assert_eq!(units[0].name, systemd::SERVE);
         assert!(!units[0].installed());
+        assert!(units.iter().all(|unit| unit.wanted));
+
+        // A runner keeps the same rows and wants one of them.
+        let units = merge_units(&[], Role::Runner);
+        assert_eq!(units.len(), UNITS.len());
+        assert_eq!(units.iter().filter(|unit| unit.wanted).count(), 1);
     }
 
     #[test]
@@ -588,8 +757,10 @@ mod tests {
         assert_eq!(app.tab, Tab::Host);
         app.on_key(Key::Right);
         assert_eq!(app.tab, Tab::Services);
-        app.on_key(Key::Char('3'));
-        assert_eq!(app.tab, Tab::Config);
+        app.on_key(Key::Char('2'));
+        assert_eq!(app.tab, Tab::Fleet);
+        app.on_key(Key::Char('5'));
+        assert_eq!(app.tab, Tab::Host);
     }
 
     #[test]
@@ -673,8 +844,11 @@ mod tests {
         let mut app = app();
         app.tab = Tab::Install;
         app.paths.source = None;
-        let bare = HostFacts::default();
-        app.steps = install::steps(&app.paths, &bare, &app.units, Some(true));
+        let bare = HostFacts {
+            missing_binaries: vec!["bentod".to_string()],
+            ..HostFacts::default()
+        };
+        app.steps = install::steps(&app.paths, &bare, &app.units, Some(true), app.role);
         app.step_cursor = 0; // the binary, with no source tree to build
         app.on_key(Key::Enter);
         assert!(matches!(app.modal, Some(Modal::Message { .. })));

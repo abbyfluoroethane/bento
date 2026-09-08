@@ -494,8 +494,12 @@ only holds guests runs `bentod-runner` **alone**. Do not enable
 one control plane, and a second `serve` against a second database would
 be a second Bento.
 
-`bento-monitor` writes all four unit files. Enabling them is per unit on
-its Services tab, so a runner-only machine enables only the one.
+`bento-monitor` reads the role from the machine and writes only the unit
+files that role calls for, so a runner-only machine gets `bentod-runner`
+and nothing else. The role follows the configuration: write the
+`[runner]` section below, with `listen` on this machine's own underlay
+address, before the unit-file step. A machine still on the loopback
+default reads as a controller, and the step would then write all four.
 
 ```ini
 [Unit]
@@ -526,15 +530,19 @@ answers with something unexpected.
 **On the new machine**, run `bento-monitor` and work down the Install
 tab, exactly as for a first host:
 
-1. Build and install the binary.
+1. Build and install the binaries.
 2. Write the configuration. Set `[runner] listen` to this machine's own
-   underlay address, and `fence_db` to a path on local disk.
+   underlay address, and `fence_db` to a path on local disk. The header
+   reads `runner` from here on, and the Install and Services tabs then
+   expect one unit rather than four.
 3. Create the directories.
-4. Install the unit files.
+4. Install the unit file.
+5. Enable it at boot.
 
-Then, on the Services tab, enable and start **`bentod-runner` only**.
-Leave `bentod-serve`, `bentod-proxy`, and `bentod-sshd` alone: one
-deployment has one control plane.
+Then start `bentod-runner` on the Services tab. Leave `bentod-serve`,
+`bentod-proxy`, and `bentod-sshd` alone: one deployment has one control
+plane. The Fleet tab reports `accepted 0` until the controller first
+reaches it.
 
 Check the log says what you expect:
 
@@ -628,7 +636,7 @@ Everything in sections 4 and 6 also has a screen. `make build` produces
 finishes. Run it on the host:
 
 ```
-sudo bento-monitor                     # -config, -binary, and -source override the paths
+sudo bento-monitor                     # -config, -binary, -monitor, and -source override the paths
 ```
 
 Run it as root, or as a user who can `sudo` — it adds the `sudo` itself,
@@ -641,14 +649,64 @@ unwanted, a sudoers rule that names the `systemctl` commands, or a polkit
 rule on `org.freedesktop.systemd1.manage-units`, gives the same relief
 without the escalation.
 
-Four screens: **Services** drives the three units (start, stop, restart,
-enable, disable, and the journal); **Install** reports each step of
-sections 4 and 6 as done, missing, or waiting on an earlier one, and runs
-the ones that are missing; **Config** shows what `/etc/bento/bento.toml`
-parses to, with the ACME and OIDC secrets reported as set or missing but
-never printed, and runs `fetch-images`, `images`, and `reconcile`;
-**Host** shows the SPEC 4.2 requirement checks, processor, memory, swap,
-free space on the image and storage directories, and the libvirt domains.
+Five screens: **Services** drives the units (start, stop, restart,
+enable, disable, and the journal); **Fleet** reports the deployment, and
+is described below; **Install** reports each step of sections 4 and 6 as
+done, missing, or waiting on an earlier one, and runs the ones that are
+missing; **Config** shows what `/etc/bento/bento.toml` parses to, with
+the ACME and OIDC secrets reported as set or missing but never printed,
+and runs `fetch-images`, `images`, and `reconcile`; **Host** shows the
+SPEC 4.2 requirement checks, processor, memory, swap, free space on the
+image and storage directories, and the libvirt domains.
+
+**The screen knows what the machine is.** A controller runs `serve`, the
+proxy, the SSH frontend, and its own runner. A machine that holds only
+guests runs the runner service alone (MULTI-NODE 19). The header names
+the role, and the Services and Install screens count only the units that
+role calls for, so a healthy runner does not read as a controller three
+units short. The role is read from the machine, not configured: a
+configuration that names `[[runners]]` belongs to the controller that
+calls them; so does a machine that already has a `bentod-serve` unit
+file; a machine with neither, whose `[runner] listen` binds an underlay
+address rather than loopback, is a runner.
+
+**The binary step installs both binaries.** `bentod` and `bento-monitor`
+come from one build and go in together, because a deployment whose halves
+came from different commits is one you cannot reason about. The step is
+done only when both are installed **and** neither is older than the copy
+in `target/release`; a rebuilt binary that was never installed is named
+on the screen. That is the check a version number cannot do: every commit
+of one release carries the same version.
+
+### The Fleet screen
+
+**Fleet** is the whole deployment, not this machine (MULTI-NODE 20). On a
+controller it lists every machine with its slots, health, and instance
+count, and the selected one in full: machine ID, endpoint, guest route,
+last contact, whether it takes new instances and why not, the controller
+epoch it has accepted, provisioned vCPU, memory and disk against the size
+it reported, architecture, image readiness, and its last error. Above
+them sit the slot prefix, the controller lease, and the row counts. There
+is no deployment total for memory or disk: memory added across machines
+that cannot share it describes a machine that does not exist. A machine
+that stops answering keeps its row and shows what it last reported.
+
+`s` prints the slot table, `p` the slot plan for the selected machine,
+and `c` runs `reconcile`.
+
+**The monitor never calls a runner.** A runner refuses any request that
+does not carry the controller epoch and an unexpired lease, and taking a
+lease raises the epoch, which would fence the running control plane out
+of its own deployment (MULTI-NODE 11.3). So the Fleet screen reads what
+the controller already recorded: the controller polls each runner every
+thirty seconds and writes what it saw. The database is opened read-only,
+and never migrated — a migration is yours to run, after a copy.
+
+On a machine that holds only guests there is no controller database, so
+Fleet shows that machine's own fence instead: which controller epoch it
+has accepted, how many objects it has been told to build, and when it
+last finished a change. An accepted epoch that matches the controller's
+lease epoch is a runner the controller has reached since it last started.
 
 The monitor is a shim, not a second control plane. It holds no state, it
 starts no process of its own, and it changes nothing quietly: an action
@@ -659,6 +717,9 @@ as it always does, and what the monitor did is what you would have typed.
 Read-only from the start: with no configuration and no units installed,
 every screen still draws, and the Install tab is the list of what is
 missing.
+
+After the binary step replaces `bento-monitor`, the screen you are
+looking at is still the old copy. Quit and start it again.
 
 ## 7. Users, capacity, and the dashboard
 

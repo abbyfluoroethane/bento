@@ -67,9 +67,11 @@ disagreements between libvirt and the database and changes nothing.
 `bentod images` lists the images.
 
 **`bento-monitor`** is a terminal screen for the same work. It installs
-the binary, the directories, the configuration, and the units. It starts,
-stops, and watches them. It is a shim over `systemctl`: it shows each
-command, then runs it in your terminal. See `DEPLOYING.md` section 6.
+both binaries, the directories, the configuration, and the units the
+machine's role calls for. It starts, stops, and watches them, and its
+Fleet screen reports every machine of the deployment. It is a shim over
+`systemctl`: it shows each command, then runs it in your terminal. See
+`DEPLOYING.md` section 6.
 
 **Users.** The first OIDC login for an identity creates the account and
 its /24 (SPEC 13). To use the command line, a user runs

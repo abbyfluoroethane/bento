@@ -9,7 +9,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, Gauge, Padding, Paragraph, Tabs, Wrap};
 
 use crate::app::{App, Modal, TABS, Tab};
+use crate::fleet::{self, Fence, Fleet, View};
 use crate::host::{Disk, human_bytes, human_duration};
+use crate::role::Role;
 use crate::systemd::UnitStatus;
 
 const GOOD: Color = Color::Green;
@@ -28,6 +30,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_header(frame, app, header);
     match app.tab {
         Tab::Services => draw_services(frame, app, body),
+        Tab::Fleet => draw_fleet(frame, app, body),
         Tab::Install => draw_install(frame, app, body),
         Tab::Config => draw_config(frame, app, body),
         Tab::Host => draw_host(frame, app, body),
@@ -43,7 +46,7 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
     let [title, tabs, right] = Layout::horizontal([
         Constraint::Length(15),
         Constraint::Min(20),
-        Constraint::Length(18),
+        Constraint::Length(28),
     ])
     .areas(area);
 
@@ -61,7 +64,15 @@ fn draw_header(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled("via sudo", Style::new().fg(WARN))
     };
     frame.render_widget(
-        Paragraph::new(Line::from(who)).alignment(Alignment::Right),
+        Paragraph::new(Line::from(vec![
+            // The role decides which units this machine is meant to run,
+            // so it belongs where it is read on every screen.
+            Span::styled(app.role.label(), Style::new().fg(Color::Cyan)),
+            Span::styled("  ", Style::new()),
+            who,
+            Span::raw(" "),
+        ]))
+        .alignment(Alignment::Right),
         right,
     );
 }
@@ -71,6 +82,10 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         Tab::Services => {
             "s start  t stop  r restart  e enable  d disable  l logs  f follow  D daemon-reload"
         }
+        // A runner has no fleet to act on: the controller holds the
+        // lease and the slot table (MULTI-NODE 11.3).
+        Tab::Fleet if app.role == Role::Runner => "F5 refresh now",
+        Tab::Fleet => "s slots  p slot plan for the selected machine  c reconcile",
         Tab::Install => "enter run step  a run every missing step",
         Tab::Config => "e edit  f fetch-images  i images  c reconcile  b backup  r restore",
         Tab::Host => "F5 refresh now",
@@ -86,7 +101,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
     );
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(" tab/1-4 screens  ? help  q quit  ", Style::new().fg(MUTED)),
+            Span::styled(" tab/1-5 screens  ? help  q quit  ", Style::new().fg(MUTED)),
             Span::styled(app.status.clone(), Style::new().fg(Color::Cyan)),
         ])),
         bottom,
@@ -184,6 +199,408 @@ fn draw_services(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
+/// Every machine of the deployment (MULTI-NODE 20).
+///
+/// A machine that does not answer keeps its row. It shows the size it
+/// last reported and what is provisioned on it, because a runner that
+/// vanished from the screen would read as a runner that no longer exists.
+fn draw_fleet(frame: &mut Frame, app: &App, area: Rect) {
+    match &app.fleet {
+        View::Controller(Ok(fleet)) => draw_fleet_table(frame, app, fleet, area),
+        View::Controller(Err(error)) => frame.render_widget(note(" Fleet ", error, WARN), area),
+        View::Runner(Ok(fence)) => frame.render_widget(runner_widget(fence), area),
+        View::Runner(Err(error)) => frame.render_widget(note(" This runner ", error, WARN), area),
+    }
+}
+
+fn draw_fleet_table(frame: &mut Frame, app: &App, fleet: &Fleet, area: Rect) {
+    // Three lines and its border. A short box would cut the row counts,
+    // which are the part that says whether anything is misplaced.
+    let [summary, body] = Layout::vertical([Constraint::Length(5), Constraint::Min(5)]).areas(area);
+    frame.render_widget(deployment_widget(fleet), summary);
+
+    let [list, detail] =
+        Layout::horizontal([Constraint::Percentage(52), Constraint::Min(30)]).areas(body);
+
+    let mut rows = Vec::new();
+    for (index, runner) in fleet.runners.iter().enumerate() {
+        let selected = index == app.runner_cursor;
+        let mut style = Style::new();
+        if selected {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        let (mark, color) = health_mark(runner);
+        let slots = if runner.slots.is_empty() {
+            "no slots".to_string()
+        } else {
+            format!(
+                "slot {}",
+                runner
+                    .slots
+                    .iter()
+                    .map(|(slot, _)| slot.to_string())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        };
+        rows.push(Line::from(vec![
+            Span::styled(if selected { " > " } else { "   " }, style),
+            Span::styled(mark, Style::new().fg(color)),
+            Span::styled(
+                format!(" {:<16}", truncate(&runner.name, 16)),
+                if runner.is_local {
+                    style.add_modifier(Modifier::BOLD)
+                } else {
+                    style
+                },
+            ),
+            Span::styled(format!("{:<12}", slots), Style::new().fg(MUTED)),
+            Span::styled(
+                format!("{:>3} vm  ", runner.instances),
+                Style::new().fg(MUTED),
+            ),
+            Span::styled(runner.health.as_str().to_string(), Style::new().fg(color)),
+        ]));
+    }
+    if fleet.runners.is_empty() {
+        rows.push(Line::from(Span::styled(
+            " no machines registered yet. `bentod serve` writes one row for each\n              [[runners]] entry when it starts.",
+            Style::new().fg(WARN),
+        )));
+    }
+    frame.render_widget(
+        Paragraph::new(rows)
+            .block(Block::bordered().title(" Machines "))
+            .wrap(Wrap { trim: false }),
+        list,
+    );
+
+    let lines = match app.selected_runner() {
+        Some(runner) => runner_lines(runner, fleet),
+        None => vec![Line::from(Span::styled(
+            " nothing to show",
+            Style::new().fg(MUTED),
+        ))],
+    };
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::bordered().title(" Machine "))
+            .wrap(Wrap { trim: false }),
+        detail,
+    );
+}
+
+/// The facts that belong to the deployment rather than to one machine:
+/// the slot prefix, the controller lease, and the row counts.
+fn deployment_widget(fleet: &Fleet) -> Paragraph<'static> {
+    let now = time::OffsetDateTime::now_utc();
+    let lease = match &fleet.lease {
+        Some(lease) => {
+            // The lease is renewed on a tick, so an expiry in the past is
+            // a control plane that has stopped dispatching, not a clock
+            // to read carefully (MULTI-NODE 11.3).
+            let (word, color) = if lease.expires_at > now {
+                ("holds", GOOD)
+            } else {
+                ("expired", BAD)
+            };
+            Line::from(vec![
+                Span::styled(" lease         ", Style::new().fg(MUTED)),
+                Span::styled(
+                    format!("epoch {}  {word}  ", lease.epoch),
+                    Style::new().fg(color),
+                ),
+                Span::styled(
+                    format!(
+                        "{}  {}",
+                        truncate(&lease.holder_id, 12),
+                        fleet::until(lease.expires_at, now)
+                    ),
+                    Style::new().fg(MUTED),
+                ),
+            ])
+        }
+        None => Line::from(vec![
+            Span::styled(" lease         ", Style::new().fg(MUTED)),
+            Span::styled(
+                "nobody holds it: no control plane is dispatching",
+                Style::new().fg(WARN),
+            ),
+        ]),
+    };
+    let mut counts = format!(
+        "{}  {}  {}",
+        count(fleet.runners.len(), "machine"),
+        count(fleet.instances, "instance"),
+        count(fleet.images, "image in the allowlist")
+    );
+    if fleet.orphans > 0 {
+        counts.push_str(&format!("  {} on no known machine", fleet.orphans));
+    }
+    Paragraph::new(vec![
+        field(
+            "slot prefix",
+            format!(
+                "/{}  ({} slot(s) per user /24)",
+                fleet.deployment.runner_prefix,
+                fleet.deployment.slot_count()
+            ),
+        ),
+        lease,
+        field("deployment", counts),
+    ])
+    .block(Block::bordered().title(" Deployment "))
+}
+
+fn runner_lines(runner: &fleet::Runner, fleet: &Fleet) -> Vec<Line<'static>> {
+    let now = time::OffsetDateTime::now_utc();
+    let mut lines = vec![
+        // The row id is shown because the controller logs it as
+        // `runner_id` on every distributed action (MULTI-NODE 20), and
+        // matching a log line to a machine is what an operator does next.
+        field(
+            "machine",
+            if runner.is_local {
+                format!("{} (this one), runner_id {}", runner.name, runner.id)
+            } else {
+                format!("{}, runner_id {}", runner.name, runner.id)
+            },
+        ),
+        field(
+            "machine id",
+            runner
+                .machine_id
+                .clone()
+                .unwrap_or_else(|| "not reported yet".to_string()),
+        ),
+        field("endpoint", runner.endpoint_text()),
+        field(
+            "guest route",
+            runner
+                .underlay
+                .clone()
+                .unwrap_or_else(|| "none: no machine can route to this one".to_string()),
+        ),
+    ];
+
+    let (mark, color) = health_mark(runner);
+    lines.push(Line::from(vec![
+        Span::styled(" health        ", Style::new().fg(MUTED)),
+        Span::styled(
+            format!("{mark} {}", runner.health.as_str()),
+            Style::new().fg(color),
+        ),
+        Span::styled(
+            format!(
+                "  last answered {}",
+                fleet::ago(runner.last_contact_at, now)
+            ),
+            Style::new().fg(MUTED),
+        ),
+    ]));
+    lines.push(match runner.refusal() {
+        Some(reason) => Line::from(vec![
+            Span::styled(" placement     ", Style::new().fg(MUTED)),
+            Span::styled(
+                format!("takes nothing new: {reason}"),
+                Style::new().fg(WARN),
+            ),
+        ]),
+        None => field("placement", "takes new instances".to_string()),
+    });
+
+    // The runner records the highest controller epoch it has accepted. A
+    // runner behind the lease has not been reached since the controller
+    // last restarted (MULTI-NODE 11.3).
+    let epoch = match &fleet.lease {
+        Some(lease) if runner.accepted_epoch < lease.epoch => Line::from(vec![
+            Span::styled(" epoch         ", Style::new().fg(MUTED)),
+            Span::styled(
+                format!(
+                    "accepted {}, controller is at {}",
+                    runner.accepted_epoch, lease.epoch
+                ),
+                Style::new().fg(WARN),
+            ),
+        ]),
+        _ => field("epoch", format!("accepted {}", runner.accepted_epoch)),
+    };
+    lines.push(epoch);
+
+    lines.push(field(
+        "slots",
+        if runner.slots.is_empty() {
+            "none: this machine holds no guest addresses".to_string()
+        } else {
+            runner
+                .slots
+                .iter()
+                .map(|(slot, state)| format!("{slot} ({})", state.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        },
+    ));
+    lines.push(field(
+        "instances",
+        format!("{} rows, {} running", runner.instances, runner.running),
+    ));
+    // Provisioned against what the machine reported. There is no
+    // deployment total: memory added across machines that cannot share it
+    // describes a machine that does not exist (MULTI-NODE 20).
+    lines.push(field(
+        "provisioned",
+        format!(
+            "{} vcpu  {} memory  {} disk",
+            runner.vcpu,
+            mib(runner.memory_mib),
+            gib(runner.disk_gib)
+        ),
+    ));
+    lines.push(field(
+        "machine size",
+        match (runner.cpu_count, runner.memory_total_mib) {
+            (Some(cpus), Some(memory)) => format!(
+                "{cpus} cpu  {} memory  {}",
+                mib(memory),
+                match (runner.storage_available_gib, runner.storage_total_gib) {
+                    (Some(free), Some(total)) => format!("{} free of {}", gib(free), gib(total)),
+                    _ => "storage unknown".to_string(),
+                }
+            ),
+            _ => "not reported yet".to_string(),
+        },
+    ));
+    lines.push(field(
+        "architecture",
+        runner
+            .arch
+            .clone()
+            .unwrap_or_else(|| "not reported yet".to_string()),
+    ));
+    if let Some(version) = &runner.hypervisor_version {
+        lines.push(field("hypervisor", version.clone()));
+    }
+    lines.push(Line::from(vec![
+        Span::styled(" images        ", Style::new().fg(MUTED)),
+        Span::styled(
+            format!("{} of {} ready", runner.images_ready, runner.images_wanted),
+            Style::new().fg(if runner.images_ready == runner.images_wanted {
+                GOOD
+            } else {
+                WARN
+            }),
+        ),
+    ]));
+    if let Some(error) = &runner.last_error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!(" last error: {error}"),
+            Style::new().fg(BAD),
+        )));
+    }
+    lines
+}
+
+/// What a machine with no controller database can say for itself: which
+/// controller it is following, and what that controller has had it do.
+fn runner_widget(fence: &Fence) -> Paragraph<'static> {
+    let now = time::OffsetDateTime::now_utc();
+    let mut lines = vec![
+        Line::from(Span::styled(
+            " This machine holds guests for a controller elsewhere. The fleet, the",
+            Style::new().fg(MUTED),
+        )),
+        Line::from(Span::styled(
+            " slots, and the placement rules are the controller's to report.",
+            Style::new().fg(MUTED),
+        )),
+        Line::from(""),
+        field(
+            "machine id",
+            fence
+                .machine_id
+                .clone()
+                .unwrap_or_else(|| "/etc/machine-id could not be read".to_string()),
+        ),
+        field("listening on", fence.listen.clone()),
+        field("fence", fence.fence_db.clone()),
+        field("epoch", format!("accepted {}", fence.accepted_epoch)),
+        field("objects", fence.objects.to_string()),
+        field(
+            "changes",
+            format!(
+                "{} recorded, last {}",
+                fence.outcomes,
+                fleet::ago(fence.last_change_at, now)
+            ),
+        ),
+    ];
+    if fence.accepted_epoch == 0 {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            " No controller has changed anything here yet. Until one does, this\n              machine has accepted no epoch and holds no guests it was told to build.",
+            Style::new().fg(WARN),
+        )));
+    }
+    Paragraph::new(lines)
+        .block(Block::bordered().title(" This runner "))
+        .wrap(Wrap { trim: false })
+}
+
+fn note(title: &'static str, body: &str, color: Color) -> Paragraph<'static> {
+    Paragraph::new(vec![Line::from(Span::styled(
+        format!(" {body}"),
+        Style::new().fg(color),
+    ))])
+    .block(Block::bordered().title(title))
+    .wrap(Wrap { trim: false })
+}
+
+fn health_mark(runner: &fleet::Runner) -> (&'static str, Color) {
+    use bento_store::HostHealth;
+    if runner.refusal().is_some() && runner.health == HostHealth::Ok {
+        // Reachable, but drained or disabled by an operator.
+        return ("[-]", WARN);
+    }
+    match runner.health {
+        HostHealth::Ok => ("[*]", GOOD),
+        HostHealth::Unknown => ("[ ]", MUTED),
+        HostHealth::Unreachable => ("[!]", BAD),
+        HostHealth::Mismatched => ("[!]", BAD),
+    }
+}
+
+/// A count and the thing counted, in the number the count calls for.
+fn count(number: usize, thing: &str) -> String {
+    if number == 1 {
+        format!("{number} {thing}")
+    } else {
+        // Every noun this is used with takes a plain -s, and the phrase
+        // that is not one word is written so its first word takes it.
+        match thing.split_once(' ') {
+            Some((head, rest)) => format!("{number} {head}s {rest}"),
+            None => format!("{number} {thing}s"),
+        }
+    }
+}
+
+fn mib(value: i64) -> String {
+    human_bytes((value.max(0) as u64).saturating_mul(1024 * 1024))
+}
+
+fn gib(value: i64) -> String {
+    human_bytes((value.max(0) as u64).saturating_mul(1024 * 1024 * 1024))
+}
+
+/// A name cut to fit its column, with the cut marked.
+fn truncate(value: &str, width: usize) -> String {
+    if value.chars().count() <= width {
+        return value.to_string();
+    }
+    let kept: String = value.chars().take(width.saturating_sub(1)).collect();
+    format!("{kept}\u{2026}")
+}
+
 fn draw_install(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines = Vec::new();
     for (index, step) in app.steps.iter().enumerate() {
@@ -202,12 +619,14 @@ fn draw_install(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(vec![
             Span::styled(if selected { " > " } else { "   " }, style),
             Span::styled(mark, Style::new().fg(color)),
-            Span::styled(format!(" {:<22}", step.title), style),
+            // Wide enough for the longest title, so a step never runs
+            // into its own detail.
+            Span::styled(format!(" {:<26}", step.title), style),
             Span::styled(step.detail.clone(), Style::new().fg(MUTED)),
         ]));
         if let Some(reason) = &step.blocked {
             lines.push(Line::from(Span::styled(
-                format!("               {reason}"),
+                format!("                   {reason}"),
                 Style::new().fg(MUTED),
             )));
         }
@@ -215,6 +634,10 @@ fn draw_install(frame: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         format!("   binary   {}", app.paths.binary.display()),
+        Style::new().fg(MUTED),
+    )));
+    lines.push(Line::from(Span::styled(
+        format!("   monitor  {}", app.paths.monitor.display()),
         Style::new().fg(MUTED),
     )));
     lines.push(Line::from(Span::styled(
@@ -538,16 +961,25 @@ fn draw_modal(frame: &mut Frame, modal: &Modal, area: Rect) {
 
 fn help_lines() -> Vec<Line<'static>> {
     [
-        "bento-monitor drives the three systemd units of a Bento host.",
-        "It runs no privileged step by itself: each one is shown first and",
-        "then runs in this terminal, so sudo can ask for a password.",
+        "bento-monitor drives the systemd units of one Bento machine and",
+        "reports the whole deployment. It runs no privileged step by itself:",
+        "each one is shown first and then runs in this terminal, so sudo can",
+        "ask for a password.",
         "",
-        "  tab / shift-tab / 1-4   move between screens",
+        "The header names this machine's role. A controller runs serve, the",
+        "proxy, the SSH frontend, and its own runner; a runner runs the runner",
+        "service alone (MULTI-NODE 19). Each screen counts only the units the",
+        "role calls for.",
+        "",
+        "  tab / shift-tab / 1-5   move between screens",
         "  up down j k             move inside a screen",
         "  F5                      reread the host now (it also rereads every 2s)",
         "",
         "Services  s start  t stop  r restart  e enable  d disable",
         "          l last 200 log lines  f follow the log  D daemon-reload",
+        "Fleet     s slots  p slot plan for the selected machine  c reconcile",
+        "          It reads what the controller recorded; it never calls a",
+        "          runner, because only the controller may hold the lease.",
         "Install   enter run the selected step  a run every missing step",
         "Config    e edit  f fetch-images  i images  c reconcile  b backup  r restore",
         "",
@@ -649,7 +1081,10 @@ fn short_name(name: &str) -> String {
 }
 
 fn unit_mark(unit: &UnitStatus) -> (&'static str, Color) {
-    if !unit.installed() {
+    if !unit.wanted && !unit.installed() {
+        // Not missing: this machine's role does not run it.
+        ("[-]", MUTED)
+    } else if !unit.installed() {
         ("[ ]", MUTED)
     } else if unit.failed() {
         ("[!]", BAD)
@@ -662,7 +1097,17 @@ fn unit_mark(unit: &UnitStatus) -> (&'static str, Color) {
 
 fn unit_state(unit: &UnitStatus) -> String {
     if !unit.installed() {
-        return "not installed".to_string();
+        return if unit.wanted {
+            "not installed".to_string()
+        } else {
+            "not run on this machine".to_string()
+        };
+    }
+    if !unit.wanted {
+        // Installed where the role does not call for it. Worth seeing:
+        // two control planes on one deployment fence each other out
+        // (MULTI-NODE 11.3).
+        return format!("{} (not for this machine)", unit.active_state);
     }
     if unit.sub_state.is_empty() {
         return unit.active_state.clone();
@@ -679,6 +1124,7 @@ mod tests {
     fn a_unit_reads_as_its_state() {
         let mut unit = UnitStatus {
             name: SERVE.to_string(),
+            wanted: true,
             ..Default::default()
         };
         assert_eq!(unit_state(&unit), "not installed");
@@ -689,6 +1135,55 @@ mod tests {
         assert_eq!(unit_state(&unit), "active (running)");
         assert_eq!(unit_mark(&unit).0, "[*]");
         assert_eq!(short_name(&unit.name), "bentod-serve");
+    }
+
+    #[test]
+    fn a_unit_the_role_does_not_run_reads_as_that_and_not_as_missing() {
+        // A runner is not a half-installed controller (MULTI-NODE 19).
+        let mut unit = UnitStatus {
+            name: SERVE.to_string(),
+            wanted: false,
+            ..Default::default()
+        };
+        assert_eq!(unit_state(&unit), "not run on this machine");
+        assert_eq!(unit_mark(&unit).0, "[-]");
+
+        // One that is nonetheless running here is called out rather than
+        // shown as an ordinary healthy unit.
+        unit.load_state = "loaded".to_string();
+        unit.fragment_path = "/etc/systemd/system/bentod-serve.service".to_string();
+        unit.active_state = "active".to_string();
+        assert_eq!(unit_state(&unit), "active (not for this machine)");
+    }
+
+    #[test]
+    fn a_long_machine_name_is_cut_and_the_cut_is_marked() {
+        assert_eq!(truncate("konata", 16), "konata");
+        assert_eq!(truncate("runner-a.example.org", 10), "runner-a.\u{2026}");
+    }
+
+    #[test]
+    fn a_count_reads_in_the_number_it_calls_for() {
+        assert_eq!(count(1, "machine"), "1 machine");
+        assert_eq!(count(2, "machine"), "2 machines");
+        assert_eq!(count(0, "instance"), "0 instances");
+        assert_eq!(
+            count(1, "image in the allowlist"),
+            "1 image in the allowlist"
+        );
+        assert_eq!(
+            count(3, "image in the allowlist"),
+            "3 images in the allowlist"
+        );
+    }
+
+    #[test]
+    fn reserved_sizes_read_in_the_units_libvirt_reports_them_in() {
+        assert_eq!(mib(2048), "2.0 GiB");
+        assert_eq!(gib(20), "20.0 GiB");
+        // A machine that reported nothing must not read as a negative
+        // size.
+        assert_eq!(mib(-1), "0 B");
     }
 
     #[test]

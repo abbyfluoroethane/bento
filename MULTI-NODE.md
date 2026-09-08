@@ -1272,6 +1272,17 @@ The runbook distinguishes:
 
 ## 20. Observability and operator interface
 
+The operator interface is `bento-monitor`, on any machine of the
+deployment (DEPLOYING.md, "bento-monitor, the terminal screen"). It reads
+what the controller recorded and never calls a runner: a runner refuses
+anything that does not carry the controller epoch and an unexpired lease
+(section 11.3), and taking a lease raises the epoch and fences the
+running controller out of its own deployment. It opens the controller
+database read-only and never migrates it. A machine that holds only
+guests keeps no fleet record, so the screen there reports that machine's
+own fence: the epoch it has accepted, the objects it has been told to
+build, and when it last finished a change.
+
 Operator output includes:
 
 - runner name, endpoint, slot ownership, enabled/draining state, architecture,

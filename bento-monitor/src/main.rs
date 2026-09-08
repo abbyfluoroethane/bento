@@ -1,18 +1,26 @@
 //! `bento-monitor`: a terminal screen over the systemd units that run
 //! Bento on one host (DEPLOYING.md sections 4 and 6).
 //!
-//! It is a shim, on purpose. It installs the binary, the directories, the
-//! configuration, and the three units; it starts, stops, restarts,
-//! enables, and disables them; and it reports what systemd, libvirt, and
-//! the host say. It holds no state of its own and it changes nothing
-//! behind the operator: every action is shown as the command it is, and
-//! that command runs in this terminal, where `sudo` can still ask for a
-//! password and the operator can read what happened.
+//! It is a shim, on purpose. It installs the two binaries, the
+//! directories, the configuration, and the units this machine's role
+//! calls for; it starts, stops, restarts, enables, and disables them; and
+//! it reports what systemd, libvirt, the host, and the controller say. It
+//! holds no state of its own and it changes nothing behind the operator:
+//! every action is shown as the command it is, and that command runs in
+//! this terminal, where `sudo` can still ask for a password and the
+//! operator can read what happened.
+//!
+//! It reads the fleet as well as the machine it runs on (MULTI-NODE 20).
+//! It never dispatches to a runner: the controller holds the lease, and
+//! taking one would fence the running control plane out of its own
+//! deployment. See `fleet.rs`.
 
 mod app;
+mod fleet;
 mod host;
 mod install;
 mod libvirt;
+mod role;
 mod run;
 mod systemd;
 mod ui;
@@ -26,7 +34,7 @@ use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use app::{App, Key, Outcome, REFRESH_INTERVAL};
-use install::{DEFAULT_BINARY, DEFAULT_CONFIG, Paths, UNIT_DIR};
+use install::{DEFAULT_BINARY, DEFAULT_CONFIG, DEFAULT_MONITOR, Paths, UNIT_DIR};
 use run::Cmd;
 
 fn main() {
@@ -191,6 +199,7 @@ struct Options {
 fn parse_args(args: Vec<OsString>) -> Result<Option<Options>, String> {
     let mut config = PathBuf::from(DEFAULT_CONFIG);
     let mut binary = PathBuf::from(DEFAULT_BINARY);
+    let mut monitor = PathBuf::from(DEFAULT_MONITOR);
     let mut source: Option<PathBuf> = None;
     let mut iter = args.into_iter();
     while let Some(arg) = iter.next() {
@@ -214,6 +223,7 @@ fn parse_args(args: Vec<OsString>) -> Result<Option<Options>, String> {
         match name.as_str() {
             "-config" | "--config" => config = PathBuf::from(value()?),
             "-binary" | "--binary" => binary = PathBuf::from(value()?),
+            "-monitor" | "--monitor" => monitor = PathBuf::from(value()?),
             "-source" | "--source" => source = Some(PathBuf::from(value()?)),
             other => return Err(format!("flag provided but not defined: {other}")),
         }
@@ -231,6 +241,7 @@ fn parse_args(args: Vec<OsString>) -> Result<Option<Options>, String> {
     Ok(Some(Options {
         paths: Paths {
             binary,
+            monitor,
             config,
             unit_dir: PathBuf::from(UNIT_DIR),
             // The configuration moves these when it loads (`App::refresh`).
@@ -263,6 +274,10 @@ fn usage(writer: &mut dyn Write) {
     );
     let _ = writeln!(
         writer,
+        "  -monitor string\n    \tpath this binary is installed at (default \"{DEFAULT_MONITOR}\")"
+    );
+    let _ = writeln!(
+        writer,
         "  -source string\n    \tthe Bento source tree to build and copy from\n    \t(default: the tree the working directory is in)"
     );
 }
@@ -280,16 +295,27 @@ mod tests {
         let options = parse(&[]).expect("parse").expect("options");
         assert_eq!(options.paths.config, PathBuf::from("/etc/bento/bento.toml"));
         assert_eq!(options.paths.binary, PathBuf::from("/usr/local/bin/bentod"));
+        assert_eq!(
+            options.paths.monitor,
+            PathBuf::from("/usr/local/bin/bento-monitor")
+        );
         assert_eq!(options.paths.unit_dir, PathBuf::from("/etc/systemd/system"));
     }
 
     #[test]
     fn a_flag_takes_its_value_after_a_space_or_an_equals_sign() {
-        let options = parse(&["--config", "/srv/a.toml", "-binary=/opt/bentod"])
-            .expect("parse")
-            .expect("options");
+        let options = parse(&[
+            "--config",
+            "/srv/a.toml",
+            "-binary=/opt/bentod",
+            "--monitor",
+            "/opt/bento-monitor",
+        ])
+        .expect("parse")
+        .expect("options");
         assert_eq!(options.paths.config, PathBuf::from("/srv/a.toml"));
         assert_eq!(options.paths.binary, PathBuf::from("/opt/bentod"));
+        assert_eq!(options.paths.monitor, PathBuf::from("/opt/bento-monitor"));
     }
 
     #[test]
@@ -329,7 +355,7 @@ mod tests {
         let mut text = Vec::new();
         usage(&mut text);
         let text = String::from_utf8(text).expect("utf-8");
-        for flag in ["-config", "-binary", "-source"] {
+        for flag in ["-config", "-binary", "-monitor", "-source"] {
             assert!(text.contains(flag), "{text}");
         }
     }

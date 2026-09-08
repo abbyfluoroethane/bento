@@ -123,6 +123,10 @@ pub struct UnitStatus {
     pub result: String,
     /// Microseconds since boot at which the unit went active.
     pub active_since_monotonic: Option<u64>,
+    /// Whether this machine's role runs this unit (MULTI-NODE 19). A
+    /// unit that is not wanted here is still shown, because one left
+    /// running on a machine that should not have it is worth seeing.
+    pub wanted: bool,
 }
 
 impl UnitStatus {
