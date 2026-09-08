@@ -450,8 +450,13 @@ impl SamplerTask {
                 o.storage_total_gib.unwrap_or_default(),
             )
         });
-        self.sampler
-            .record_known(host.id, &host.name, cpu_count, memory_total_mib, storage_total_gib);
+        self.sampler.record_known(
+            host.id,
+            &host.name,
+            cpu_count,
+            memory_total_mib,
+            storage_total_gib,
+        );
     }
 }
 
@@ -647,7 +652,14 @@ mod tests {
         let t = now();
         sampler.record_instance("uuid-a", 1, HOST, &sample(90_000_000_000, 2, None), 0.0, t);
         // The domain restarted, so its cumulative counter went backwards.
-        sampler.record_instance("uuid-a", 1, HOST, &sample(5_000_000_000, 2, None), 0.0, t + 30);
+        sampler.record_instance(
+            "uuid-a",
+            1,
+            HOST,
+            &sample(5_000_000_000, 2, None),
+            0.0,
+            t + 30,
+        );
         let metrics = sampler
             .instance("uuid-a", Duration::from_secs(3600))
             .await
@@ -658,7 +670,14 @@ mod tests {
             metrics.cpu_pct
         );
         // The next reading measures from the new baseline.
-        sampler.record_instance("uuid-a", 1, HOST, &sample(35_000_000_000, 2, None), 0.0, t + 60);
+        sampler.record_instance(
+            "uuid-a",
+            1,
+            HOST,
+            &sample(35_000_000_000, 2, None),
+            0.0,
+            t + 60,
+        );
         let metrics = sampler
             .instance("uuid-a", Duration::from_secs(3600))
             .await
@@ -672,7 +691,14 @@ mod tests {
         let sampler = sampler();
         let t = now();
         sampler.record_instance("uuid-a", 1, HOST, &sample(0, 1, None), 0.0, t);
-        sampler.record_instance("uuid-a", 1, HOST, &sample(15_000_000_000, 1, None), 0.0, t + 30);
+        sampler.record_instance(
+            "uuid-a",
+            1,
+            HOST,
+            &sample(15_000_000_000, 1, None),
+            0.0,
+            t + 30,
+        );
         let metrics = sampler
             .instance("uuid-a", Duration::from_secs(3600))
             .await
