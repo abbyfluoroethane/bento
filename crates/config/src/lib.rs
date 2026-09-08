@@ -1092,10 +1092,9 @@ endpoint = "http://10.0.0.97:10443"
     fn instance_domain_defaults_to_the_base_domain() {
         let cfg = Config::parse(r#"base_domain = "bento.example.org""#).unwrap();
         assert_eq!(cfg.instance_domain, "bento.example.org");
-        let split = Config::parse(
-            "base_domain = \"bento.example.org\"\ninstance_domain = \"example.org\"",
-        )
-        .unwrap();
+        let split =
+            Config::parse("base_domain = \"bento.example.org\"\ninstance_domain = \"example.org\"")
+                .unwrap();
         assert_eq!(split.instance_domain, "example.org");
         parse_err(
             "base_domain = \"b.example\"\ninstance_domain = \"*.example\"",
@@ -1110,10 +1109,9 @@ endpoint = "http://10.0.0.97:10443"
         let single = Config::parse(r#"base_domain = "bento.example.org""#).unwrap();
         assert_eq!(single.reserved(), vec!["www", "bento"]);
 
-        let split = Config::parse(
-            "base_domain = \"bento.example.org\"\ninstance_domain = \"example.org\"",
-        )
-        .unwrap();
+        let split =
+            Config::parse("base_domain = \"bento.example.org\"\ninstance_domain = \"example.org\"")
+                .unwrap();
         // `bento` is already in the default list, so it is not repeated.
         assert_eq!(split.reserved(), vec!["www", "bento"]);
 
@@ -1131,10 +1129,8 @@ endpoint = "http://10.0.0.97:10443"
         assert!(deep.reserved().is_empty());
 
         // An operator can clear the list entirely.
-        let none = Config::parse(
-            "base_domain = \"bento.example.org\"\nreserved_names = []",
-        )
-        .unwrap();
+        let none =
+            Config::parse("base_domain = \"bento.example.org\"\nreserved_names = []").unwrap();
         assert!(none.reserved().is_empty());
     }
 
