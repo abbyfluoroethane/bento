@@ -139,7 +139,10 @@ async fn home_draws_every_machine_and_counts_each_ones_own_guests() {
     // Capacity belongs to a machine. The two fixture guests are on
     // machine 1, so machine 12 must read as empty rather than inherit
     // the deployment total (SPEC 6.1).
-    assert!(body.contains("3 GiB of 8 GiB"), "machine 1 holds both guests");
+    assert!(
+        body.contains("3 GiB of 8 GiB"),
+        "machine 1 holds both guests"
+    );
     assert!(body.contains("0 MiB of 32 GiB"), "machine 12 holds none");
     // A ceiling names one machine, so two machines get none: adding
     // them would name a machine that does not exist (MULTI-NODE 20).

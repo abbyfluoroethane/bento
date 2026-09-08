@@ -156,12 +156,9 @@ async fn usage_tiles(
     };
     Ok(vec![
         tile("VMs", usage.instances, None, |n| n.to_string()),
-        tile(
-            "vCPU",
-            usage.vcpu,
-            host.map(|host| host.cpu_count),
-            |n| n.to_string(),
-        ),
+        tile("vCPU", usage.vcpu, host.map(|host| host.cpu_count), |n| {
+            n.to_string()
+        }),
         tile(
             "Memory",
             usage.memory_mib,
