@@ -117,6 +117,7 @@ where
 /// control plane and tests.
 pub struct ProxyBuilder {
     base_domain: String,
+    instance_domain: Option<String>,
     instances: Arc<dyn InstanceSource>,
     sessions: Option<Arc<dyn SessionChecker>>,
     control: Option<ControlHandler>,
@@ -129,6 +130,14 @@ pub struct ProxyBuilder {
 }
 
 impl ProxyBuilder {
+    /// Sets the domain instances publish under (SPEC 7.1). An empty value
+    /// or an absent call leaves it equal to the base domain, which is what a
+    /// single-domain deployment wants.
+    pub fn with_instance_domain(mut self, domain: impl Into<String>) -> Self {
+        self.instance_domain = Some(domain.into());
+        self
+    }
+
     /// Supplies the per-request authorization implementation.
     pub fn with_sessions(mut self, sessions: Arc<dyn SessionChecker>) -> Self {
         self.sessions = Some(sessions);
@@ -208,8 +217,13 @@ impl ProxyBuilder {
         let login_url = self
             .login_url
             .unwrap_or_else(|| format!("https://{base_domain}/login"));
+        let instance_domain = self
+            .instance_domain
+            .filter(|domain| !domain.is_empty())
+            .unwrap_or_else(|| base_domain.clone());
         Ok(Proxy {
             base_domain,
+            instance_domain,
             instances: self.instances,
             sessions: self.sessions,
             control: self.control,
@@ -226,6 +240,7 @@ impl ProxyBuilder {
 /// Hostname router and streaming reverse proxy.
 pub struct Proxy {
     base_domain: String,
+    instance_domain: String,
     instances: Arc<dyn InstanceSource>,
     sessions: Option<Arc<dyn SessionChecker>>,
     control: Option<ControlHandler>,
@@ -239,13 +254,15 @@ pub struct Proxy {
 
 impl Proxy {
     /// Starts a builder. Requests for `base_domain` go to the configured
-    /// control handler; `<name>.<base_domain>` resolves through `instances`.
+    /// control handler; `<name>.<instance domain>` resolves through
+    /// `instances`. The instance domain defaults to `base_domain`.
     pub fn builder(
         base_domain: impl Into<String>,
         instances: Arc<dyn InstanceSource>,
     ) -> ProxyBuilder {
         ProxyBuilder {
             base_domain: base_domain.into(),
+            instance_domain: None,
             instances,
             sessions: None,
             control: None,
@@ -291,6 +308,10 @@ impl Proxy {
     ) -> Response<ProxyBody> {
         let host = request_host(&request, server_name);
 
+        // The base domain is tested first because it can itself be a name
+        // under the instance domain, as `bento.foid.space` is under
+        // `foid.space`. Reversing these two would route the control plane to
+        // an instance lookup (SPEC 9).
         if host == self.base_domain {
             // The control plane answers only on the main port. The high
             // ports bind nothing for the base domain.
@@ -302,7 +323,7 @@ impl Proxy {
             return pages::not_found();
         }
 
-        let Some(name) = host.strip_suffix(&format!(".{}", self.base_domain)) else {
+        let Some(name) = host.strip_suffix(&format!(".{}", self.instance_domain)) else {
             return pages::not_found();
         };
         if name.is_empty() || name.contains('.') {

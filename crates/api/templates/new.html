@@ -12,7 +12,7 @@
     <label for="name">VM name</label>
     <div class="name-field">
       <input class="input mono" id="name" name="name" value="{{ form.name }}" placeholder="machine-name" pattern="[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?" required autofocus autocomplete="off">
-      <span class="suffix">.{{ base_domain }}</span>
+      <span class="suffix">.{{ instance_domain }}</span>
     </div>
     <p class="hint">Lower-case letters, digits, and hyphens.</p>
   </div>
@@ -50,7 +50,7 @@
   </div>
   <div>
     <label class="switch-row" for="public">
-      <span class="text"><b>Make VM public</b><span>When enabled, users can visit <span class="mono" data-name-preview>{{ form.name or "machine-name" }}</span>.{{ base_domain }} without authentication.</span></span>
+      <span class="text"><b>Make VM public</b><span>When enabled, users can visit <span class="mono" data-name-preview>{{ form.name or "machine-name" }}</span>.{{ instance_domain }} without authentication.</span></span>
       <input class="input" type="checkbox" role="switch" id="public" name="public"{% if form.public %} checked{% endif %}>
     </label>
     <label class="switch-row" for="ksm">

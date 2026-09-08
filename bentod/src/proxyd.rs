@@ -44,6 +44,7 @@ async fn proxy_inner(app: &App) -> Result<()> {
         }
         let manager = bento_tlscert::new(bento_tlscert::Config {
             base_domain: app.cfg.base_domain.clone(),
+            instance_domain: app.cfg.instance_domain.clone(),
             email: app.cfg.acme.email.clone(),
             provider: Some(bento_tlscert::cloudflare(&app.cfg.acme.cloudflare_token)),
             storage_dir: Path::new(&app.cfg.db_path)
@@ -70,6 +71,7 @@ async fn proxy_inner(app: &App) -> Result<()> {
     });
     let proxy = Arc::new(
         bento_proxy::Proxy::builder(&app.cfg.base_domain, source.clone())
+            .with_instance_domain(&app.cfg.instance_domain)
             .with_sessions(sessions)
             .with_last_seen(source)
             .with_control(control_proxy(&control)?)

@@ -122,11 +122,27 @@ pub trait TokenStore: Send + Sync {
     async fn delete_token(&self, id: i64) -> std::result::Result<(), BoxError>;
 }
 
+/// Whether a name belongs to an instance. The post-login redirect needs
+/// this: the instance domain can hold names that point at another host, so a
+/// suffix test alone would let the login flow bounce a user off-site
+/// (SPEC 13).
+#[async_trait]
+pub trait InstanceNames: Send + Sync {
+    /// Whether an instance of this name exists. An error reads as "no".
+    async fn exists(&self, name: &str) -> bool;
+}
+
 type Clock = Arc<dyn Fn() -> OffsetDateTime + Send + Sync>;
 
 /// Ties sessions, OIDC login, authorization, and API tokens together.
 pub struct Service {
     base_domain: String,
+    /// The domain instances publish under (SPEC 7.1). Equal to
+    /// `base_domain` unless the operator splits them.
+    instance_domain: String,
+    /// Resolves a label to an instance for the redirect check. `None`
+    /// refuses every host but the base domain.
+    instance_names: Option<Arc<dyn InstanceNames>>,
     sessions: Arc<dyn SessionStore>,
     users: Arc<dyn UserStore>,
     access: Arc<dyn AccessStore>,
@@ -162,11 +178,14 @@ impl Service {
         access: Arc<dyn AccessStore>,
         tokens: Arc<dyn TokenStore>,
     ) -> Self {
+        let base_domain = base_domain
+            .into()
+            .trim_end_matches('.')
+            .to_ascii_lowercase();
         Self {
-            base_domain: base_domain
-                .into()
-                .trim_end_matches('.')
-                .to_ascii_lowercase(),
+            instance_domain: base_domain.clone(),
+            instance_names: None,
+            base_domain,
             sessions: Arc::new(MemorySessionStore::new()),
             users,
             access,
@@ -249,6 +268,23 @@ impl Service {
 
     /// Injects the pairing store that backs the SSH key-linking page.
     #[must_use]
+    /// Sets the domain instances publish under (SPEC 7.1). An empty value
+    /// leaves it equal to the base domain.
+    pub fn with_instance_domain(mut self, domain: impl Into<String>) -> Self {
+        let domain = domain.into().trim_end_matches('.').to_ascii_lowercase();
+        if !domain.is_empty() {
+            self.instance_domain = domain;
+        }
+        self
+    }
+
+    /// Supplies the instance lookup the post-login redirect check needs
+    /// (SPEC 13).
+    pub fn with_instance_names(mut self, names: Arc<dyn InstanceNames>) -> Self {
+        self.instance_names = Some(names);
+        self
+    }
+
     pub fn with_pairings(mut self, pairings: Arc<dyn PairingStore>) -> Self {
         self.pairings = Some(pairings);
         self

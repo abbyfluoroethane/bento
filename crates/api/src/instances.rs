@@ -217,6 +217,9 @@ pub(crate) async fn create_instance(
     if !valid_name(&request.name) {
         return error_response(StatusCode::BAD_REQUEST, BAD_NAME);
     }
+    if bento_types::is_reserved(&request.name, &state.0.reserved_names) {
+        return crate::reserved_response(&request.name);
+    }
     if request.image.is_empty() {
         return error_response(StatusCode::BAD_REQUEST, "image is required");
     }
@@ -358,6 +361,9 @@ pub(crate) async fn rename_instance(
     };
     if !valid_name(&request.new_name) {
         return error_response(StatusCode::BAD_REQUEST, BAD_NAME);
+    }
+    if bento_types::is_reserved(&request.new_name, &state.0.reserved_names) {
+        return crate::reserved_response(&request.new_name);
     }
     match state
         .0

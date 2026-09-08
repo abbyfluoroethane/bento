@@ -493,6 +493,36 @@ pub struct Token {
     pub expires_at: OffsetDateTime,
 }
 
+/// The shape rule for an instance name (SPEC 7.2).
+///
+/// A name is one DNS label: lower-case letters, digits, and inner hyphens,
+/// 1 to 63 characters. The name becomes a host name and an SSH user name,
+/// so both ends must be alphanumeric.
+pub fn valid_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    let label_char = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
+    !bytes.is_empty()
+        && bytes.len() <= 63
+        && label_char(bytes[0])
+        && label_char(bytes[bytes.len() - 1])
+        && bytes.iter().all(|byte| label_char(*byte) || *byte == b'-')
+}
+
+/// Whether `name` is reserved and so cannot become an instance name
+/// (SPEC 7.4). Both a create and a rename consult this.
+pub fn is_reserved(name: &str, reserved: &[String]) -> bool {
+    reserved.iter().any(|entry| entry == name)
+}
+
+/// The refusal text for a name that breaks the shape rule.
+pub const BAD_NAME: &str =
+    "instance name must be a DNS label: lower-case letters, digits, and hyphens, up to 63 characters";
+
+/// The refusal text for a reserved name (SPEC 7.4).
+pub fn reserved_name_message(name: &str) -> String {
+    format!("the name {name:?} is reserved")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -526,5 +556,25 @@ mod tests {
     #[test]
     fn visibility_defaults_to_off() {
         assert_eq!(Visibility::default(), Visibility::Off);
+    }
+
+    #[test]
+    fn name_shape_rule() {
+        for name in ["a", "a1", "web", "my-vm", "x9", &"a".repeat(63)] {
+            assert!(valid_name(name), "{name} should be valid");
+        }
+        for name in ["", "-a", "a-", "A", "a_b", "a.b", &"a".repeat(64)] {
+            assert!(!valid_name(name), "{name:?} should be refused");
+        }
+    }
+
+    #[test]
+    fn reserved_lookup_is_exact() {
+        let reserved = vec!["www".to_string(), "bento".to_string()];
+        assert!(is_reserved("www", &reserved));
+        assert!(is_reserved("bento", &reserved));
+        assert!(!is_reserved("wwwx", &reserved));
+        assert!(!is_reserved("web", &reserved));
+        assert!(!is_reserved("", &reserved));
     }
 }

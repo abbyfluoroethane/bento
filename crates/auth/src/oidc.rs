@@ -628,8 +628,10 @@ impl Service {
                 );
             }
         };
-        let next = cookie_value(headers, NEXT_COOKIE_NAME)
-            .map_or_else(|| "/".to_string(), |next| self.safe_next(&next));
+        let next = match cookie_value(headers, NEXT_COOKIE_NAME) {
+            Some(next) => self.checked_next(&next).await,
+            None => "/".to_string(),
+        };
         let mut response = redirect_response(&next);
         append_cookie(&mut response, flow_cookie(STATE_COOKIE_NAME, ""));
         append_cookie(&mut response, flow_cookie(NONCE_COOKIE_NAME, ""));
@@ -671,10 +673,41 @@ impl Service {
         else {
             return "/".into();
         };
-        if host == self.base_domain || host.ends_with(&format!(".{}", self.base_domain)) {
-            next.into()
-        } else {
-            "/".into()
+        if host == self.base_domain {
+            return next.into();
+        }
+        // Exactly one label under the instance domain. A deeper name is not
+        // an instance, and the proxy would not route it either (SPEC 9).
+        match host.strip_suffix(&format!(".{}", self.instance_domain)) {
+            Some(label) if !label.contains('.') && bento_types::valid_name(label) => next.into(),
+            _ => "/".into(),
+        }
+    }
+
+    /// The post-login redirect. `safe_next` settles the shape; this also
+    /// requires that a host under the instance domain names a real instance.
+    /// The instance domain can hold names that point at another host, so the
+    /// suffix test alone would leave an open redirect (SPEC 13).
+    async fn checked_next(&self, next: &str) -> String {
+        let next = self.safe_next(next);
+        if next.starts_with('/') {
+            return next;
+        }
+        let host = Url::parse(&next)
+            .ok()
+            .and_then(|url| url.host_str().map(|h| h.trim_end_matches('.').to_ascii_lowercase()));
+        let Some(host) = host else {
+            return "/".into();
+        };
+        if host == self.base_domain {
+            return next;
+        }
+        let Some(label) = host.strip_suffix(&format!(".{}", self.instance_domain)) else {
+            return "/".into();
+        };
+        match &self.instance_names {
+            Some(names) if names.exists(label).await => next,
+            _ => "/".into(),
         }
     }
 }
@@ -1122,6 +1155,55 @@ mod tests {
         ] {
             assert_eq!(service.safe_next(input), expected);
         }
+    }
+
+    /// A host under the instance domain is allowed only when it names a real
+    /// instance. The zone can hold names that point elsewhere (SPEC 13).
+    #[tokio::test]
+    async fn checked_next_requires_a_real_instance() {
+        use crate::test_support::FakeInstanceNames;
+        let TestOidc { service, .. } = new_oidc_service();
+        let service = service
+            .with_instance_domain("foid.space")
+            .with_instance_names(FakeInstanceNames::with(&["web"]));
+
+        // A real instance under the instance domain is kept.
+        assert_eq!(
+            service.checked_next("https://web.foid.space/admin").await,
+            "https://web.foid.space/admin"
+        );
+        // A name in the zone that is not an instance is refused, even though
+        // it passes the suffix test. This is the open redirect.
+        assert_eq!(service.checked_next("https://updog.foid.space/").await, "/");
+        // The control plane is always allowed.
+        assert_eq!(
+            service.checked_next("https://bento.example.org/instances").await,
+            "https://bento.example.org/instances"
+        );
+        // Relative paths are untouched.
+        assert_eq!(service.checked_next("/instances/web").await, "/instances/web");
+        // Off-domain and deeper names stay refused.
+        for input in [
+            "https://evil.example.com/",
+            "https://a.b.foid.space/",
+            "http://web.foid.space/",
+        ] {
+            assert_eq!(service.checked_next(input).await, "/", "{input}");
+        }
+    }
+
+    /// Without an instance lookup wired, only the control plane is allowed.
+    #[tokio::test]
+    async fn checked_next_without_a_lookup_allows_only_the_base_domain() {
+        let TestOidc { service, .. } = new_oidc_service();
+        assert_eq!(
+            service.checked_next("https://bento.example.org/x").await,
+            "https://bento.example.org/x"
+        );
+        assert_eq!(
+            service.checked_next("https://web.bento.example.org/").await,
+            "/"
+        );
     }
 
     #[tokio::test]

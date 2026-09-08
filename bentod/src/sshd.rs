@@ -74,6 +74,8 @@ async fn sshd_inner(app: &App) -> Result<()> {
             lifecycle,
             bento_cli::Options {
                 domain: app.cfg.base_domain.clone(),
+                instance_domain: app.cfg.instance_domain.clone(),
+                reserved_names: app.cfg.reserved(),
                 default_image: default_image(&app.cfg),
                 default_vcpu: app.cfg.defaults.vcpu,
                 default_memory_mib: app.cfg.defaults.memory_mib,

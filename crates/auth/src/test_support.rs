@@ -7,8 +7,8 @@ use bento_types::{Pairing, Token, User};
 use time::{Duration, OffsetDateTime, macros::datetime};
 
 use crate::{
-    AccessStore, BoxError, Claims, Exchanger, NewAccount, PairingStore, Provisioner, Service,
-    TokenLookup, TokenStore, UserStore, Verifier,
+    AccessStore, BoxError, Claims, Exchanger, InstanceNames, NewAccount, PairingStore, Provisioner,
+    Service, TokenLookup, TokenStore, UserStore, Verifier,
 };
 
 pub(crate) const TEST_EPOCH: OffsetDateTime = datetime!(2026-08-10 12:00 UTC);
@@ -429,5 +429,22 @@ fn build_oidc_service(signups: bool) -> TestOidc {
         exchanger,
         verifier,
         provisioner,
+    }
+}
+
+/// The instance names the redirect check consults (SPEC 13).
+#[derive(Default)]
+pub(crate) struct FakeInstanceNames(HashSet<String>);
+
+impl FakeInstanceNames {
+    pub(crate) fn with(names: &[&str]) -> Arc<Self> {
+        Arc::new(Self(names.iter().map(|n| (*n).to_string()).collect()))
+    }
+}
+
+#[async_trait]
+impl InstanceNames for FakeInstanceNames {
+    async fn exists(&self, name: &str) -> bool {
+        self.0.contains(name)
     }
 }

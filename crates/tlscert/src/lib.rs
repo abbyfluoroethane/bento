@@ -127,6 +127,9 @@ pub fn cloudflare(api_token: impl Into<String>) -> Arc<dyn DnsProvider> {
 
 /// Configures the wildcard certificate manager (SPEC section 8).
 pub struct Config {
+    /// The domain instances publish under, such as `foid.space`. Empty
+    /// means the same as `base_domain` (SPEC 7.1).
+    pub instance_domain: String,
     /// The deployment domain, such as `bento.foid.space`. The certificate
     /// covers it and its direct wildcard.
     pub base_domain: String,
@@ -223,10 +226,26 @@ impl CancellationToken {
     }
 }
 
-/// Returns the certificate's subject set: the base domain itself and its
-/// direct wildcard. There are never per-instance certificates (SPEC 8).
-pub fn domains(base_domain: &str) -> Vec<String> {
-    vec![base_domain.to_string(), format!("*.{base_domain}")]
+/// Returns the certificate's subject set: the base domain and the wildcard
+/// under the instance domain. There are never per-instance certificates
+/// (SPEC 8).
+///
+/// A wildcard covers one label, so `*.foid.space` does not cover
+/// `web.bento.foid.space`. When the base domain does not sit directly under
+/// the instance domain, its own wildcard is added as well. When the two
+/// domains are equal this returns the single-domain pair unchanged.
+pub fn domains(base_domain: &str, instance_domain: &str) -> Vec<String> {
+    let mut subjects = vec![base_domain.to_string(), format!("*.{instance_domain}")];
+    let nested = base_domain
+        .strip_suffix(&format!(".{instance_domain}"))
+        .is_some_and(|label| !label.is_empty() && !label.contains('.'));
+    if !nested {
+        let wildcard = format!("*.{base_domain}");
+        if !subjects.contains(&wildcard) {
+            subjects.push(wildcard);
+        }
+    }
+    subjects
 }
 
 /// Owns the wildcard certificate, updates a live rustls resolver on renewal,
@@ -292,6 +311,22 @@ impl Manager {
                 config.base_domain
             )));
         }
+        let instance_domain = {
+            let domain = config
+                .instance_domain
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            if domain.is_empty() {
+                base_domain.clone()
+            } else if domain.contains(['*', '/', ' ']) || domain.starts_with('.') {
+                return Err(Error::Invalid(format!(
+                    "tlscert: instance domain {:?} must be a bare domain",
+                    config.instance_domain
+                )));
+            } else {
+                domain
+            }
+        };
         let provider = config
             .provider
             .ok_or_else(|| Error::Invalid("tlscert: DNS provider is nil".to_string()))?;
@@ -318,7 +353,7 @@ impl Manager {
 
         Ok(Self {
             inner: Arc::new(ManagerInner {
-                domains: domains(&base_domain),
+                domains: domains(&base_domain, &instance_domain),
                 base_domain,
                 email: config.email,
                 provider,
@@ -662,6 +697,34 @@ fn make_tls_config(resolver: Arc<LiveResolver>) -> Result<ServerConfig, Error> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The subject set follows the instance domain (SPEC 8).
+    #[test]
+    fn subject_set_follows_the_instance_domain() {
+        // A single-domain deployment is unchanged.
+        assert_eq!(
+            domains("bento.example.org", "bento.example.org"),
+            vec!["bento.example.org", "*.bento.example.org"]
+        );
+        // One label under the instance domain: its wildcard already covers
+        // the base domain, so no third subject is needed.
+        assert_eq!(
+            domains("bento.example.org", "example.org"),
+            vec!["bento.example.org", "*.example.org"]
+        );
+        // Unrelated domains need both wildcards, because a wildcard covers
+        // exactly one label.
+        assert_eq!(
+            domains("bento.example.org", "example.net"),
+            vec!["bento.example.org", "*.example.net", "*.bento.example.org"]
+        );
+        // Two labels down is not "directly under", so the base domain keeps
+        // its own wildcard.
+        assert_eq!(
+            domains("a.b.example.org", "example.org"),
+            vec!["a.b.example.org", "*.example.org", "*.a.b.example.org"]
+        );
+    }
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::time::Duration;
@@ -706,6 +769,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let config = Config {
             base_domain: "bento.example.org".to_string(),
+            instance_domain: String::new(),
             email: "operator@example.org".to_string(),
             provider: Some(Arc::new(FakeProvider)),
             storage_dir: directory.path().to_path_buf(),
@@ -718,7 +782,7 @@ mod tests {
     #[test]
     fn domain_set_is_apex_and_direct_wildcard() {
         assert_eq!(
-            domains("bento.example.org"),
+            domains("bento.example.org", "bento.example.org"),
             ["bento.example.org", "*.bento.example.org"]
         );
     }
@@ -817,7 +881,7 @@ mod tests {
     async fn restart_loads_persisted_certificate_without_issuance() {
         let (directory, config) = valid_config();
         let key = KeyPair::generate().unwrap();
-        let mut params = CertificateParams::new(domains("bento.example.org")).unwrap();
+        let mut params = CertificateParams::new(domains("bento.example.org", "bento.example.org")).unwrap();
         params.not_after = date_time_ymd(2031, 7, 8);
         let certificate = params.self_signed(&key).unwrap();
         storage::atomic_write(

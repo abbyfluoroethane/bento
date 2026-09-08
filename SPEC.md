@@ -22,14 +22,15 @@ Bento calls libvirt. Bento implements the parts that libvirt does not provide. T
 | the SSH frontend | The component that accepts SSH connections and forwards them to an instance. |
 | an image | A named entry in the operator allowlist, such as `debian-13`. |
 | an image version | One downloaded file for an image. A checksum identifies an image version. |
-| the base domain | The domain that the operator chooses. This document uses `bento.foid.space`. |
+| the base domain | The domain of the control plane. The dashboard, the SSH frontend, and the OIDC callback use this domain. This document uses `bento.foid.space`. |
+| the instance domain | The domain that an instance publishes under. This document uses `foid.space`. The instance domain defaults to the base domain. |
 
 ## 2. Scope
 
 Bento version 1 does the following:
 
 - Create, list, start, stop, resize, and delete instances on one host.
-- Publish an instance at `$NAME.bento.foid.space` over HTTPS when the user asks for it.
+- Publish an instance at `$NAME.foid.space` over HTTPS when the user asks for it.
 - Accept SSH connections to each instance through one public port.
 - Support more than one user.
 - Give each user a private network and a fixed address range.
@@ -280,12 +281,18 @@ Reload the whole table on every change. A partial rule update leaves a period wi
 
 Create these DNS records:
 
-1. Create an `A` record for `bento.foid.space` that points to the host.
-2. Create an `A` record for `*.bento.foid.space` that points to the host.
+1. Create an `A` record for the base domain that points to the host.
+2. Create an `A` record for `*.foid.space` that points to the host.
+
+Create a third record when the instance domain is not the parent of the base domain:
+
+3. Create an `A` record for `*.bento.foid.space` that points to the host.
 
 IPv6 is not in version 1.
 
 Every name resolves to the same address, so a stale DNS cache never sends a request to the wrong machine. The HTTP proxy resolves the name to an instance on every request.
+
+The operator can set the instance domain to a parent of the base domain. `bento.foid.space` and `foid.space` are such a pair. The apex of the instance domain stays free in this arrangement. Bento answers the base domain and each instance name. Bento does not answer the apex.
 
 ### 7.2 The name lifecycle
 
@@ -317,9 +324,22 @@ The `rename` command is allowed on an instance with any visibility value. The co
 
 The old name enters the cooldown in section 7.2.
 
+### 7.4 Reserved names
+
+A reserved name cannot become an instance name. A create and a rename both refuse a reserved name. One rule decides the reserved set, and the control plane applies the same rule at every entry point.
+
+Reserve these names:
+
+1. Reserve the first label of the base domain when the base domain sits one label under the instance domain. This label already routes to the control plane, so an instance of that name is unreachable.
+2. Reserve every name in the operator `reserved_names` setting. An operator uses this setting for a name that the DNS zone already answers.
+
+The default of `reserved_names` holds `www` and `bento`.
+
+A reserved name is public knowledge, so the refusal states the reason. Section 9.2 requires that an `off` instance and a name that does not exist give the same response. A reserved name is neither, so this refusal does not weaken that rule.
+
 ## 8. TLS
 
-Get one wildcard certificate for `*.bento.foid.space` and `bento.foid.space`. Use the ACME DNS-01 challenge. A wildcard certificate requires the DNS-01 challenge.
+Get one wildcard certificate for `*.foid.space` and the base domain. Add `*.bento.foid.space` when the instance domain is not the parent of the base domain. Use the ACME DNS-01 challenge. A wildcard certificate requires the DNS-01 challenge.
 
 The first reason is the Certificate Transparency logs. A per-instance certificate publishes the name of every instance to a public log. A wildcard certificate publishes only the base domain.
 
@@ -333,9 +353,9 @@ The control plane needs write access to the DNS zone. Use an API token that is l
 
 The HTTP proxy reads the TLS Server Name Indication field and extracts the instance name. The HTTP proxy then reads the address from the `instances` table. Section 6.2 makes this address known before the instance boots.
 
-Write the proxy in Go with `net/http/httputil.ReverseProxy`.
+A request for the base domain goes to the control plane. The control plane serves the dashboard and the OIDC login flow. The proxy tests the base domain first, because the base domain can itself be a name under the instance domain.
 
-A request for the base domain goes to the control plane. The control plane serves the dashboard and the OIDC login flow.
+A request for `$NAME.foid.space` goes to the instance. The proxy strips the instance domain and reads the remaining label. A name that holds a dot does not resolve.
 
 Set these headers on each forwarded request:
 
@@ -347,9 +367,9 @@ Set these headers on each forwarded request:
 
 Each instance has one default HTTP port. The default value is 80. A user changes the port with the `port` command.
 
-The HTTP proxy also listens on ports 3000 to 9999. A request to `https://$NAME.bento.foid.space:3456/` goes to port 3456 on the instance. The wildcard certificate covers these ports, because the host name does not change.
+The HTTP proxy also listens on ports 3000 to 9999. A request to `https://$NAME.foid.space:3456/` goes to port 3456 on the instance. The wildcard certificate covers these ports, because the host name does not change.
 
-Do not use a name prefix such as `3456-$NAME.bento.foid.space`. This form needs a certificate for `*.*.bento.foid.space`. Such a certificate does not exist.
+Do not use a name prefix such as `3456-$NAME.foid.space`. This form needs a certificate for `*.*.foid.space`. Such a certificate does not exist.
 
 ### 9.2 Visibility
 
@@ -514,6 +534,8 @@ Bento does these three things instead:
 ## 13. Identity
 
 The dashboard uses OIDC. Pocket ID is a suitable provider.
+
+The login flow returns the user to a `next` address. The control plane accepts the base domain, and it accepts a name under the instance domain that matches an instance. The control plane sends every other address to `/`. A wildcard test is not enough here: the instance domain can hold names that point at another host.
 
 OIDC is the only way an account comes into existence. A verified login for a subject no `users` row carries creates that row, deriving the account name from `preferred_username`, then the local part of the email, then the display name, reduced to lowercase letters, digits, and inner hyphens; a taken name is suffixed `-2`, `-3`. Account creation also allocates the subnet and the libvirt network of the user. The identity provider therefore decides who has an account. Setting `allow_signup = false` under `[oidc]` refuses logins from identities that have no row yet, which freezes the user list.
 

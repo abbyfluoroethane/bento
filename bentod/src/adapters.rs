@@ -914,6 +914,17 @@ impl bento_api::Store for ApiStore {
 
 // ---- auth ----
 
+/// Resolves a label to an instance for the post-login redirect check
+/// (SPEC 13). A store error reads as "no such instance", which fails closed.
+pub(crate) struct AuthInstanceNames(pub(crate) Store);
+
+#[async_trait]
+impl bento_auth::InstanceNames for AuthInstanceNames {
+    async fn exists(&self, name: &str) -> bool {
+        self.0.instance_by_name(name).await.is_ok()
+    }
+}
+
 pub(crate) struct AuthUsers(pub(crate) Store);
 
 #[async_trait]

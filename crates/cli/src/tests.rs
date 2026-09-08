@@ -461,6 +461,7 @@ fn fixture() -> (Arc<FakeStore>, Arc<FakeLifecycle>, Cli) {
         lifecycle.clone(),
         Options {
             domain: "bento.example.org".into(),
+            reserved_names: vec!["www".into(), "bento".into()],
             default_image: "debian-13".into(),
             now: Arc::new(test_time),
             ..Options::default()

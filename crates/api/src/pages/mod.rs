@@ -299,7 +299,10 @@ pub(crate) struct UserCtx {
 pub(crate) struct Shell {
     pub(crate) user: UserCtx,
     pub(crate) vms: Vec<SidebarVm>,
+    /// The control plane's domain, for the SSH hints.
     pub(crate) base_domain: String,
+    /// The domain an instance publishes under, for the links (SPEC 7.1).
+    pub(crate) instance_domain: String,
     pub(crate) path: String,
     pub(crate) toast: Option<Toast>,
 }
@@ -368,6 +371,7 @@ pub(crate) async fn shell(
         },
         vms,
         base_domain: state.0.base_domain.clone(),
+        instance_domain: state.0.instance_domain.clone(),
         path: path.to_string(),
         toast: toast_from(params),
     })
@@ -461,10 +465,14 @@ pub(crate) async fn vm_view(state: &AppState, instance: Instance, viewer: &User)
             .map(|user| user.name)
             .unwrap_or_default()
     };
-    let domain = &state.0.base_domain;
+    // The link and the SSH host are different domains once the operator
+    // splits them (SPEC 7.1): an instance publishes under the instance
+    // domain, but the SSH frontend answers on the control plane.
+    let domain = &state.0.instance_domain;
+    let ssh_domain = &state.0.base_domain;
     VmView {
         url: format!("https://{}.{domain}/", instance.name),
-        ssh: format!("ssh {}@{domain}", instance.name),
+        ssh: format!("ssh {}@{ssh_domain}", instance.name),
         uuid: instance.uuid,
         mine: instance.owner_id == viewer.id,
         owner,
@@ -504,14 +512,17 @@ pub(crate) async fn readable_instance(
     }
 }
 
-/// Parses a name the way the API does, with the same message.
-pub(crate) fn checked_name(name: &str) -> Result<String, String> {
+/// Parses a name the way the API does, with the same messages. The JSON and
+/// HTML paths share this so a reserved name is refused at both (SPEC 7.4).
+pub(crate) fn checked_name(name: &str, reserved: &[String]) -> Result<String, String> {
     let name = name.trim();
-    if valid_name(name) {
-        Ok(name.to_string())
-    } else {
-        Err(crate::BAD_NAME.to_string())
+    if !valid_name(name) {
+        return Err(crate::BAD_NAME.to_string());
     }
+    if bento_types::is_reserved(name, reserved) {
+        return Err(bento_types::reserved_name_message(name));
+    }
+    Ok(name.to_string())
 }
 
 /// Form checkboxes arrive as `on` or not at all.

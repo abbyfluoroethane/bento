@@ -34,6 +34,9 @@ pub mod defaults {
     pub const OVERCOMMIT_RATIO: f64 = 1.0;
     /// SPEC 7.2.
     pub const NAME_COOLDOWN: Duration = Duration::from_secs(24 * 3600);
+    /// Names an instance may not take (SPEC 7.4). `bento` and `www` are the
+    /// names a visitor assumes belong to the deployment itself.
+    pub const RESERVED_NAMES: [&str; 2] = ["www", "bento"];
     /// SPEC 11.2.
     pub const RESTORE_BATCH_SIZE: u32 = 4;
     /// Carved into user `/24`s, SPEC 6.2.
@@ -119,8 +122,15 @@ impl TlsMode {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Config {
-    /// The domain the operator owns, e.g. `bento.foid.space`.
+    /// The control plane's domain, e.g. `bento.foid.space`. The dashboard,
+    /// the SSH frontend, and the OIDC callback all answer here (SPEC 1).
     pub base_domain: String,
+    /// The domain an instance publishes under, e.g. `foid.space`. Empty
+    /// means "the same as `base_domain`", which `parse` fills in (SPEC 7.1).
+    pub instance_domain: String,
+    /// Names an instance may not take (SPEC 7.4). The computed reservation
+    /// in `reserved` is applied on top of this list.
+    pub reserved_names: Vec<String>,
     /// The libvirt connection URI.
     pub libvirt_uri: String,
     /// Holds content-addressed image versions (SPEC 5.1).
@@ -351,6 +361,11 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             base_domain: String::new(),
+            instance_domain: String::new(),
+            reserved_names: defaults::RESERVED_NAMES
+                .iter()
+                .map(|name| (*name).to_string())
+                .collect(),
             libvirt_uri: defaults::LIBVIRT_URI.to_string(),
             image_dir: defaults::IMAGE_DIR.to_string(),
             storage_dir: defaults::STORAGE_DIR.to_string(),
@@ -461,9 +476,35 @@ impl Config {
     /// Decodes TOML text, applies defaults for unset values, and
     /// validates the result.
     pub fn parse(data: &str) -> Result<Config, Error> {
-        let cfg: Config = toml::from_str(data)?;
+        let mut cfg: Config = toml::from_str(data)?;
+        // An unset instance domain means the deployment publishes instances
+        // under the control plane's own domain, which is what every
+        // single-domain deployment does (SPEC 7.1).
+        if cfg.instance_domain.is_empty() {
+            cfg.instance_domain.clone_from(&cfg.base_domain);
+        }
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// The names an instance may not take (SPEC 7.4).
+    ///
+    /// The operator list is taken as given. On top of it, a base domain that
+    /// sits one label under the instance domain reserves that label: the
+    /// proxy answers it from the control plane, so an instance of that name
+    /// could never be reached.
+    pub fn reserved(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.reserved_names.clone();
+        if let Some(label) = self
+            .base_domain
+            .strip_suffix(&format!(".{}", self.instance_domain))
+            && !label.is_empty()
+            && !label.contains('.')
+            && !names.iter().any(|name| name == label)
+        {
+            names.push(label.to_string());
+        }
+        names
     }
 
     /// The resolvers to write into an instance's network configuration,
@@ -498,6 +539,17 @@ impl Config {
     fn validate(&self) -> Result<(), Error> {
         if self.base_domain.is_empty() {
             return Err(invalid("base_domain is required"));
+        }
+        if self.instance_domain.is_empty() {
+            return Err(invalid("instance_domain is required"));
+        }
+        for (field, value) in [
+            ("base_domain", &self.base_domain),
+            ("instance_domain", &self.instance_domain),
+        ] {
+            if value.contains(['*', '/', ' ']) {
+                return Err(invalid(format!("{field} must be a domain, got {value:?}")));
+            }
         }
         if self.overcommit_ratio < 1.0 {
             return Err(invalid(format!(
@@ -1034,6 +1086,58 @@ endpoint = "http://10.0.0.97:10443"
 
     /// Signups follow the identity provider unless the operator says
     /// otherwise, so the flag's absence must not read as `false`.
+    /// An unset instance domain follows the base domain, so a single-domain
+    /// deployment is unchanged (SPEC 7.1).
+    #[test]
+    fn instance_domain_defaults_to_the_base_domain() {
+        let cfg = Config::parse(r#"base_domain = "bento.example.org""#).unwrap();
+        assert_eq!(cfg.instance_domain, "bento.example.org");
+        let split = Config::parse(
+            "base_domain = \"bento.example.org\"\ninstance_domain = \"example.org\"",
+        )
+        .unwrap();
+        assert_eq!(split.instance_domain, "example.org");
+        parse_err(
+            "base_domain = \"b.example\"\ninstance_domain = \"*.example\"",
+            "instance_domain must be a domain",
+        );
+    }
+
+    /// The operator list is taken as given; a base domain one label under the
+    /// instance domain reserves that label too (SPEC 7.4).
+    #[test]
+    fn reserved_names_add_the_control_plane_label() {
+        let single = Config::parse(r#"base_domain = "bento.example.org""#).unwrap();
+        assert_eq!(single.reserved(), vec!["www", "bento"]);
+
+        let split = Config::parse(
+            "base_domain = \"bento.example.org\"\ninstance_domain = \"example.org\"",
+        )
+        .unwrap();
+        // `bento` is already in the default list, so it is not repeated.
+        assert_eq!(split.reserved(), vec!["www", "bento"]);
+
+        let other = Config::parse(
+            "base_domain = \"panel.example.org\"\ninstance_domain = \"example.org\"\nreserved_names = []",
+        )
+        .unwrap();
+        assert_eq!(other.reserved(), vec!["panel"]);
+
+        // Two labels down is not the control plane's own label.
+        let deep = Config::parse(
+            "base_domain = \"a.b.example.org\"\ninstance_domain = \"example.org\"\nreserved_names = []",
+        )
+        .unwrap();
+        assert!(deep.reserved().is_empty());
+
+        // An operator can clear the list entirely.
+        let none = Config::parse(
+            "base_domain = \"bento.example.org\"\nreserved_names = []",
+        )
+        .unwrap();
+        assert!(none.reserved().is_empty());
+    }
+
     #[test]
     fn signups_are_open_unless_turned_off() {
         let cfg =

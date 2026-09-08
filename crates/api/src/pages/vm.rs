@@ -394,7 +394,7 @@ pub(crate) async fn save_settings(
         }
     };
 
-    let new_name = match checked_name(&form.name) {
+    let new_name = match checked_name(&form.name, &state.0.reserved_names) {
         Ok(name) => name,
         Err(message) => return fail(message, StatusCode::BAD_REQUEST).await,
     };

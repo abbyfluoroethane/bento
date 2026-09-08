@@ -475,7 +475,7 @@ pub(crate) async fn create(
     Extension(user): Viewer,
     Form(form): Form<NewForm>,
 ) -> Response {
-    let name = match checked_name(&form.name) {
+    let name = match checked_name(&form.name, &state.0.reserved_names) {
         Ok(name) => name,
         Err(message) => {
             return render_new(&state, &user, form, StatusCode::BAD_REQUEST, Some(&message)).await;

@@ -58,9 +58,13 @@ pub struct Config {
 
     /// Resource measurements behind the dashboard charts.
     pub metrics: Arc<dyn Metrics>,
-    /// The deployment's base domain, for the `name.<base_domain>` URLs and
-    /// SSH hints the pages show.
+    /// The control plane's domain, for the SSH hints the pages show.
     pub base_domain: String,
+    /// The domain an instance publishes under, for the `name.<domain>` URLs
+    /// the pages show (SPEC 7.1).
+    pub instance_domain: String,
+    /// Names an instance may not take (SPEC 7.4).
+    pub reserved_names: Vec<String>,
     /// The operator defaults a new instance starts from (SPEC 15 `new`).
     pub defaults: CreateDefaults,
 }
@@ -209,17 +213,17 @@ pub(crate) fn mapped_error(error: BoxError) -> Response {
     error_response(status, message)
 }
 
-pub(crate) fn valid_name(name: &str) -> bool {
-    let bytes = name.as_bytes();
-    let label_char = |byte: u8| byte.is_ascii_lowercase() || byte.is_ascii_digit();
-    !bytes.is_empty()
-        && bytes.len() <= 63
-        && label_char(bytes[0])
-        && label_char(bytes[bytes.len() - 1])
-        && bytes.iter().all(|byte| label_char(*byte) || *byte == b'-')
-}
+pub(crate) use bento_types::{BAD_NAME, valid_name};
 
-pub(crate) const BAD_NAME: &str = "instance name must be a DNS label: lower-case letters, digits, and hyphens, up to 63 characters";
+/// The refusal for a name the operator reserved (SPEC 7.4). A reserved name
+/// has a valid shape, so it needs its own message; `valid_name` cannot
+/// carry the reason.
+pub(crate) fn reserved_response(name: &str) -> axum::response::Response {
+    error_response(
+        StatusCode::BAD_REQUEST,
+        bento_types::reserved_name_message(name),
+    )
+}
 
 pub(crate) fn rfc3339(value: OffsetDateTime) -> String {
     if value == OffsetDateTime::UNIX_EPOCH {

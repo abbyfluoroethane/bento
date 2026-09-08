@@ -195,6 +195,55 @@ async fn base_domain_routing() {
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
+/// The operator can publish instances under a parent of the base domain
+/// (SPEC 7.1). The control plane keeps the base domain, instances answer one
+/// label under the instance domain, and the apex belongs to neither.
+#[tokio::test]
+async fn split_control_and_instance_domains() {
+    let mut instances = HashMap::new();
+    instances.insert("web".to_owned(), running_instance("web", Visibility::Public));
+    let source = Arc::new(FakeSource {
+        instances,
+        error: false,
+    });
+    let control = control_handler(|_| async { Response::new(full_body("control")) });
+    let (transport, _seen) = ok_transport();
+    let proxy = Proxy::builder("bento.foid.space", source)
+        .with_instance_domain("foid.space")
+        .with_control(control)
+        .with_transport(transport)
+        .build()
+        .unwrap();
+
+    // The base domain reaches the control plane even though it is itself a
+    // name under the instance domain.
+    let (status, _, body) = response_parts(
+        proxy
+            .handle(request("bento.foid.space"), DEFAULT_PORT, REMOTE)
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, "control");
+
+    // An instance answers one label under the instance domain.
+    let (status, _, _) = response_parts(
+        proxy
+            .handle(request("web.foid.space"), DEFAULT_PORT, REMOTE)
+            .await,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // The apex is not the base domain and strips to nothing, so Bento does
+    // not answer it. The operator can leave it to another service.
+    for host in ["foid.space", "web.bento.foid.space", "a.b.foid.space"] {
+        let (status, _, _) =
+            response_parts(proxy.handle(request(host), DEFAULT_PORT, REMOTE).await).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{host}");
+    }
+}
+
 /// A name that never existed, a name in release cooldown, an instance with
 /// visibility off, and an invalid nested label produce byte-identical
 /// responses (SPEC 9.2).

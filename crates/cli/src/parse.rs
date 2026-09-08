@@ -2,22 +2,15 @@ use std::time::Duration;
 
 use time::OffsetDateTime;
 
-pub(crate) fn validate_name(name: &str) -> Result<(), String> {
+pub(crate) fn validate_name(name: &str, reserved: &[String]) -> Result<(), String> {
     if name.is_empty() || name.len() > 63 {
         return Err("an instance name has 1 to 63 characters".into());
     }
-    let bytes = name.as_bytes();
-    if (!bytes[0].is_ascii_lowercase() && !bytes[0].is_ascii_digit())
-        || (!bytes[bytes.len() - 1].is_ascii_lowercase()
-            && !bytes[bytes.len() - 1].is_ascii_digit())
-        || !bytes
-            .iter()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
-    {
+    if !bento_types::valid_name(name) {
         return Err("an instance name uses lowercase letters, digits, and inner hyphens".into());
     }
-    if matches!(name, "bento" | "www") {
-        return Err(format!("the name {name:?} is reserved"));
+    if bento_types::is_reserved(name, reserved) {
+        return Err(bento_types::reserved_name_message(name));
     }
     Ok(())
 }
@@ -183,12 +176,22 @@ mod tests {
 
     #[test]
     fn validate_instance_names() {
+        let reserved = vec!["www".to_string(), "bento".to_string()];
         for name in ["web", "my-app-2", "a", "0z"] {
-            assert!(validate_name(name).is_ok(), "{name}");
+            assert!(validate_name(name, &reserved).is_ok(), "{name}");
         }
-        for name in ["", "-web", "web-", "Web", "we_b", "we.b", "bento", "www"] {
-            assert!(validate_name(name).is_err(), "{name}");
+        for name in ["", "-web", "web-", "Web", "we_b", "we.b"] {
+            assert!(validate_name(name, &reserved).is_err(), "{name}");
         }
+        // A reserved name has a valid shape, so it is refused for the other
+        // reason and the message says so (SPEC 7.4).
+        for name in ["bento", "www"] {
+            assert!(bento_types::valid_name(name), "{name} has a valid shape");
+            let error = validate_name(name, &reserved).unwrap_err();
+            assert!(error.contains("reserved"), "{name}: {error}");
+        }
+        // Nothing is reserved when the operator list is empty.
+        assert!(validate_name("bento", &[]).is_ok());
     }
 
     #[test]

@@ -23,7 +23,7 @@ impl Cli {
             return env.usage("new <name> [--image --memory --cpu --disk --nested --no-ksm]");
         }
         let name = &flags.positionals[0];
-        if let Err(error) = validate_name(name) {
+        if let Err(error) = validate_name(name, &self.options.reserved_names) {
             return env.fail_message(error);
         }
         let image = flags
@@ -206,7 +206,7 @@ impl Cli {
         let Some(instance) = self.resolve_owned(env, &old_name).await else {
             return 1;
         };
-        if let Err(error) = validate_name(&new_name) {
+        if let Err(error) = validate_name(&new_name, &self.options.reserved_names) {
             return env.fail_message(error);
         }
         // SPEC 7.3: confirm when visibility is public, stating two facts: the
@@ -250,7 +250,7 @@ impl Cli {
                 source.name, source.state
             ));
         }
-        if let Err(error) = validate_name(&target) {
+        if let Err(error) = validate_name(&target, &self.options.reserved_names) {
             return env.fail_message(error);
         }
         let request = CreateRequest {

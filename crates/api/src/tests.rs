@@ -536,6 +536,8 @@ pub(crate) fn fixture_with_metrics(metrics: Arc<dyn Metrics>) -> Fixture {
         db_path: "/var/lib/bento/bento.db".to_string(),
         metrics,
         base_domain: "bento.example".to_string(),
+        instance_domain: "bento.example".to_string(),
+        reserved_names: vec!["www".to_string(), "bento".to_string()],
         defaults: CreateDefaults {
             vcpu: 2,
             memory_mib: 2048,
@@ -1209,6 +1211,8 @@ async fn database_download_is_a_consistent_operator_only_snapshot() {
         db_path: String::new(),
         metrics: Arc::new(crate::PlaceholderMetrics),
         base_domain: "bento.example".to_string(),
+        instance_domain: "bento.example".to_string(),
+        reserved_names: vec!["www".to_string(), "bento".to_string()],
         defaults: CreateDefaults {
             vcpu: 2,
             memory_mib: 2048,

@@ -37,9 +37,14 @@ pub type OperatorPredicate = Arc<dyn Fn(&User) -> bool + Send + Sync>;
 /// Configuration for the SSH command line interface.
 #[derive(Clone)]
 pub struct Options {
-    /// The base domain, for example `bento.foid.space`. It appears in help
-    /// text, rename confirmations, and visibility messages.
+    /// The control plane's domain, for example `bento.foid.space`. It
+    /// appears in help text, rename confirmations, and SSH hints.
     pub domain: String,
+    /// The domain an instance publishes under, for example `foid.space`.
+    /// Instance URLs in command output use this (SPEC 7.1).
+    pub instance_domain: String,
+    /// Names an instance may not take (SPEC 7.4).
+    pub reserved_names: Vec<String>,
     /// The image `new` uses when `--image` is absent. Empty makes the flag
     /// mandatory.
     pub default_image: String,
@@ -62,6 +67,8 @@ impl Default for Options {
     fn default() -> Self {
         Self {
             domain: String::new(),
+            instance_domain: String::new(),
+            reserved_names: Vec::new(),
             default_image: String::new(),
             default_vcpu: FALLBACK_VCPU,
             default_memory_mib: FALLBACK_MEMORY_MIB,
@@ -75,6 +82,11 @@ impl Default for Options {
 
 impl Options {
     fn with_defaults(mut self) -> Self {
+        // An unset instance domain follows the control plane's own domain,
+        // which is what a single-domain deployment wants (SPEC 7.1).
+        if self.instance_domain.is_empty() {
+            self.instance_domain.clone_from(&self.domain);
+        }
         if self.default_vcpu == 0 {
             self.default_vcpu = FALLBACK_VCPU;
         }

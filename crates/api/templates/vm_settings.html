@@ -19,9 +19,9 @@
     <label for="name">VM name</label>
     <div class="name-field">
       <input class="input mono" id="name" name="name" value="{{ vm.name }}" data-current="{{ vm.name }}" pattern="[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?" required autocomplete="off">
-      <span class="suffix">.{{ base_domain }}</span>
+      <span class="suffix">.{{ instance_domain }}</span>
     </div>
-    <p class="hint">Renaming breaks links to <span class="mono">{{ vm.name }}.{{ base_domain }}</span> and changes the SSH user name.</p>
+    <p class="hint">Renaming breaks links to <span class="mono">{{ vm.name }}.{{ instance_domain }}</span> and changes the SSH user name.</p>
   </div>
   <div class="fields three">
     <div class="stepper">
@@ -43,7 +43,7 @@
   <p class="hint">Takes effect after a restart. The disk can only grow.</p>
   <div>
     <label class="switch-row" for="public">
-      <span class="text"><b>Make VM public</b><span>When enabled, users can visit <span class="mono">{{ vm.name }}.{{ base_domain }}</span> without authentication.</span></span>
+      <span class="text"><b>Make VM public</b><span>When enabled, users can visit <span class="mono">{{ vm.name }}.{{ instance_domain }}</span> without authentication.</span></span>
       <input class="input" type="checkbox" role="switch" id="public" name="public"{% if vm.visibility == "public" %} checked{% endif %}>
     </label>
     <div class="switch-row">
@@ -73,7 +73,7 @@
   <div>
     <header>
       <h2 id="rename-title">Rename {{ vm.name }}?</h2>
-      <p id="rename-desc">Links to <span class="mono">{{ vm.name }}.{{ base_domain }}</span> will break. SSH becomes <span class="mono">ssh <span data-new-name></span>@{{ base_domain }}</span>. The old name is locked for a while.</p>
+      <p id="rename-desc">Links to <span class="mono">{{ vm.name }}.{{ instance_domain }}</span> will break. SSH becomes <span class="mono">ssh <span data-new-name></span>@{{ base_domain }}</span>. The old name is locked for a while.</p>
     </header>
     {% if vm.visibility == "public" %}
     <section>

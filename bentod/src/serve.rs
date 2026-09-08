@@ -20,7 +20,8 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::adapters::{
-    AccountProvisioner, ApiBackend, ApiStore, AuthAccess, AuthPairings, AuthTokens, AuthUsers,
+    AccountProvisioner, ApiBackend, ApiStore, AuthAccess, AuthInstanceNames, AuthPairings,
+    AuthTokens, AuthUsers,
     Authenticator, Backend, NetworkEnsurer, RuntimeImages, access_status, operator_predicate,
     user_network,
 };
@@ -442,6 +443,8 @@ async fn control_plane_router(
         Arc::new(AuthTokens(app.store.clone())),
     )
     .with_pairings(Arc::new(AuthPairings(app.store.clone())))
+    .with_instance_domain(&app.cfg.instance_domain)
+    .with_instance_names(Arc::new(AuthInstanceNames(app.store.clone())))
     .with_provider_name(provider_name(&app.cfg.oidc.issuer));
     if app.cfg.oidc.allow_signup {
         // Wiring the provisioner is what opens signups: without it a login
@@ -487,6 +490,8 @@ async fn control_plane_router(
         db_path: app.cfg.db_path.clone(),
         metrics: sampler,
         base_domain: app.cfg.base_domain.clone(),
+        instance_domain: app.cfg.instance_domain.clone(),
+        reserved_names: app.cfg.reserved(),
         defaults: bento_api::CreateDefaults {
             vcpu: app.cfg.defaults.vcpu,
             memory_mib: app.cfg.defaults.memory_mib,

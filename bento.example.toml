@@ -2,9 +2,23 @@
 # Copy to /etc/bento/bento.toml and edit. See SPEC.md for the meaning of
 # each setting. Commented values show the defaults.
 
-# The domain the operator owns. Instances publish at $NAME.<base_domain>.
-# Required.
+# The control plane's domain: the dashboard, the SSH frontend, and the OIDC
+# callback all answer here (SPEC 1). Required.
 base_domain = "bento.example.org"
+
+# The domain instances publish at, as $NAME.<instance_domain> (SPEC 7.1).
+# The default is base_domain, which is what a single-domain deployment
+# wants. Set it to a parent of base_domain to publish instances under
+# shorter names: with the pair below, the dashboard stays at
+# bento.example.org and an instance answers at web.example.org. The apex
+# stays free either way, so another service can keep it.
+#instance_domain = "example.org"
+
+# Names an instance may not take (SPEC 7.4). Add any name the DNS zone
+# already answers for, so nobody creates an instance whose name resolves
+# somewhere else. The first label of base_domain is reserved on top of this
+# list when base_domain sits one label under instance_domain.
+#reserved_names = ["www", "bento"]
 
 # libvirt connection URI (SPEC 4).
 #libvirt_uri = "qemu:///system"
