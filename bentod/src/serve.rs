@@ -21,9 +21,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::adapters::{
     AccountProvisioner, ApiBackend, ApiStore, AuthAccess, AuthInstanceNames, AuthPairings,
-    AuthTokens, AuthUsers,
-    Authenticator, Backend, NetworkEnsurer, RuntimeImages, access_status, operator_predicate,
-    user_network,
+    AuthTokens, AuthUsers, Authenticator, Backend, NetworkEnsurer, RuntimeImages, access_status,
+    operator_predicate, user_network,
 };
 use crate::firewall::Firewall;
 use crate::keys::{FRONTEND_KEY_FILE, authorized_key_line, ensure_key, key_path};

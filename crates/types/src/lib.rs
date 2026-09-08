@@ -524,8 +524,7 @@ pub fn is_reserved(name: &str, reserved: &[String]) -> bool {
 }
 
 /// The refusal text for a name that breaks the shape rule.
-pub const BAD_NAME: &str =
-    "instance name must be a DNS label: lower-case letters, digits, and hyphens, up to 63 characters";
+pub const BAD_NAME: &str = "instance name must be a DNS label: lower-case letters, digits, and hyphens, up to 63 characters";
 
 /// The refusal text for a reserved name (SPEC 7.4).
 pub fn reserved_name_message(name: &str) -> String {

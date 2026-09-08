@@ -881,7 +881,8 @@ mod tests {
     async fn restart_loads_persisted_certificate_without_issuance() {
         let (directory, config) = valid_config();
         let key = KeyPair::generate().unwrap();
-        let mut params = CertificateParams::new(domains("bento.example.org", "bento.example.org")).unwrap();
+        let mut params =
+            CertificateParams::new(domains("bento.example.org", "bento.example.org")).unwrap();
         params.not_after = date_time_ymd(2031, 7, 8);
         let certificate = params.self_signed(&key).unwrap();
         storage::atomic_write(

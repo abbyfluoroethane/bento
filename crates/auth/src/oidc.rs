@@ -693,9 +693,10 @@ impl Service {
         if next.starts_with('/') {
             return next;
         }
-        let host = Url::parse(&next)
-            .ok()
-            .and_then(|url| url.host_str().map(|h| h.trim_end_matches('.').to_ascii_lowercase()));
+        let host = Url::parse(&next).ok().and_then(|url| {
+            url.host_str()
+                .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
+        });
         let Some(host) = host else {
             return "/".into();
         };
@@ -1177,11 +1178,16 @@ mod tests {
         assert_eq!(service.checked_next("https://updog.foid.space/").await, "/");
         // The control plane is always allowed.
         assert_eq!(
-            service.checked_next("https://bento.example.org/instances").await,
+            service
+                .checked_next("https://bento.example.org/instances")
+                .await,
             "https://bento.example.org/instances"
         );
         // Relative paths are untouched.
-        assert_eq!(service.checked_next("/instances/web").await, "/instances/web");
+        assert_eq!(
+            service.checked_next("/instances/web").await,
+            "/instances/web"
+        );
         // Off-domain and deeper names stay refused.
         for input in [
             "https://evil.example.com/",

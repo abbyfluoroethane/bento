@@ -1105,7 +1105,8 @@ async fn help_lines_up_in_one_column() {
 #[tokio::test]
 async fn visibility_message_uses_the_instance_domain() {
     let (_, _, cli) = fixture();
-    let (code, out, error) = run(&cli, user(1, "alice"), "", &["visibility", "web", "public"]).await;
+    let (code, out, error) =
+        run(&cli, user(1, "alice"), "", &["visibility", "web", "public"]).await;
     assert_eq!(code, 0, "{error}");
     assert!(out.contains("https://web.example.org/"), "{out}");
     assert!(!out.contains("bento.example.org"), "{out}");

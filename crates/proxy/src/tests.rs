@@ -201,7 +201,10 @@ async fn base_domain_routing() {
 #[tokio::test]
 async fn split_control_and_instance_domains() {
     let mut instances = HashMap::new();
-    instances.insert("web".to_owned(), running_instance("web", Visibility::Public));
+    instances.insert(
+        "web".to_owned(),
+        running_instance("web", Visibility::Public),
+    );
     let source = Arc::new(FakeSource {
         instances,
         error: false,
