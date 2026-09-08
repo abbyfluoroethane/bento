@@ -214,8 +214,9 @@ impl Store for FakeStore {
 }
 
 #[derive(Clone)]
-enum Failure {
+pub(crate) enum Failure {
     Capacity,
+    NoPlacement,
     Cooldown,
     NameTaken,
     Teapot,
@@ -224,7 +225,7 @@ enum Failure {
 pub(crate) struct FakeLifecycle {
     store: Arc<FakeStore>,
     pub(crate) calls: Mutex<Vec<String>>,
-    failure: Mutex<Option<Failure>>,
+    pub(crate) failure: Mutex<Option<Failure>>,
 }
 
 impl FakeLifecycle {
@@ -242,6 +243,9 @@ impl FakeLifecycle {
 
     fn error(&self) -> Option<BoxError> {
         match self.failure.lock().unwrap().clone()? {
+            Failure::NoPlacement => Some(Box::new(StoreError::NoPlacement {
+                reasons: "runner-a.example.org: has 0 MiB left; runner-b.example.org: last seen unreachable".into(),
+            })),
             Failure::Capacity => Some(Box::new(StoreError::Capacity {
                 resource: "memory".to_string(),
                 used: 6144,
@@ -757,6 +761,7 @@ async fn create_validates_input_defaults_ksm_and_maps_typed_errors() {
 
     for (failure, status) in [
         (Failure::Capacity, StatusCode::CONFLICT),
+        (Failure::NoPlacement, StatusCode::CONFLICT),
         (Failure::Cooldown, StatusCode::CONFLICT),
         (Failure::NameTaken, StatusCode::CONFLICT),
         (Failure::Teapot, StatusCode::IM_A_TEAPOT),
@@ -773,6 +778,13 @@ async fn create_validates_input_defaults_ksm_and_maps_typed_errors() {
         assert_eq!(response.status, status);
         let body: ErrorBody = decode(&response);
         match failure {
+            Failure::NoPlacement => {
+                assert!(body.error.contains("runner-a.example.org: has 0 MiB left"));
+                assert!(
+                    body.error
+                        .contains("runner-b.example.org: last seen unreachable")
+                );
+            }
             Failure::Capacity => {
                 // The refusal is a plain 409 with a readable message.
                 // The structured per-limit body went with the quota.

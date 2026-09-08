@@ -315,6 +315,70 @@ async fn cli_backend_create_seeds_frontend_key() {
     assert!(env.hypervisor.domain("web").is_some());
 }
 
+#[test]
+fn a_wrapped_placement_refusal_keeps_each_runner_reason() {
+    let reasons =
+        "runner-a.example.org: has 0 MiB left; runner-b.example.org: last seen unreachable";
+    let source = StoreError::NoPlacement {
+        reasons: reasons.into(),
+    };
+    let error = api_lifecycle_error(bento_lifecycle::Error::Caused {
+        message: source.to_string(),
+        source: Box::new(source),
+    });
+    let translated = error
+        .downcast_ref::<bento_api::StoreError>()
+        .expect("typed API error");
+    assert!(
+        matches!(translated, bento_api::StoreError::NoPlacement { reasons: actual } if actual == reasons)
+    );
+}
+
+#[tokio::test]
+async fn placement_adapter_passes_the_configured_overcommit_ratio() {
+    use bento_lifecycle::Store as _;
+    let env = Env::new().await;
+    let machine_id = "00000000000000000000000000000002";
+    let host = env
+        .store
+        .ensure_host(machine_id, "runner-b.example.org", "qemu:///system")
+        .await
+        .unwrap();
+    env.store.claim_slot(0, host.id).await.unwrap();
+    env.store
+        .observe_host(
+            host.id,
+            bento_store::HostSeen {
+                machine_id: Some(machine_id.into()),
+                memory_total_mib: Some(4096),
+                storage_total_gib: Some(100),
+                storage_available_gib: Some(100),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let adapter = LifecycleStore(
+        env.store.clone(),
+        crate::adapters::LocalCapacity {
+            host_id: env.host_id,
+            capacity: bento_types::Capacity::unbounded(),
+            overcommit_ratio: 1.5,
+        },
+    );
+    let want = bento_types::Placing {
+        vcpu: 2,
+        memory_mib: 6144,
+        disk_gib: 20,
+        arch: None,
+    };
+    assert_eq!(adapter.choose_host(want).await.unwrap(), host.id);
+    assert_eq!(
+        adapter.host_capacity(host.id).await.unwrap().memory_mib,
+        6144
+    );
+}
+
 #[tokio::test]
 async fn cli_backend_stop_start_restart() {
     let env = Env::new().await;

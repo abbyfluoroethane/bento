@@ -244,15 +244,20 @@ impl bento_lifecycle::Store for LifecycleStore {
                 "machine {host_id} has not reported its capacity yet"
             ))));
         };
-        Ok(Capacity {
-            memory_mib: (seen.memory_total_mib.unwrap_or(0) as f64 * self.1.overcommit_ratio)
-                as i64,
-            disk_gib: seen.storage_total_gib.unwrap_or(0),
-        })
+        Ok(Capacity::from_host(
+            seen.memory_total_mib.unwrap_or(0),
+            seen.storage_total_gib.unwrap_or(0),
+            self.1.overcommit_ratio,
+        ))
     }
 
     async fn choose_host(&self, want: bento_types::Placing) -> Result<i64, LifecycleError> {
-        Ok(self.0.choose_host(want).await?.host.id)
+        Ok(self
+            .0
+            .choose_host(want, self.1.overcommit_ratio)
+            .await?
+            .host
+            .id)
     }
 
     async fn placeable_hosts(&self) -> Result<usize, LifecycleError> {
@@ -807,6 +812,9 @@ fn api_store_error_ref(error: &StoreError) -> Option<ApiError> {
     Some(match error {
         StoreError::NotFound => Box::new(ApiStoreError::NotFound),
         StoreError::NameTaken => Box::new(ApiStoreError::NameTaken),
+        StoreError::NoPlacement { reasons } => Box::new(ApiStoreError::NoPlacement {
+            reasons: reasons.clone(),
+        }),
         StoreError::Capacity {
             resource,
             used,

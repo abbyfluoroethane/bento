@@ -854,7 +854,7 @@ impl Store {
     /// is deterministic and explainable rather than predictive: an
     /// operator can work out why a instance landed where it did
     /// (MULTI-NODE 12).
-    pub async fn choose_host(&self, want: Placing) -> Result<Placement> {
+    pub async fn choose_host(&self, want: Placing, overcommit_ratio: f64) -> Result<Placement> {
         self.with_tx(move |tx| {
             let mut statement = tx.prepare(&format!(
                 "SELECT {HOST_COLUMNS} FROM hosts WHERE enabled = 1 AND placement = 'active' \
@@ -868,7 +868,7 @@ impl Store {
             let mut rejected = Vec::new();
             let mut best: Option<(f64, f64, i64, Host)> = None;
             for host in hosts {
-                match weigh_host(tx, &host, &want)? {
+                match weigh_host(tx, &host, &want, overcommit_ratio)? {
                     Ok(weight) => {
                         let candidate = (weight.memory_ratio, weight.vcpu_ratio, host.id, host);
                         if best.as_ref().is_none_or(|current| {
@@ -921,6 +921,7 @@ fn weigh_host(
     tx: &Transaction<'_>,
     host: &Host,
     want: &Placing,
+    overcommit_ratio: f64,
 ) -> rusqlite::Result<std::result::Result<Weight, String>> {
     let observation = tx
         .query_row(
@@ -979,10 +980,12 @@ fn weigh_host(
     if memory_total <= 0 {
         return Ok(Err("reported no memory".to_string()));
     }
-    if reserved_memory + want.memory_mib > memory_total {
+    let memory_limit =
+        bento_types::Capacity::from_host(memory_total, 0, overcommit_ratio).memory_mib;
+    if reserved_memory + want.memory_mib > memory_limit {
         return Ok(Err(format!(
-            "has {} MiB left of {memory_total}, the instance wants {}",
-            memory_total - reserved_memory,
+            "has {} MiB left of {memory_limit}, the instance wants {}",
+            memory_limit - reserved_memory,
             want.memory_mib
         )));
     }
@@ -997,13 +1000,15 @@ fn weigh_host(
 
     let cpu_count = cpu_count.unwrap_or(0).max(1);
     Ok(Ok(Weight {
-        memory_ratio: (reserved_memory + want.memory_mib) as f64 / memory_total as f64,
+        memory_ratio: (reserved_memory + want.memory_mib) as f64 / memory_limit as f64,
         vcpu_ratio: (reserved_vcpu + want.vcpu) as f64 / cpu_count as f64,
     }))
 }
 
 #[cfg(test)]
 mod placement_tests {
+    use std::time::Duration;
+
     use super::{HostSeen, Placing};
     use crate::Error;
     use crate::tests::new_test_store;
@@ -1087,7 +1092,7 @@ mod placement_tests {
                 .unwrap();
         }
 
-        let chosen = store.choose_host(want(2048, 20)).await.unwrap();
+        let chosen = store.choose_host(want(2048, 20), 1.0).await.unwrap();
         assert_eq!(chosen.host.id, tsukasa, "the emptier runner takes it");
     }
 
@@ -1099,13 +1104,83 @@ mod placement_tests {
     async fn a_runner_that_cannot_hold_it_says_why() {
         let (store, _, _) = two_runners().await;
         // More memory than either runner has.
-        let error = store.choose_host(want(99_000, 1)).await.unwrap_err();
+        let error = store.choose_host(want(99_000, 1), 1.0).await.unwrap_err();
         let Error::NoPlacement { reasons } = &error else {
             panic!("expected no placement, got {error}");
         };
         assert!(reasons.contains("konata"), "{reasons}");
         assert!(reasons.contains("tsukasa"), "{reasons}");
         assert!(reasons.contains("MiB left"), "{reasons}");
+    }
+
+    #[tokio::test]
+    async fn placement_and_creation_share_the_overcommitted_memory_ceiling() {
+        let (store, first, second) = two_runners().await;
+        let (owner, _) = crate::tests::seed_store(&store).await;
+        for (index, host_id, machine) in [(20, first, KONATA), (21, second, TSUKASA)] {
+            store
+                .observe_host(host_id, seen(machine, 4097, 100))
+                .await
+                .unwrap();
+            let mut instance = crate::tests::test_instance(
+                index,
+                &format!("existing-{index}"),
+                &owner,
+                &host_row(&store, host_id).await,
+            );
+            instance.memory_mib = 4096;
+            instance.disk_gib = 1;
+            store
+                .create_instance(instance, Duration::ZERO, bento_types::Capacity::unbounded())
+                .await
+                .unwrap();
+        }
+
+        assert!(matches!(
+            store.choose_host(want(2049, 1), 1.0).await,
+            Err(Error::NoPlacement { .. })
+        ));
+        // The fractional MiB is truncated by both checks: 4097 * 1.5 = 6145.5.
+        let chosen = store.choose_host(want(2049, 1), 1.5).await.unwrap();
+        assert_eq!(
+            chosen.host.id, first,
+            "equal weights keep the stable host order"
+        );
+        let error = store.choose_host(want(2050, 1), 1.5).await.unwrap_err();
+        let Error::NoPlacement { reasons } = error else {
+            panic!("expected placement refusal")
+        };
+        assert!(
+            reasons.contains("konata: has 2049 MiB left of 6145"),
+            "{reasons}"
+        );
+        assert!(
+            reasons.contains("tsukasa: has 2049 MiB left of 6145"),
+            "{reasons}"
+        );
+        assert!(
+            matches!(
+                store.choose_host(want(2049, 101), 1.5).await,
+                Err(Error::NoPlacement { .. })
+            ),
+            "overcommit does not increase free disk"
+        );
+
+        let mut instance = crate::tests::test_instance(22, "overcommitted", &owner, &chosen.host);
+        instance.memory_mib = 2049;
+        instance.disk_gib = 1;
+        store
+            .create_instance(
+                instance,
+                Duration::ZERO,
+                bento_types::Capacity::from_host(4097, 110, 1.5),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            store.choose_host(want(2049, 1), 1.5).await.unwrap().host.id,
+            second
+        );
     }
 
     #[tokio::test]
@@ -1121,7 +1196,7 @@ mod placement_tests {
             )
             .await
             .unwrap();
-        let chosen = store.choose_host(want(1024, 1)).await.unwrap();
+        let chosen = store.choose_host(want(1024, 1), 1.0).await.unwrap();
         assert_eq!(chosen.host.id, konata);
     }
 
@@ -1132,7 +1207,7 @@ mod placement_tests {
         other.arch = Some("x86_64".into());
         store.observe_host(tsukasa, other).await.unwrap();
 
-        let chosen = store.choose_host(want(1024, 1)).await.unwrap();
+        let chosen = store.choose_host(want(1024, 1), 1.0).await.unwrap();
         assert_ne!(
             chosen.host.id, tsukasa,
             "an aarch64 image needs an aarch64 runner"
@@ -1215,7 +1290,7 @@ mod placement_tests {
         // Both machines are healthy, but only the one holding a slot has
         // addresses to give.
         for _ in 0..4 {
-            let chosen = store.choose_host(want(1024, 1)).await.unwrap();
+            let chosen = store.choose_host(want(1024, 1), 1.0).await.unwrap();
             assert_eq!(
                 chosen.host.id, konata.id,
                 "a machine with no slot was chosen"

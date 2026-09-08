@@ -181,6 +181,18 @@
   });
   document.addEventListener("htmx:pushedIntoHistory", cleanUrl);
   document.addEventListener("htmx:replacedInHistory", cleanUrl);
+  // Create refusals return the form with its values and an explanation
+  // (SPEC 14.4). HTMX normally discards error responses from boosted forms.
+  document.addEventListener("htmx:beforeSwap", function (event) {
+    var detail = event.detail;
+    var form = detail.requestConfig && detail.requestConfig.elt;
+    if (!form || !form.matches("form[data-form-errors]")) return;
+    if (detail.xhr.status !== 400 && detail.xhr.status !== 409) return;
+    var type = detail.xhr.getResponseHeader("Content-Type") || "";
+    if (!type.toLowerCase().startsWith("text/html")) return;
+    detail.shouldSwap = true;
+    detail.isError = false;
+  });
   document.addEventListener("htmx:responseError", function (event) {
     var toaster = document.getElementById("toaster");
     if (!toaster) return;

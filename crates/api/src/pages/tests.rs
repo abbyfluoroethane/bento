@@ -286,6 +286,44 @@ async fn vm_pages_and_a_toast_from_the_query() {
 }
 
 #[tokio::test]
+async fn a_placement_refusal_returns_the_form_with_values_and_runner_reasons() {
+    let fx = fixture();
+    *fx.lifecycle.failure.lock().unwrap() = Some(crate::tests::Failure::NoPlacement);
+    let response = post(
+        &fx.pages,
+        "/new",
+        "name=fresh&image=debian-13&vcpu=3&memory_gib=2.5&disk_gib=17&public=on&ksm=on&nested=on",
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::CONFLICT);
+    let body = text(&response);
+    for expected in [
+        "Not created",
+        "runner-a.example.org: has 0 MiB left",
+        "runner-b.example.org: last seen unreachable",
+        "value=\"fresh\"",
+        "value=\"debian-13\"",
+        "value=\"3\"",
+        "value=\"2.5\"",
+        "value=\"17\"",
+        "data-form-errors",
+    ] {
+        assert!(body.contains(expected), "missing {expected}: {body}");
+    }
+    for name in ["public", "ksm", "nested"] {
+        assert!(body.contains(&format!("name=\"{name}\" checked")), "{body}");
+    }
+    assert!(
+        !fx.store
+            .data
+            .lock()
+            .unwrap()
+            .instances
+            .contains_key("uuid-fresh")
+    );
+}
+
+#[tokio::test]
 async fn settings_apply_only_what_changed_and_rename_last() {
     let fx = fixture();
     // Nothing changed.
@@ -627,6 +665,10 @@ async fn dev_server() {
     };
     let fx = fixture();
     seed_demo(&fx);
+    // Browser checks need a real error page over the fake lifecycle.
+    if std::env::var("BENTO_DEV_CREATE_ERROR").as_deref() == Ok("no-placement") {
+        *fx.lifecycle.failure.lock().unwrap() = Some(crate::tests::Failure::NoPlacement);
+    }
     {
         let mut data = fx.store.data.lock().unwrap();
         data.images.push(bento_types::Image {

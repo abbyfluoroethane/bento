@@ -31,6 +31,9 @@ pub enum StoreError {
     NotFound,
     #[error("store: name is taken by an existing instance")]
     NameTaken,
+    /// Every runner refused the request (MULTI-NODE 12).
+    #[error("store: no runner can take this instance: {reasons}")]
+    NoPlacement { reasons: String },
     /// A create or resize would provision more than the host holds
     /// (SPEC 6.1). There is no per-user limit to report.
     #[error(

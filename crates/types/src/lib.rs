@@ -209,6 +209,15 @@ pub struct Capacity {
 }
 
 impl Capacity {
+    /// Applies the deployment's memory allowance to one host's physical
+    /// figures, shared by placement and the final capacity check (SPEC 6.1).
+    pub fn from_host(memory_mib: i64, disk_gib: i64, overcommit_ratio: f64) -> Self {
+        Self {
+            memory_mib: (memory_mib as f64 * overcommit_ratio) as i64,
+            disk_gib,
+        }
+    }
+
     /// A capacity that bounds nothing. Zero means "no ceiling", not "no
     /// room": a check whose ceiling is zero is skipped. Tests use this.
     /// `bentod` refuses to start without real host figures, so a running

@@ -207,10 +207,11 @@ fn host_capacity(cfg: &Config) -> Result<Capacity> {
 
 /// The arithmetic of [`host_capacity`], apart from the host it reads.
 fn capacity_from(memory_bytes: u64, storage_bytes: u64, overcommit_ratio: f64) -> Capacity {
-    Capacity {
-        memory_mib: ((memory_bytes / MIB) as f64 * overcommit_ratio) as i64,
-        disk_gib: (storage_bytes / GIB) as i64,
-    }
+    Capacity::from_host(
+        (memory_bytes / MIB) as i64,
+        (storage_bytes / GIB) as i64,
+        overcommit_ratio,
+    )
 }
 
 /// Extracts the Unix socket from a `qemu:///system` style URI. The default
