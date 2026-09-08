@@ -164,6 +164,39 @@ impl Store {
         })
     }
 
+    /// Opens an existing database for reading and nothing else.
+    ///
+    /// The control plane is the only writer (SPEC 4), and a migration is
+    /// a deliberate operation an operator takes a copy before
+    /// (CLAUDE.md). A reader must therefore neither create the file nor
+    /// carry it forward: `bento-monitor` reads the fleet through this
+    /// while `bentod serve` is running, and a reader that migrated would
+    /// change the database behind the process that owns it.
+    ///
+    /// The connection is opened read-write and then held to
+    /// `query_only`, rather than opened `SQLITE_OPEN_READONLY`. A
+    /// read-only connection cannot map the shared-memory file that WAL
+    /// needs, so it refuses a database whose writer is not running: the
+    /// one case where an operator most wants to read it.
+    pub async fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let now: Clock = Arc::new(OffsetDateTime::now_utc);
+        let conn = tokio::task::spawn_blocking(move || -> Result<Connection> {
+            let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+                | rusqlite::OpenFlags::SQLITE_OPEN_URI
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+            let conn = Connection::open_with_flags(&path, flags)?;
+            conn.busy_timeout(Duration::from_millis(5000))?;
+            conn.pragma_update(None, "query_only", true)?;
+            Ok(conn)
+        })
+        .await??;
+        Ok(Self {
+            conn: Arc::new(Mutex::new(conn)),
+            now,
+        })
+    }
+
     /// Closes the database. This must be the final cloned handle and no
     /// cancelled blocking operation may still be finishing; otherwise the
     /// shared connection remains open and [`Error::ConnectionInUse`] is

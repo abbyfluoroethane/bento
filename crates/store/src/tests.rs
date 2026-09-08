@@ -351,3 +351,35 @@ async fn migrates_bootc_version_provenance_from_the_initial_oci_schema() {
         "disk-checksum"
     );
 }
+
+#[tokio::test]
+async fn a_read_only_store_reads_a_live_database_and_writes_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("bento.db");
+
+    // A reader must not create the database: a wrong path has to say so
+    // rather than answer for an empty deployment.
+    assert!(Store::open_read_only(&path).await.is_err());
+
+    let writer = Store::open(&path).await.unwrap();
+    writer
+        .register_runner("runner-a", "http://10.0.0.21:10443", "10.0.0.21")
+        .await
+        .unwrap();
+
+    let reader = Store::open_read_only(&path).await.unwrap();
+    let hosts = reader.hosts().await.unwrap();
+    assert_eq!(hosts.len(), 1);
+    assert_eq!(hosts[0].name, "runner-a");
+    assert_eq!(reader.deployment().await.unwrap().runner_prefix, 24);
+
+    // Every write is refused, so the reader cannot disturb the control
+    // plane that owns the file.
+    assert!(
+        reader
+            .register_runner("runner-b", "http://10.0.0.22:10443", "10.0.0.22")
+            .await
+            .is_err()
+    );
+    assert_eq!(writer.hosts().await.unwrap().len(), 1);
+}
