@@ -427,81 +427,105 @@ impl Proxy {
             return pages::unavailable(instance);
         };
 
-        let requested_upgrade = upgrade_protocol(request.headers()).cloned();
-        remove_hop_by_hop_headers(request.headers_mut());
-        if let Some(protocol) = &requested_upgrade {
-            request
-                .headers_mut()
-                .insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
-            request
-                .headers_mut()
-                .insert(header::UPGRADE, protocol.clone());
-        }
-        *request.uri_mut() = uri;
-        // Forwarding headers are trust-boundary data. Discard anything the
-        // client supplied before writing the values observed by this proxy.
-        for name in [
-            HeaderName::from_static("forwarded"),
-            HeaderName::from_static("x-forwarded-for"),
-            HeaderName::from_static("x-forwarded-host"),
-            HeaderName::from_static("x-forwarded-proto"),
-        ] {
-            request.headers_mut().remove(name);
-        }
-        if let Ok(host) = HeaderValue::from_str(&original_host) {
-            request.headers_mut().insert(header::HOST, host.clone());
-            request
-                .headers_mut()
-                .insert(HeaderName::from_static("x-forwarded-host"), host);
-        }
-        request.headers_mut().insert(
-            HeaderName::from_static("x-forwarded-proto"),
-            HeaderValue::from_static(if tls { "https" } else { "http" }),
-        );
-        set_forwarded_for(request.headers_mut(), remote_addr.ip());
-
-        let request_upgrade = requested_upgrade
-            .as_ref()
-            .map(|_| hyper::upgrade::on(&mut *request));
-        let mut response = match self.transport.send(take_request(request)).await {
+        let prepared = send_upgradable(self.transport.as_ref(), take_request(request), |request| {
+            *request.uri_mut() = uri;
+            // Forwarding headers are trust-boundary data. Discard anything the
+            // client supplied before writing the values observed by this proxy.
+            for name in [
+                HeaderName::from_static("forwarded"),
+                HeaderName::from_static("x-forwarded-for"),
+                HeaderName::from_static("x-forwarded-host"),
+                HeaderName::from_static("x-forwarded-proto"),
+            ] {
+                request.headers_mut().remove(name);
+            }
+            if let Ok(host) = HeaderValue::from_str(&original_host) {
+                request.headers_mut().insert(header::HOST, host.clone());
+                request
+                    .headers_mut()
+                    .insert(HeaderName::from_static("x-forwarded-host"), host);
+            }
+            request.headers_mut().insert(
+                HeaderName::from_static("x-forwarded-proto"),
+                HeaderValue::from_static(if tls { "https" } else { "http" }),
+            );
+            set_forwarded_for(request.headers_mut(), remote_addr.ip());
+        })
+        .await;
+        match prepared {
             Ok(response) => response,
-            Err(_) => return pages::unavailable(instance),
-        };
-
-        let response_upgrade = if requested_upgrade.is_some()
-            && response.status() == StatusCode::SWITCHING_PROTOCOLS
-            && upgrade_protocol(response.headers()) == requested_upgrade.as_ref()
-        {
-            Some(hyper::upgrade::on(&mut response))
-        } else {
-            None
-        };
-        remove_hop_by_hop_headers(response.headers_mut());
-        if let Some(protocol) = requested_upgrade
-            && response_upgrade.is_some()
-        {
-            response
-                .headers_mut()
-                .insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
-            response.headers_mut().insert(header::UPGRADE, protocol);
+            Err(_) => pages::unavailable(instance),
         }
-
-        if let (Some(inbound), Some(outbound)) = (request_upgrade, response_upgrade) {
-            tokio::spawn(async move {
-                if let (Ok(inbound), Ok(outbound)) = (inbound.await, outbound.await) {
-                    let mut inbound = hyper_util::rt::TokioIo::new(inbound);
-                    let mut outbound = hyper_util::rt::TokioIo::new(outbound);
-                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
-                }
-            });
-        }
-        response
     }
+}
+
+/// Sends `request` through `transport`. When the client and the upstream
+/// agree on an upgrade, such as a WebSocket, this joins the two upgraded
+/// connections. Instance traffic and the control plane both need that; the
+/// web terminal is a WebSocket on the base domain (SPEC 14.6).
+///
+/// `prepare` runs after the hop-by-hop headers are removed, so a header it
+/// sets cannot be named away by the client's `Connection` header.
+pub async fn send_upgradable(
+    transport: &dyn Transport,
+    mut request: Request<ProxyBody>,
+    prepare: impl FnOnce(&mut Request<ProxyBody>),
+) -> Result<Response<ProxyBody>, BoxError> {
+    let requested_upgrade = upgrade_protocol(request.headers()).cloned();
+    remove_hop_by_hop_headers(request.headers_mut());
+    if let Some(protocol) = &requested_upgrade {
+        request
+            .headers_mut()
+            .insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
+        request
+            .headers_mut()
+            .insert(header::UPGRADE, protocol.clone());
+    }
+    prepare(&mut request);
+
+    let request_upgrade = requested_upgrade
+        .as_ref()
+        .map(|_| hyper::upgrade::on(&mut request));
+    let mut response = transport.send(request).await?;
+    let response_upgrade = if requested_upgrade.is_some()
+        && response.status() == StatusCode::SWITCHING_PROTOCOLS
+        && upgrade_protocol(response.headers()) == requested_upgrade.as_ref()
+    {
+        Some(hyper::upgrade::on(&mut response))
+    } else {
+        None
+    };
+    remove_hop_by_hop_headers(response.headers_mut());
+    if let Some(protocol) = requested_upgrade
+        && response_upgrade.is_some()
+    {
+        response
+            .headers_mut()
+            .insert(header::CONNECTION, HeaderValue::from_static("upgrade"));
+        response.headers_mut().insert(header::UPGRADE, protocol);
+    }
+
+    if let (Some(inbound), Some(outbound)) = (request_upgrade, response_upgrade) {
+        tokio::spawn(async move {
+            if let (Ok(inbound), Ok(outbound)) = (inbound.await, outbound.await) {
+                let mut inbound = hyper_util::rt::TokioIo::new(inbound);
+                let mut outbound = hyper_util::rt::TokioIo::new(outbound);
+                let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+            }
+        });
+    }
+    Ok(response)
 }
 
 fn take_request(request: &mut Request<ProxyBody>) -> Request<ProxyBody> {
     let replacement = Request::new(full_body(Bytes::new()));
     std::mem::replace(request, replacement)
+}
+
+/// The hyper client the proxy uses by default. The control plane handler
+/// uses it too, with [`send_upgradable`].
+pub fn http_transport() -> Arc<dyn Transport> {
+    default_transport()
 }
 
 fn default_transport() -> Arc<dyn Transport> {
