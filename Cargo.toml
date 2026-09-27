@@ -56,7 +56,9 @@ bento-cli = { path = "crates/cli" }
 # is a feature.
 anyhow = "1.0.104"
 async-trait = "0.1.92"
-axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "form"] }
+# `ws` is the web terminal (SPEC 14.6). Its tungstenite has no TLS of its
+# own, so it adds no second crypto provider.
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio", "form", "ws"] }
 base64 = "0.23.1"
 bytes = "1.12.1"
 futures = "0.3.34"

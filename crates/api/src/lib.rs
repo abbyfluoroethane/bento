@@ -58,6 +58,8 @@ pub struct Config {
 
     /// Resource measurements behind the dashboard charts.
     pub metrics: Arc<dyn Metrics>,
+    /// Joins the web terminal to a guest shell (SPEC 14.6).
+    pub console: Arc<dyn Console>,
     /// The control plane's domain, for the SSH hints the pages show.
     pub base_domain: String,
     /// The domain an instance publishes under, for the `name.<domain>` URLs

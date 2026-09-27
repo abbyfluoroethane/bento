@@ -1,12 +1,23 @@
 {% extends "layout.html" %}
 {% block content %}
 {% include "partials/vm_header.html" %}
-<div class="alert" role="status">
-  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg>
-  <h2>Not built yet.</h2>
-  <section><p>Use SSH for now.</p></section>
-</div>
-<div class="terminal" role="region" aria-label="Terminal">
-  <pre>$ {{ vm.ssh }}</pre>
-</div>
+{#- The web terminal (SPEC 14.6). terminal.js mounts on [data-terminal].
+    hx-history="false" stops HTMX from keeping a copy of a live terminal
+    in its history cache. Without JavaScript, the fallback stays visible
+    and gives the ssh command (SPEC 14.1). -#}
+<section class="terminal-view" data-terminal data-uuid="{{ vm.uuid }}" data-name="{{ vm.name }}" data-state="{{ vm.state }}" hx-history="false" aria-label="Terminal">
+  <p class="hint">This terminal is the same as <code>{{ vm.ssh }}</code>: the same account, the same shell, and the same access. It is not a serial console. The VM must be running, with a working network and <code>sshd</code>.</p>
+  <div class="terminal" data-terminal-fallback>
+    <pre>$ {{ vm.ssh }}</pre>
+    <p class="muted small">The web terminal needs JavaScript. It is the same as SSH, so you can use the command above.</p>
+  </div>
+  <div class="terminal-live" data-terminal-live hidden>
+    <div class="terminal-bar">
+      <p class="terminal-status" role="status" aria-live="polite" data-terminal-status></p>
+      <button type="button" class="btn" data-size="sm" data-terminal-connect hidden>Start and connect</button>
+    </div>
+    <div class="terminal terminal-screen" data-terminal-screen></div>
+  </div>
+</section>
+<script type="module" src="/assets/js/terminal.js"></script>
 {% endblock %}

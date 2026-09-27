@@ -10,8 +10,10 @@ edit a file here, rebuild the binary.
 | `js/basecoat.min.js`, `js/toast.min.js`, `js/dropdown-menu.min.js`, `js/select.min.js`, `js/combobox.min.js` | Basecoat runtime, toast, dropdown menu, select, combobox | basecoat-css 1.0.2 | same package, `dist/js/` |
 | `js/htmx.min.js` | HTMX | 2.0.10 | `https://cdn.jsdelivr.net/npm/htmx.org@2.0.10/dist/htmx.min.js` |
 | `js/uplot.min.js`, `css/uplot.min.css` | uPlot | 1.6.32 | `https://cdn.jsdelivr.net/npm/uplot@1.6.32/dist/` |
+| `js/ghostty-web.js`, `js/__vite-browser-external-2447137e.js` | ghostty-web, ES module build with the WebAssembly parser inline (SPEC 14.6), MIT. The second file is an empty module; the bundle imports it only under Node | 0.4.0 | `https://cdn.jsdelivr.net/npm/ghostty-web@0.4.0/dist/` |
 | `css/app.css` | Bento's tokens (Catppuccin Latte/Mocha, blue accent) and layout | — | this repository |
 | `js/app.js` | Theme switch, charts, steppers, dialogs | — | this repository |
+| `js/terminal.js` | Web terminal client, loaded only by the Terminal tab (SPEC 14.6) | — | this repository |
 | `fonts/*.woff2` | IBM Plex Sans and Mono, latin subset (SPEC 14.3) | @fontsource 5.2.5 | previously vendored through `@fontsource/ibm-plex-*` |
 | `branding/` | Favicon and wordmark | — | `branding/` at the repository root |
 

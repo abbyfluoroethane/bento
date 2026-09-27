@@ -17,8 +17,8 @@ use tokio::time::Instant;
 use crate::server::{GuestClient, KeyLinker, PairingRequest, PendingLink, Server};
 use crate::{DEFAULT_DIAL_INTERVAL, DEFAULT_START_TIMEOUT};
 
-type SessionInput = Pin<Box<dyn AsyncRead + Send>>;
-type SessionOutput = Pin<Box<dyn AsyncWrite + Send>>;
+pub(crate) type SessionInput = Pin<Box<dyn AsyncRead + Send>>;
+pub(crate) type SessionOutput = Pin<Box<dyn AsyncWrite + Send>>;
 
 /// Translates bare newlines to CRLF on the way to the channel.
 ///
@@ -137,34 +137,43 @@ pub(crate) enum Authenticated {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Window {
-    col_width: u32,
-    row_height: u32,
-    pix_width: u32,
-    pix_height: u32,
+pub(crate) struct Window {
+    pub(crate) col_width: u32,
+    pub(crate) row_height: u32,
+    pub(crate) pix_width: u32,
+    pub(crate) pix_height: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct PtyRequest {
-    term: String,
-    window: Window,
+pub(crate) struct PtyRequest {
+    pub(crate) term: String,
+    pub(crate) window: Window,
 }
 
 #[async_trait]
-trait SessionExit: Send + Sync {
+pub(crate) trait SessionExit: Send + Sync {
     async fn exit(&self, code: u32);
+
+    /// Ends a session the frontend could not join. The message is already on
+    /// stderr. Over SSH this is exit status 1; the web terminal closes with
+    /// the message instead, so the page can tell a failure from a guest exit
+    /// status (SPEC 14.6).
+    async fn fail(&self, message: &str) {
+        let _ = message;
+        self.exit(1).await;
+    }
 }
 
-struct SessionParts {
-    user: String,
-    raw_command: Vec<u8>,
-    command: Vec<String>,
-    pty: Option<PtyRequest>,
-    windows: mpsc::Receiver<Window>,
-    stdin: SessionInput,
-    stdout: SessionOutput,
-    stderr: SessionOutput,
-    exit: Arc<dyn SessionExit>,
+pub(crate) struct SessionParts {
+    pub(crate) user: String,
+    pub(crate) raw_command: Vec<u8>,
+    pub(crate) command: Vec<String>,
+    pub(crate) pty: Option<PtyRequest>,
+    pub(crate) windows: mpsc::Receiver<Window>,
+    pub(crate) stdin: SessionInput,
+    pub(crate) stdout: SessionOutput,
+    pub(crate) stderr: SessionOutput,
+    pub(crate) exit: Arc<dyn SessionExit>,
 }
 
 /// The narrow terminal-session seam used by dispatch. Tests provide an
@@ -348,7 +357,7 @@ async fn resolve_instance(server: &Server, name: &str, user_id: i64) -> Option<I
 }
 
 /// Implements SPEC 10 steps 7-10 for one resolved connection.
-async fn proxy(server: &Server, instance: Instance, mut session: SessionParts) {
+pub(crate) async fn proxy(server: &Server, instance: Instance, mut session: SessionParts) {
     // Step 7 starts a stopped instance without changing desired state. The
     // Starter interface has no operation that could change it (SPEC 11.2).
     if instance.state == State::Stopped {
@@ -357,13 +366,12 @@ async fn proxy(server: &Server, instance: Instance, mut session: SessionParts) {
             .write_all(format!("bento: starting {}\r\n", instance.name).as_bytes())
             .await;
         if let Err(error) = server.starter.start_instance(instance.clone()).await {
+            let message = format!("bento: starting {} failed: {error}", instance.name);
             let _ = session
                 .stderr
-                .write_all(
-                    format!("bento: starting {} failed: {error}\r\n", instance.name).as_bytes(),
-                )
+                .write_all(format!("{message}\r\n").as_bytes())
                 .await;
-            session.exit.exit(1).await;
+            session.exit.fail(&message).await;
             return;
         }
     }
@@ -375,18 +383,16 @@ async fn proxy(server: &Server, instance: Instance, mut session: SessionParts) {
     let connection = match wait_ssh(server, &address, timeout, interval).await {
         Ok(connection) => connection,
         Err(error) => {
+            let message = format!(
+                "bento: {} did not accept an SSH connection within {}: {error}",
+                instance.name,
+                display_duration(timeout)
+            );
             let _ = session
                 .stderr
-                .write_all(
-                    format!(
-                        "bento: {} did not accept an SSH connection within {}: {error}\r\n",
-                        instance.name,
-                        display_duration(timeout)
-                    )
-                    .as_bytes(),
-                )
+                .write_all(format!("{message}\r\n").as_bytes())
                 .await;
-            session.exit.exit(1).await;
+            session.exit.fail(&message).await;
             return;
         }
     };
@@ -654,11 +660,12 @@ async fn join_error(
     operation: &str,
     error: impl std::fmt::Display,
 ) {
+    let message = format!("bento: {operation} {} failed: {error}", instance.name);
     let _ = session
         .stderr
-        .write_all(format!("bento: {operation} {} failed: {error}\r\n", instance.name).as_bytes())
+        .write_all(format!("{message}\r\n").as_bytes())
         .await;
-    session.exit.exit(1).await;
+    session.exit.fail(&message).await;
 }
 
 /// How often the waiting session asks whether the link has been used.

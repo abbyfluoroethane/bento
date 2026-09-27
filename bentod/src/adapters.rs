@@ -1125,6 +1125,55 @@ impl bento_sshfront::Starter for Starter {
     }
 }
 
+/// The web terminal (SPEC 14.6) takes the SSH frontend's own path to the
+/// guest, so the two cannot drift: the same start, the same wait for sshd,
+/// the same frontend key, and the same join (SPEC 10 steps 7 to 10).
+pub(crate) struct Console(pub(crate) bento_sshfront::Server);
+
+#[async_trait]
+impl bento_api::Console for Console {
+    async fn attach(
+        &self,
+        instance: Instance,
+        terminal: bento_api::ConsoleTerminal,
+    ) -> bento_api::ConsoleEnd {
+        let bento_api::ConsoleTerminal {
+            size,
+            mut resizes,
+            input,
+            output,
+            start,
+        } = terminal;
+        let (sender, receiver) = tokio::sync::mpsc::channel(16);
+        tokio::spawn(async move {
+            while let Some(size) = resizes.recv().await {
+                let size = bento_sshfront::TerminalSize {
+                    cols: size.cols,
+                    rows: size.rows,
+                };
+                if sender.send(size).await.is_err() {
+                    return;
+                }
+            }
+        });
+        let terminal = bento_sshfront::Terminal {
+            size: bento_sshfront::TerminalSize {
+                cols: size.cols,
+                rows: size.rows,
+            },
+            resizes: receiver,
+            input,
+            output,
+            start,
+        };
+        match self.0.attach(instance, terminal).await {
+            bento_sshfront::Attached::Exited(code) => bento_api::ConsoleEnd::Exited(code),
+            bento_sshfront::Attached::Failed(message) => bento_api::ConsoleEnd::Failed(message),
+            bento_sshfront::Attached::NotRunning => bento_api::ConsoleEnd::NotRunning,
+        }
+    }
+}
+
 #[async_trait]
 pub(crate) trait NetworkEnsurer: Send + Sync {
     async fn ensure_network(&self, name: &str, xml: &str) -> anyhow::Result<()>;

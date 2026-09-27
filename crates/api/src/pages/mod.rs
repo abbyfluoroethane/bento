@@ -9,6 +9,7 @@
 mod account;
 mod admin;
 mod home;
+pub(crate) mod terminal;
 mod vm;
 
 #[cfg(test)]
@@ -44,6 +45,7 @@ pub fn router(config: Arc<Config>) -> Router {
         .route("/vm/{uuid}/metrics.json", get(vm::metrics))
         .route("/vm/{uuid}/fragments/state", get(vm::state_fragment))
         .route("/vm/{uuid}/terminal", get(vm::terminal))
+        .route("/vm/{uuid}/terminal/ws", get(terminal::socket))
         .route(
             "/vm/{uuid}/settings",
             get(vm::settings).post(vm::save_settings),

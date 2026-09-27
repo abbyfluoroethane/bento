@@ -8,9 +8,11 @@
 //! an instance the user can reach runs the command line interface, and an
 //! unknown key is offered a link to sign in with, whatever the user name says.
 
+mod attach;
 mod server;
 mod session;
 
+pub use attach::{Attached, Terminal, TerminalSize, WEB_TERM};
 pub use server::{
     AsyncReadWrite, BoxError, BoxedIo, CLIRunner, Dialer, InstanceStore, KeyLinker, KeyStore,
     PairingRequest, PendingLink, Server, Starter,

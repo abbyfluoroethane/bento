@@ -21,8 +21,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::adapters::{
     AccountProvisioner, ApiBackend, ApiStore, AuthAccess, AuthInstanceNames, AuthPairings,
-    AuthTokens, AuthUsers, Authenticator, Backend, NetworkEnsurer, RuntimeImages, access_status,
-    operator_predicate, user_network,
+    AuthTokens, AuthUsers, Authenticator, Backend, Console, NetworkEnsurer, RuntimeImages, Starter,
+    access_status, operator_predicate, user_network,
 };
 use crate::firewall::Firewall;
 use crate::keys::{FRONTEND_KEY_FILE, authorized_key_line, ensure_key, key_path};
@@ -154,7 +154,6 @@ async fn serve_inner(
     // The frontend public key rides in every seed so the frontend can reach
     // guests (SPEC 10 step 9). Creating it here keeps serve and sshd aligned.
     let frontend_key = ensure_key(&key_path(app, FRONTEND_KEY_FILE), "bento-frontend")?;
-    let frontend_public = authorized_key_line(frontend_key.public_key(), "bento-frontend")?;
     // Only this process holds the controller lease, so only this process
     // may send a change to another machine (MULTI-NODE 11.3). A create
     // that placement sends elsewhere goes through here.
@@ -204,7 +203,7 @@ async fn serve_inner(
         manager.clone(),
         hypervisor.clone(),
         firewall.clone(),
-        frontend_public,
+        frontend_key,
         host.id,
         sampler.clone(),
     )
@@ -431,7 +430,7 @@ async fn control_plane_router(
     manager: Arc<bento_lifecycle::Manager>,
     hypervisor: Arc<bento_hypervisor::Client>,
     firewall: Arc<Firewall>,
-    frontend_key: String,
+    frontend_key: Arc<russh::keys::PrivateKey>,
     host_id: i64,
     sampler: Arc<crate::metrics::Sampler>,
 ) -> Result<Router> {
@@ -470,6 +469,15 @@ async fn control_plane_router(
             format!("https://{}/callback", app.cfg.base_domain),
         );
     }
+    let frontend_public = authorized_key_line(frontend_key.public_key(), "bento-frontend")?;
+    // This process already holds the frontend key, so the web terminal
+    // needs no new secret (SPEC 14.6).
+    let mut guests = bento_sshfront::Server::for_guests(
+        Arc::new(app.store.clone()),
+        Arc::new(Starter(hypervisor.clone())),
+        frontend_key,
+    );
+    guests.guest_user = bento_lifecycle::GUEST_USER.to_owned();
     let operators = Arc::new(operator_predicate(&app.cfg.operators));
     let http = Arc::new(bento_api::Config {
         store: Arc::new(ApiStore(app.store.clone())),
@@ -477,7 +485,7 @@ async fn control_plane_router(
             manager,
             store: app.store.clone(),
             host_id,
-            frontend_key,
+            frontend_key: frontend_public,
             firewall: Some(firewall),
         })),
         auth: Arc::new(Authenticator {
@@ -488,6 +496,7 @@ async fn control_plane_router(
         image_admin: Some(Arc::new(RuntimeImages(app.image_store()))),
         db_path: app.cfg.db_path.clone(),
         metrics: sampler,
+        console: Arc::new(Console(guests)),
         base_domain: app.cfg.base_domain.clone(),
         instance_domain: app.cfg.instance_domain.clone(),
         reserved_names: app.cfg.reserved(),
