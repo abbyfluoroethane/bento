@@ -12,9 +12,6 @@ use anyhow::{Result, bail};
 use bytes::Bytes;
 use http::{Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Empty};
-use hyper_util::client::legacy::Client;
-use hyper_util::client::legacy::connect::HttpConnector;
-use hyper_util::rt::TokioExecutor;
 
 use crate::adapters::{ProxySource, RemoteSession};
 use crate::setup::{App, bind_host, control_url, main_port, shutdown_signal};
@@ -115,12 +112,12 @@ fn control_proxy(base: &str) -> Result<bento_proxy::ControlHandler> {
         .cloned()
         .ok_or_else(|| anyhow::anyhow!("control URL has no authority"))?;
     let scheme = base.scheme().cloned().unwrap_or(http::uri::Scheme::HTTP);
-    let mut connector = HttpConnector::new();
-    connector.set_connect_timeout(Some(Duration::from_secs(5)));
-    let client: Client<_, bento_proxy::ProxyBody> =
-        Client::builder(TokioExecutor::new()).build(connector);
-    Ok(bento_proxy::control_handler(move |mut request| {
-        let client = client.clone();
+    // The upgrade-aware send, not a bare client request: the web terminal is
+    // a WebSocket on the base domain, and a bare request returns the 101
+    // but never joins the two connections (SPEC 14.6).
+    let transport = bento_proxy::http_transport();
+    Ok(bento_proxy::control_handler(move |request| {
+        let transport = transport.clone();
         let authority = authority.clone();
         let scheme = scheme.clone();
         async move {
@@ -137,14 +134,11 @@ fn control_proxy(base: &str) -> Result<bento_proxy::ControlHandler> {
             let Ok(uri) = uri else {
                 return empty_response(StatusCode::BAD_GATEWAY);
             };
-            *request.uri_mut() = uri;
-            match client.request(request).await {
-                Ok(response) => response.map(|body| {
-                    body.map_err(|error| -> bento_proxy::BoxError { Box::new(error) })
-                        .boxed()
-                }),
-                Err(_) => empty_response(StatusCode::BAD_GATEWAY),
-            }
+            bento_proxy::send_upgradable(transport.as_ref(), request, |request| {
+                *request.uri_mut() = uri;
+            })
+            .await
+            .unwrap_or_else(|_| empty_response(StatusCode::BAD_GATEWAY))
         }
     }))
 }
@@ -168,5 +162,100 @@ mod tests {
         control_proxy("http://127.0.0.1:10080").unwrap();
         let _client = reqwest::Client::new();
         let _path = std::path::PathBuf::from("acme");
+    }
+
+    /// Serves `service` on a loopback port, with upgrades, one connection
+    /// per task.
+    async fn serve_upgrades<S, F>(service: S) -> std::net::SocketAddr
+    where
+        S: Fn(http::Request<hyper::body::Incoming>) -> F + Clone + Send + Sync + 'static,
+        F: std::future::Future<Output = Response<bento_proxy::ProxyBody>> + Send + 'static,
+    {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                let service = service.clone();
+                tokio::spawn(async move {
+                    let service = hyper::service::service_fn(move |request| {
+                        let response = service(request);
+                        async move { Ok::<_, Infallible>(response.await) }
+                    });
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(hyper_util::rt::TokioIo::new(stream), service)
+                        .with_upgrades()
+                        .await;
+                });
+            }
+        });
+        address
+    }
+
+    /// The web terminal is a WebSocket on the base domain (SPEC 14.6). The
+    /// control proxy must join the two upgraded connections, not only pass
+    /// the 101 back. A generic `echo` upgrade stands in for the WebSocket.
+    #[tokio::test]
+    async fn control_proxy_joins_an_upgraded_connection() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let upstream = serve_upgrades(
+            |mut request: http::Request<hyper::body::Incoming>| async move {
+                let upgrade = hyper::upgrade::on(&mut request);
+                tokio::spawn(async move {
+                    let mut io = hyper_util::rt::TokioIo::new(upgrade.await.unwrap());
+                    let mut buffer = [0_u8; 4];
+                    io.read_exact(&mut buffer).await.unwrap();
+                    io.write_all(&buffer).await.unwrap();
+                });
+                let mut response = empty_response(StatusCode::SWITCHING_PROTOCOLS);
+                response
+                    .headers_mut()
+                    .insert(http::header::CONNECTION, "upgrade".parse().unwrap());
+                response
+                    .headers_mut()
+                    .insert(http::header::UPGRADE, "echo".parse().unwrap());
+                response
+            },
+        )
+        .await;
+
+        let control = control_proxy(&format!("http://{upstream}")).unwrap();
+        let front = serve_upgrades(move |request: http::Request<hyper::body::Incoming>| {
+            let control = control.clone();
+            async move {
+                let request = request.map(|body| {
+                    body.map_err(|error| -> bento_proxy::BoxError { Box::new(error) })
+                        .boxed()
+                });
+                control(request).await
+            }
+        })
+        .await;
+
+        let mut client = tokio::net::TcpStream::connect(front).await.unwrap();
+        client
+            .write_all(
+                b"GET /vm/uuid-web/terminal/ws HTTP/1.1\r\nHost: bento.example.org\r\n\
+                  Connection: upgrade\r\nUpgrade: echo\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            let mut byte = [0_u8; 1];
+            client.read_exact(&mut byte).await.unwrap();
+            head.push(byte[0]);
+        }
+        let head = String::from_utf8(head).unwrap();
+        assert!(head.starts_with("HTTP/1.1 101"), "{head}");
+
+        client.write_all(b"ping").await.unwrap();
+        let mut echoed = [0_u8; 4];
+        tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut echoed))
+            .await
+            .expect("the upgraded connection carries bytes")
+            .unwrap();
+        assert_eq!(&echoed, b"ping");
     }
 }
