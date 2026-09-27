@@ -1,5 +1,6 @@
 use std::error::Error as StdError;
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -237,4 +238,45 @@ pub struct CreateDefaults {
     pub vcpu: u32,
     pub memory_mib: i64,
     pub disk_gib: i64,
+}
+
+/// A terminal size in character cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalSize {
+    pub cols: u32,
+    pub rows: u32,
+}
+
+/// The browser side of one web terminal (SPEC 14.6).
+pub struct ConsoleTerminal {
+    /// The size of the first PTY.
+    pub size: TerminalSize,
+    /// Each later size.
+    pub resizes: tokio::sync::mpsc::Receiver<TerminalSize>,
+    /// Keyboard input from the browser.
+    pub input: Pin<Box<dyn tokio::io::AsyncRead + Send>>,
+    /// Guest output for the browser.
+    pub output: Pin<Box<dyn tokio::io::AsyncWrite + Send>>,
+    /// Starts a stopped instance. The page sets this only after a click.
+    pub start: bool,
+}
+
+/// How a web terminal ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConsoleEnd {
+    /// The guest shell ended with this exit status.
+    Exited(u32),
+    /// The control plane could not join the guest. The message is also in
+    /// the output.
+    Failed(String),
+    /// The instance is stopped and the page did not ask to start it.
+    NotRunning,
+}
+
+/// Joins a web terminal to a shell in an instance, as the SSH frontend
+/// joins an SSH session (SPEC 10 steps 7 to 10, SPEC 14.6). The caller has
+/// checked the access. The binary wires the SSH frontend; tests use a fake.
+#[async_trait]
+pub trait Console: Send + Sync + 'static {
+    async fn attach(&self, instance: Instance, terminal: ConsoleTerminal) -> ConsoleEnd;
 }

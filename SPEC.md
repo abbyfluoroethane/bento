@@ -424,6 +424,8 @@ The SSH frontend presents the same host key for every instance. A rename or a na
 
 The SSH frontend also answers `ssh bento.foid.space` with no user name. This session runs the command line interface.
 
+The web terminal of section 14.6 does steps 5 to 10 for a browser. Steps 1 to 4 do not apply: the dashboard session identifies the user, and the URL identifies the instance. Put steps 7 to 10 in one function that both transports call. Do not write the join twice.
+
 ## 11. Instance lifecycle
 
 ### 11.1 States and actions
@@ -565,13 +567,15 @@ The bundle assumes a session and has no sign-in of its own, so a request without
 
 The dashboard is server-rendered HTML from the control plane, with
 [Basecoat](https://basecoatui.com) (the Lyra style pack) for components,
-[HTMX](https://htmx.org) for navigation and the few polled fragments, and
-[uPlot](https://github.com/leeoniya/uPlot) for the resource charts.
+[HTMX](https://htmx.org) for navigation and the few polled fragments,
+[uPlot](https://github.com/leeoniya/uPlot) for the resource charts, and
+[ghostty-web](https://github.com/coder/ghostty-web) for the web terminal
+of section 14.6.
 
 Basecoat is the shadcn/ui visual language as plain HTML, CSS, and a small
 amount of vanilla JavaScript, so the dashboard needs no React, no Radix,
 and no Node build: the templates live in `crates/api/templates`, the
-precompiled Basecoat stylesheet and scripts, HTMX, uPlot, the fonts, and
+precompiled Basecoat stylesheet and scripts, HTMX, uPlot, ghostty-web, the fonts, and
 the branding are checked in under `crates/dashboard/assets`, and
 `rust-embed` puts all of it in the binary. The deployed artifact stays one
 binary with no Node runtime and no build step, which is what the earlier
@@ -581,8 +585,9 @@ Every page works without JavaScript: navigation is links, every change is
 a form that posts and redirects. HTMX adds polling (the instance table,
 the sidebar list, an instance's state badge), boosted navigation, and a
 redirect header when a session ends under a fragment request. The charts
-are the one JavaScript-only element; a page without them still shows the
-figures as text.
+and the web terminal are the two JavaScript-only elements. A page without
+the charts still shows the figures as text. A page without the terminal
+still shows the `ssh` command for the instance.
 
 Keyboard navigation and focus management come from the platform: native
 `<dialog>` and `<details>`, and Basecoat's own handling for the composite
@@ -591,7 +596,7 @@ its `combobox`; a native `<select>` or `<datalist>` is drawn by the browser
 and cannot be styled. Do not replace a control with a plain `div`. An
 infrastructure tool gets used by keyboard.
 
-Record the versions of Basecoat, HTMX, and uPlot in
+Record the versions of Basecoat, HTMX, uPlot, and ghostty-web in
 `crates/dashboard/assets/README.md` when updating them. The Catppuccin
 token set for Basecoat is committed in `crates/dashboard/assets/css/app.css`
 (section 19): the upstream theme is a source, not a build input.
@@ -676,6 +681,44 @@ The HTTP proxy serves the 503 page in section 9.3. The dashboard does not serve 
 This page must render without JavaScript. Write it as static HTML with inline CSS. Use the same palette and the same self-hosted fonts. The page must work when the dashboard bundle is unavailable.
 
 The page names the instance and the state. The page does not name the owner. A visitor to a `public` instance must not learn who owns it.
+
+### 14.6 The web terminal
+
+The Terminal tab of an instance gives a shell in the browser. **The web terminal is equal to `ssh $NAME@bento.foid.space`.** It is not a serial console and it is not a rescue path. It gives the same account, the same shell, and the same access as the SSH frontend. It needs the same things: a running guest, a working guest network, and a running `sshd`. When the guest network is broken, use the serial console of section 15.
+
+**Transport.** The page opens a WebSocket to `/vm/{uuid}/terminal/ws`. The path uses the UUID, not the name, because the UUID is the instance key. The control plane joins the WebSocket to a guest SSH session. It uses the frontend key and the internal address, as in section 10 steps 8 to 10. The control plane already holds the frontend key, so no new secret is necessary.
+
+**Authorization.** The WebSocket request uses the dashboard session cookie. Do these checks before the upgrade:
+
+1. Find the user from the session. Refuse a request with no session.
+2. Compare the `Origin` header with `https://` and the base domain. Refuse a request with a different or missing `Origin`.
+3. Resolve the UUID to an instance.
+4. Check that the user owns the instance or has a share for the UUID. This is section 10 step 6.
+
+Step 2 is necessary. A browser does not apply the same-origin policy to a WebSocket. The session cookie is `SameSite=Lax` and its domain is the base domain. A page on an instance subdomain is therefore same-site, and the browser sends the cookie with its WebSocket request. Without step 2, a `public` instance could open a shell on every instance of each visitor.
+
+Refuse each failed check with the status that `error_parts` gives. Do not tell a user without access that the instance exists.
+
+**Start.** Section 10 step 7 starts a stopped instance. The web terminal does the same, but only after a click. The page connects on load only when the observed state is `running`. For another state, the page shows a Connect button, and the button text says that it starts the instance. A page load must not start an instance. The server enforces this too: it starts a stopped instance only when the URL has `start=1`, and the page adds that value only after a click. Write `bento: starting $NAME` to the terminal before the wait, as in section 10.
+
+**Messages.**
+
+| Direction | Frame | Content |
+| --- | --- | --- |
+| Browser to server | binary | Keyboard input, as raw bytes. |
+| Browser to server | text | One JSON control object: `{"type":"resize","cols":N,"rows":N}`. |
+| Server to browser | binary | Guest output, as raw bytes. |
+| Server to browser | close | Code 1000 with the exit status as the reason, code 1011 with the failure message, or code 4409 when the instance is stopped and the URL has no `start=1`. |
+
+The WebSocket URL carries the first size as `cols` and `rows` query values. The server requests a PTY of that size with `TERM=xterm-256color`. It then requests a shell. Clamp `cols` and `rows` to 1 through 1000.
+
+**Development server.** The dashboard development server has no guest. Its `Origin` is not the base domain, so the terminal refuses it. Test the terminal with the page tests.
+
+**Lifetime.** One WebSocket is one SSH session. When the WebSocket closes, the server closes the guest session. When the guest session ends, the server closes the WebSocket. The server keeps no session after a disconnect, and it does not replay output. A user who wants a session that continues after a disconnect runs `tmux` in the guest, as with SSH. The page does not reconnect automatically. It shows the close reason and a Reconnect button.
+
+**Records.** Update `last_seen_at` when the guest session opens (section 12). Log the user, the instance UUID, the open time, and the close time. Do not log the terminal bytes.
+
+**Client.** Vendor the ES module build of ghostty-web under `crates/dashboard/assets/js/`. That build includes the WebAssembly parser as an inline data URL, so the page loads no second file. Load the module only on the Terminal tab. The terminal uses IBM Plex Mono and the palette of section 14.2. Fit the terminal to its container, and send a resize message when the container size changes.
 
 ## 15. Command line interface
 
@@ -780,7 +823,7 @@ See section 17.
 
 ### 18.4 A serial console in the dashboard
 
-Section 15 gives a serial console over SSH. The dashboard has no equivalent. A console in the browser needs `xterm.js` and a WebSocket. This matters most when the network of an instance is broken, which is the case where the SSH frontend cannot help either.
+Section 14.6 puts a terminal in the dashboard, but that terminal is equal to SSH, not to a serial console. The serial console stays on the command line (section 15). A serial console in the browser matters most when the network of an instance is broken. In that case, neither the SSH frontend nor the web terminal can help. A serial console in the browser can use the same WebSocket and the same ghostty-web client as section 14.6, with the libvirt console stream in place of the SSH session. Build it when a user asks.
 
 ### 18.5 Secure boot and a virtual TPM
 

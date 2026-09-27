@@ -933,6 +933,17 @@ mod tests {
             Ok(())
         }
 
+        async fn shell_request(
+            &mut self,
+            channel: ChannelId,
+            session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            self.events.lock().unwrap().push("shell".to_owned());
+            self.active_channel = Some(channel);
+            session.channel_success(channel)?;
+            Ok(())
+        }
+
         async fn window_change_request(
             &mut self,
             _channel: ChannelId,
@@ -1082,5 +1093,131 @@ mod tests {
         assert_eq!(cli.user.lock().unwrap().as_ref().unwrap().name, "frank");
         assert_eq!(cli.args.lock().unwrap().as_ref().unwrap(), &["ls"]);
         task.abort();
+    }
+
+    async fn start_pty_guest(
+        events: Arc<Mutex<Vec<String>>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        use russh::server::Server as _;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let config = Arc::new(server::Config {
+            keys: vec![private_key().as_ref().clone()],
+            ..server::Config::default()
+        });
+        let task = tokio::spawn(async move {
+            let mut guest = PtyGuestFactory { events };
+            let _ = guest.run_on_socket(config, &listener).await;
+        });
+        (address, task)
+    }
+
+    fn web_terminal(
+        start: bool,
+    ) -> (
+        crate::Terminal,
+        tokio::sync::mpsc::Sender<crate::TerminalSize>,
+        tokio::io::DuplexStream,
+        tokio::io::DuplexStream,
+    ) {
+        let (resize_sender, resizes) = tokio::sync::mpsc::channel(4);
+        let (keyboard, input) = tokio::io::duplex(1024);
+        let (output, screen) = tokio::io::duplex(64 * 1024);
+        let terminal = crate::Terminal {
+            size: crate::TerminalSize { cols: 80, rows: 24 },
+            resizes,
+            input: Box::pin(input),
+            output: Box::pin(output),
+            start,
+        };
+        (terminal, resize_sender, keyboard, screen)
+    }
+
+    #[tokio::test]
+    async fn attach_joins_a_web_terminal_to_a_guest_shell() {
+        use tokio::io::AsyncReadExt as _;
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let (guest_address, guest_task) = start_pty_guest(events.clone()).await;
+        let instances = Arc::new(FakeInstances::default());
+        let mut frontend =
+            Server::for_guests(instances.clone(), Arc::new(FakeStarter), private_key());
+        frontend.dialer = Arc::new(RewriteDialer(guest_address));
+
+        let (terminal, resizes, _keyboard, mut screen) = web_terminal(false);
+        // The fake guest answers the first resize with output and exit 0.
+        resizes
+            .send(crate::TerminalSize {
+                cols: 132,
+                rows: 43,
+            })
+            .await
+            .unwrap();
+        let attached = frontend.attach(instance(), terminal).await;
+        let mut output = Vec::new();
+        screen.read_to_end(&mut output).await.unwrap();
+
+        assert_eq!(attached, crate::Attached::Exited(0));
+        assert_eq!(output, b"resized\n");
+        assert_eq!(
+            events.lock().unwrap().as_slice(),
+            [
+                "pty:xterm-256color:80x24:echo=true",
+                "shell",
+                "window:132x43"
+            ]
+        );
+        // SPEC 14.6: the web terminal counts as a use, as SSH does.
+        assert_eq!(instances.touched.lock().unwrap().as_slice(), ["uuid-web"]);
+        guest_task.abort();
+    }
+
+    #[tokio::test]
+    async fn attach_does_not_start_a_stopped_instance_without_a_request() {
+        let frontend = Server::for_guests(
+            Arc::new(FakeInstances::default()),
+            Arc::new(FakeStarter),
+            private_key(),
+        );
+        let mut stopped = instance();
+        stopped.state = State::Stopped;
+        let (terminal, _resizes, _keyboard, _screen) = web_terminal(false);
+        assert_eq!(
+            frontend.attach(stopped, terminal).await,
+            crate::Attached::NotRunning
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_reports_a_guest_that_never_accepts() {
+        use tokio::io::AsyncReadExt as _;
+
+        // A bound and dropped listener leaves a port that refuses.
+        let closed = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = closed.local_addr().unwrap().to_string();
+        drop(closed);
+        let mut frontend = Server::for_guests(
+            Arc::new(FakeInstances::default()),
+            Arc::new(FakeStarter),
+            private_key(),
+        );
+        frontend.dialer = Arc::new(RewriteDialer(address));
+        frontend.start_timeout = std::time::Duration::from_millis(50);
+        frontend.dial_interval = std::time::Duration::from_millis(10);
+
+        let (terminal, _resizes, _keyboard, mut screen) = web_terminal(true);
+        let attached = frontend.attach(instance(), terminal).await;
+        let mut output = String::new();
+        screen.read_to_string(&mut output).await.unwrap();
+
+        let crate::Attached::Failed(message) = attached else {
+            panic!("expected a failure, got {attached:?}");
+        };
+        assert!(
+            message.contains("web did not accept an SSH connection"),
+            "{message}"
+        );
+        assert_eq!(output, format!("{message}\r\n"));
     }
 }

@@ -10,6 +10,7 @@ async-trait.workspace = true
 axum.workspace = true
 bento-store.workspace = true
 bento-types.workspace = true
+futures.workspace = true
 minijinja = "2"
 russh.workspace = true
 serde.workspace = true
@@ -21,6 +22,9 @@ tracing.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+# The client end of the web terminal test. axum's `ws` feature already
+# builds this crate; the version follows it.
+tokio-tungstenite = "0.29"
 bento-auth.workspace = true
 bento-dashboard.workspace = true
 http-body-util.workspace = true

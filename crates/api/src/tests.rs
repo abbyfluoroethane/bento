@@ -473,11 +473,61 @@ pub(crate) fn instance(
     }
 }
 
+/// A guest shell that echoes the keyboard and reports each resize, so a
+/// test can see both directions of the web terminal (SPEC 14.6).
+#[derive(Default)]
+pub(crate) struct FakeConsole {
+    /// One entry per attach: the UUID, the first size, and the start flag.
+    pub(crate) attached: Mutex<Vec<(String, TerminalSize, bool)>>,
+}
+
+#[async_trait]
+impl Console for FakeConsole {
+    async fn attach(&self, instance: Instance, terminal: ConsoleTerminal) -> ConsoleEnd {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        self.attached
+            .lock()
+            .unwrap()
+            .push((instance.uuid.clone(), terminal.size, terminal.start));
+        if instance.state == InstanceState::Stopped && !terminal.start {
+            return ConsoleEnd::NotRunning;
+        }
+        let ConsoleTerminal {
+            mut resizes,
+            mut input,
+            mut output,
+            ..
+        } = terminal;
+        let _ = output
+            .write_all(format!("hello from {}\r\n", instance.name).as_bytes())
+            .await;
+        let mut buffer = [0_u8; 1024];
+        loop {
+            tokio::select! {
+                read = input.read(&mut buffer) => match read {
+                    Ok(0) | Err(_) => return ConsoleEnd::Exited(0),
+                    Ok(count) if &buffer[..count] == b"exit" => return ConsoleEnd::Exited(3),
+                    Ok(count) => {
+                        let _ = output.write_all(&buffer[..count]).await;
+                    }
+                },
+                Some(size) = resizes.recv() => {
+                    let _ = output
+                        .write_all(format!("size {}x{}\r\n", size.cols, size.rows).as_bytes())
+                        .await;
+                }
+            }
+        }
+    }
+}
+
 pub(crate) struct Fixture {
     pub(crate) store: Arc<FakeStore>,
     pub(crate) lifecycle: Arc<FakeLifecycle>,
     pub(crate) auth: Arc<FakeAuth>,
     pub(crate) image_admin: Arc<FakeImageAdmin>,
+    pub(crate) console: Arc<FakeConsole>,
     pub(crate) app: Router,
     /// The server-rendered dashboard over the same fakes.
     pub(crate) pages: Router,
@@ -531,6 +581,7 @@ pub(crate) fn fixture_with_metrics(metrics: Arc<dyn Metrics>) -> Fixture {
     let lifecycle = Arc::new(FakeLifecycle::new(store.clone()));
     let auth = Arc::new(FakeAuth(Mutex::new(Some(alice.clone()))));
     let image_admin = Arc::new(FakeImageAdmin::default());
+    let console = Arc::new(FakeConsole::default());
     let config = Arc::new(Config {
         store: store.clone(),
         lifecycle: lifecycle.clone(),
@@ -539,6 +590,7 @@ pub(crate) fn fixture_with_metrics(metrics: Arc<dyn Metrics>) -> Fixture {
         image_admin: Some(image_admin.clone()),
         db_path: "/var/lib/bento/bento.db".to_string(),
         metrics,
+        console: console.clone(),
         base_domain: "bento.example".to_string(),
         instance_domain: "bento.example".to_string(),
         reserved_names: vec!["www".to_string(), "bento".to_string()],
@@ -555,6 +607,7 @@ pub(crate) fn fixture_with_metrics(metrics: Arc<dyn Metrics>) -> Fixture {
         lifecycle,
         auth,
         image_admin,
+        console,
         app,
         pages,
         alice,
@@ -1222,6 +1275,7 @@ async fn database_download_is_a_consistent_operator_only_snapshot() {
         image_admin: None,
         db_path: String::new(),
         metrics: Arc::new(crate::PlaceholderMetrics),
+        console: fixture.console.clone(),
         base_domain: "bento.example".to_string(),
         instance_domain: "bento.example".to_string(),
         reserved_names: vec!["www".to_string(), "bento".to_string()],

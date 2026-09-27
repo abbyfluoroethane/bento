@@ -837,3 +837,173 @@ fn seed_demo(fx: &crate::tests::Fixture) {
         }],
     );
 }
+
+/// A WebSocket handshake for the web terminal, without the upgrade: the
+/// checks of SPEC 14.6 answer before it.
+async fn terminal_handshake(app: &Router, path: &str, origin: Option<&str>) -> StatusCode {
+    let mut builder = Request::builder()
+        .method(Method::GET)
+        .uri(path)
+        .header(header::CONNECTION, "upgrade")
+        .header(header::UPGRADE, "websocket")
+        .header(header::SEC_WEBSOCKET_VERSION, "13")
+        .header(header::SEC_WEBSOCKET_KEY, "dGhlIHNhbXBsZSBub25jZQ==");
+    if let Some(origin) = origin {
+        builder = builder.header(header::ORIGIN, origin);
+    }
+    app.clone()
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+        .status()
+}
+
+#[tokio::test]
+async fn the_terminal_socket_refuses_another_origin_and_a_stranger() {
+    let fx = fixture();
+    let path = "/vm/uuid-web/terminal/ws";
+    // A page on an instance subdomain is same-site and carries the cookie,
+    // so only the Origin header keeps it out (SPEC 14.6 step 2).
+    for origin in [
+        None,
+        Some("https://web.bento.example"),
+        Some("http://bento.example"),
+    ] {
+        assert_eq!(
+            terminal_handshake(&fx.pages, path, origin).await,
+            StatusCode::FORBIDDEN,
+            "{origin:?}"
+        );
+    }
+    *fx.auth.0.lock().unwrap() = Some(fx.bob.clone());
+    assert_eq!(
+        terminal_handshake(&fx.pages, path, Some("https://bento.example")).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        terminal_handshake(
+            &fx.pages,
+            "/vm/uuid-none/terminal/ws",
+            Some("https://bento.example")
+        )
+        .await,
+        StatusCode::NOT_FOUND
+    );
+    assert!(fx.console.attached.lock().unwrap().is_empty());
+}
+
+mod terminal_socket {
+    use futures::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode;
+
+    use super::*;
+
+    type Socket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn serve(app: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        address
+    }
+
+    async fn open(address: &str, path: &str) -> Socket {
+        let mut request = format!("ws://{address}{path}")
+            .into_client_request()
+            .unwrap();
+        request
+            .headers_mut()
+            .insert(header::ORIGIN, "https://bento.example".parse().unwrap());
+        tokio_tungstenite::connect_async(request).await.unwrap().0
+    }
+
+    /// Reads binary frames until `want` has arrived.
+    async fn read_until(socket: &mut Socket, want: &str) -> String {
+        let mut seen = String::new();
+        while !seen.contains(want) {
+            match socket.next().await {
+                Some(Ok(Message::Binary(bytes))) => seen.push_str(&String::from_utf8_lossy(&bytes)),
+                other => panic!("waiting for {want:?} after {seen:?}, got {other:?}"),
+            }
+        }
+        seen
+    }
+
+    async fn close_of(socket: &mut Socket) -> (CloseCode, String) {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Close(Some(frame)))) => {
+                    return (frame.code, frame.reason.to_string());
+                }
+                Some(Ok(Message::Binary(_))) => {}
+                other => panic!("expected a close frame, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn keyboard_resize_and_exit_cross_the_socket() {
+        let fx = fixture();
+        let address = serve(fx.pages.clone()).await;
+        let mut socket = open(&address, "/vm/uuid-web/terminal/ws?cols=5000&rows=30").await;
+
+        read_until(&mut socket, "hello from web").await;
+        socket.send(Message::binary(&b"ls\r"[..])).await.unwrap();
+        read_until(&mut socket, "ls\r").await;
+        socket
+            .send(Message::text(r#"{"type":"resize","cols":120,"rows":40}"#))
+            .await
+            .unwrap();
+        read_until(&mut socket, "size 120x40").await;
+        socket.send(Message::binary(&b"exit"[..])).await.unwrap();
+        assert_eq!(
+            close_of(&mut socket).await,
+            (CloseCode::Normal, "exit 3".to_owned())
+        );
+
+        let attached = fx.console.attached.lock().unwrap().clone();
+        assert_eq!(
+            attached,
+            [(
+                "uuid-web".to_owned(),
+                crate::TerminalSize {
+                    cols: 1000,
+                    rows: 30
+                },
+                false
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stopped_vm_starts_only_when_the_page_asks() {
+        // Alice holds a share on the stopped VM `db`.
+        let fx = fixture();
+        let address = serve(fx.pages.clone()).await;
+
+        let mut socket = open(&address, "/vm/uuid-db/terminal/ws").await;
+        assert_eq!(
+            close_of(&mut socket).await,
+            (
+                CloseCode::Library(crate::pages::terminal::CLOSE_NOT_RUNNING),
+                "the VM is not running".to_owned()
+            )
+        );
+
+        let mut socket = open(&address, "/vm/uuid-db/terminal/ws?start=1").await;
+        read_until(&mut socket, "hello from db").await;
+        let starts: Vec<bool> = fx
+            .console
+            .attached
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(_, _, start)| *start)
+            .collect();
+        assert_eq!(starts, [false, true]);
+    }
+}
