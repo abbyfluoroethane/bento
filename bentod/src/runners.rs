@@ -451,6 +451,42 @@ impl InstanceSync {
         }
     }
 
+    /// Defines an existing instance again on its own machine and keeps
+    /// its files (MULTI-NODE 11.5). A rename and a resize go here, never
+    /// to `RemoveInstance`, which deletes the disk.
+    pub(crate) async fn redefine(
+        &self,
+        host: &Host,
+        request: bento_runner::RedefineRequest,
+    ) -> Result<bento_types::State> {
+        let endpoint = host
+            .endpoint
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("machine {} has no endpoint", host.name))?;
+        let current = self.lease.lease().await?;
+        let body = serde_json::to_string(&request)?;
+        let object = self
+            .object_fence(&request.instance.uuid, &digest_of(&body), current.epoch)
+            .await?;
+        let reply = send(
+            self.client.as_ref(),
+            endpoint,
+            host,
+            &current,
+            Operation::RedefineInstance {
+                redefine: Box::new(request),
+            },
+            Some(object),
+            self.request_timeout,
+        )
+        .await
+        .map_err(anyhow::Error::msg)?;
+        match reply {
+            Reply::Changed { state } => Ok(state),
+            other => anyhow::bail!("machine answered {other:?} to a redefine request"),
+        }
+    }
+
     /// Sends a read, which needs no object and records no generation.
     pub(crate) async fn read(&self, host: &Host, op: Operation) -> Result<Reply> {
         let endpoint = host
@@ -501,24 +537,6 @@ impl InstanceSync {
         match reply {
             Reply::Changed { state } => Ok(state),
             other => anyhow::bail!("machine answered {other:?} to an instance change"),
-        }
-    }
-
-    /// The UUID of a domain on one machine, by its name.
-    ///
-    /// The runner protocol names an instance by both, because the UUID
-    /// is the identifier and the name is a label (SPEC 7.2). The
-    /// lifecycle code above acts on names, so this looks the UUID up
-    /// from the machine's own inventory rather than guessing.
-    pub(crate) async fn uuid_of(&self, host: &Host, name: &str) -> Result<String> {
-        match self.read(host, Operation::Inventory).await? {
-            Reply::Inventory(inventory) => inventory
-                .domains
-                .into_iter()
-                .find(|domain| domain.name == name)
-                .map(|domain| domain.uuid)
-                .ok_or_else(|| anyhow::anyhow!("machine {} has no domain {name}", host.name)),
-            other => anyhow::bail!("machine answered {other:?} to an inventory request"),
         }
     }
 
@@ -583,11 +601,15 @@ impl RunnerHypervisor {
         op: impl Fn(bento_runner::InstanceRef) -> Operation,
         name: &str,
     ) -> std::result::Result<bento_types::State, bento_hypervisor::Error> {
-        let uuid = self
-            .sync
-            .uuid_of(&self.host, name)
-            .await
-            .map_err(|error| bento_hypervisor::Error::Operation(error.to_string()))?;
+        // A missing domain is `DomainNotFound`, as from a local libvirt.
+        // The lifecycle relies on that to remove a row whose domain is
+        // already gone (SPEC 11.1).
+        let uuid = bento_hypervisor::Hypervisor::list(self)
+            .await?
+            .into_iter()
+            .find(|domain| domain.name == name)
+            .map(|domain| domain.uuid)
+            .ok_or_else(|| bento_hypervisor::Error::DomainNotFound(name.to_owned()))?;
         let instance = bento_runner::InstanceRef {
             uuid,
             name: name.to_owned(),
@@ -1105,6 +1127,39 @@ mod tests {
             .await
             .unwrap();
         (directory, store)
+    }
+
+    #[tokio::test]
+    async fn an_action_on_a_missing_remote_domain_is_domain_not_found() {
+        // `rm` of a row whose domain is already gone must succeed on a
+        // runner as it does locally. It failed with a plain operation
+        // error, so such a row could not be removed (SPEC 11.1).
+        let (_directory, store) = store().await;
+        let host = store
+            .register_runner("runner-a.example.org", ENDPOINT, UNDERLAY)
+            .await
+            .unwrap();
+        let client = Arc::new(FakeClient::new(vec![Ok(Reply::Inventory(
+            bento_runner::Inventory { domains: vec![] },
+        ))]));
+        let sync = InstanceSync {
+            client: client.clone(),
+            lease: LeaseSource::Held(lease()),
+            store: store.clone(),
+            request_timeout: REQUEST_TIMEOUT,
+        };
+        let hypervisor = RunnerHypervisor::new(sync, host);
+
+        let error = bento_hypervisor::Hypervisor::remove(&hypervisor, "gone")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, bento_hypervisor::Error::DomainNotFound(ref name) if name == "gone"),
+            "{error:?}"
+        );
+        // Only the inventory read went out; nothing was sent to remove.
+        assert_eq!(client.calls.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

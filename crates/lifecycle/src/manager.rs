@@ -149,6 +149,27 @@ pub trait Fleet: Send + Sync {
     /// deployment with no runner endpoints answers for any machine but
     /// its own.
     async fn hypervisor(&self, host_id: i64) -> Option<Arc<dyn Hypervisor>>;
+    /// Defines an existing instance again on the machine that runs it,
+    /// and keeps its overlay and seed image (MULTI-NODE 11.5).
+    ///
+    /// A rename and a resize of an instance on another machine go here.
+    /// They must never undefine through [`Fleet::hypervisor`]: on another
+    /// machine that `remove` also deletes the disk. Returns the state the
+    /// machine observed afterwards.
+    async fn redefine(&self, spec: &RedefineSpec) -> std::result::Result<State, DynError>;
+}
+
+/// What one machine needs to define one existing instance again.
+#[derive(Debug, Clone)]
+pub struct RedefineSpec {
+    /// The machine that runs it.
+    pub host_id: i64,
+    /// The instance with the name and size it is to have.
+    pub instance: Instance,
+    /// The libvirt network of the owner (SPEC 6.2).
+    pub network: String,
+    /// The domain name libvirt has now, when a rename changes it.
+    pub previous_name: Option<String>,
 }
 
 /// What one machine needs to build one instance.

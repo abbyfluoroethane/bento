@@ -65,7 +65,7 @@ mod tests {
     use super::*;
     use crate::{
         Capabilities, Health, HostError, InstanceRef, Inventory, Operation, PROTOCOL_VERSION,
-        Refusal, Reply, SqliteFence,
+        RedefineRequest, Refusal, Reply, SqliteFence,
     };
 
     const MACHINE: &str = "167eeb6836c44115aa084e7780e4328c";
@@ -143,6 +143,9 @@ mod tests {
             Ok(bento_types::State::Running)
         }
         async fn remove(&self, _: &InstanceRef) -> Result<bento_types::State, HostError> {
+            Ok(bento_types::State::Stopped)
+        }
+        async fn redefine(&self, _: &RedefineRequest) -> Result<bento_types::State, HostError> {
             Ok(bento_types::State::Stopped)
         }
         async fn inventory(&self) -> Result<Inventory, HostError> {

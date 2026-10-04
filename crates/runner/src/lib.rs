@@ -21,8 +21,8 @@ pub use client::{ClientError, RunnerClient};
 pub use fence::{Admission, Fence, FenceStore};
 pub use protocol::{
     Capabilities, CpuTimeSample, Domain, DomainUsage, Envelope, Health, HostSample, ImageRequest,
-    InstanceRef, Inventory, ObjectFence, Operation, PROTOCOL_VERSION, ProvisionRequest, Refusal,
-    Reply, Samples,
+    InstanceRef, Inventory, ObjectFence, Operation, PROTOCOL_VERSION, ProvisionRequest,
+    RedefineRequest, Refusal, Reply, Samples,
 };
 pub use store::SqliteFence;
 
@@ -54,6 +54,10 @@ pub trait Host: Send + Sync {
     async fn stop(&self, instance: &InstanceRef) -> Result<bento_types::State, HostError>;
     async fn reboot(&self, instance: &InstanceRef) -> Result<bento_types::State, HostError>;
     async fn remove(&self, instance: &InstanceRef) -> Result<bento_types::State, HostError>;
+    /// Defines an existing instance again and keeps its overlay and seed
+    /// image (MULTI-NODE 11.5). A rename undefines the previous name
+    /// first; the files stay, because only the label changes.
+    async fn redefine(&self, request: &RedefineRequest) -> Result<bento_types::State, HostError>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -99,6 +103,9 @@ pub async fn serve_one(
                 },
                 Operation::RemoveInstance { instance } => Reply::Changed {
                     state: host.remove(instance).await?,
+                },
+                Operation::RedefineInstance { redefine } => Reply::Changed {
+                    state: host.redefine(redefine).await?,
                 },
             };
             // A change is recorded before the answer leaves, so a retry

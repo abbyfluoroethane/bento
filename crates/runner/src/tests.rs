@@ -137,6 +137,9 @@ impl Host for FakeHost {
     async fn remove(&self, _: &InstanceRef) -> Result<bento_types::State, HostError> {
         Ok(bento_types::State::Stopped)
     }
+    async fn redefine(&self, _: &RedefineRequest) -> Result<bento_types::State, HostError> {
+        Ok(bento_types::State::Stopped)
+    }
 }
 
 #[test]
@@ -496,6 +499,9 @@ async fn a_refused_request_never_reaches_the_host() {
             panic!("the host was asked despite a refusal");
         }
         async fn remove(&self, _: &InstanceRef) -> Result<bento_types::State, HostError> {
+            panic!("the host was asked despite a refusal");
+        }
+        async fn redefine(&self, _: &RedefineRequest) -> Result<bento_types::State, HostError> {
             panic!("the host was asked despite a refusal");
         }
     }

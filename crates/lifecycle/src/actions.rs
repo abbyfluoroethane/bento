@@ -178,6 +178,11 @@ impl Manager {
     }
 
     pub(crate) async fn redefine(&self, instance: &Instance) -> Result<()> {
+        if instance.host_id != self.host_id {
+            // The local definer would put the domain on this machine, and
+            // the instance runs on another one (MULTI-NODE 11.5).
+            return self.redefine_elsewhere(instance, None).await.map(|_| ());
+        }
         let Some(definer) = &self.definer else {
             self.log.warn("redefine: hypervisor cannot redefine XML; stored configuration applies at the next redefine");
             return Ok(());
@@ -189,6 +194,34 @@ impl Manager {
             )
             .await?;
         definer.define(&xml).await.map_err(|error| {
+            Error::operation(format!("lifecycle: redefine {}: {error}", instance.name))
+        })
+    }
+}
+
+impl Manager {
+    /// Asks the machine that runs `instance` to define it again, with the
+    /// facts that machine renders into its own XML (MULTI-NODE 11.5).
+    /// `previous_name` is the domain name libvirt has now, for a rename.
+    pub(crate) async fn redefine_elsewhere(
+        &self,
+        instance: &Instance,
+        previous_name: Option<&str>,
+    ) -> Result<State> {
+        let owner = self
+            .store
+            .user_by_id(instance.owner_id)
+            .await
+            .map_err(|error| {
+                Error::operation(format!("lifecycle: owner of {}: {error}", instance.name))
+            })?;
+        let spec = crate::RedefineSpec {
+            host_id: instance.host_id,
+            instance: instance.clone(),
+            network: self.user_network_name(&owner)?,
+            previous_name: previous_name.map(str::to_owned),
+        };
+        self.fleet.redefine(&spec).await.map_err(|error| {
             Error::operation(format!("lifecycle: redefine {}: {error}", instance.name))
         })
     }

@@ -390,6 +390,8 @@ struct TestImages {
     acted_on: Mutex<Vec<i64>>,
     /// Machines that cannot be reached, by id.
     unreachable: Mutex<Vec<i64>>,
+    /// Every redefine request as `host name previous`, in order.
+    redefined: Mutex<Vec<String>>,
     /// The machine this fake stands for. Only work aimed here reaches
     /// the hypervisor, as with the real one.
     fake: Arc<Fake>,
@@ -407,6 +409,7 @@ impl TestImages {
             placed_on: Mutex::new(Vec::new()),
             acted_on: Mutex::new(Vec::new()),
             unreachable: Mutex::new(Vec::new()),
+            redefined: Mutex::new(Vec::new()),
             fake,
             iso,
             storage_dir,
@@ -489,8 +492,83 @@ impl Fleet for TestImages {
             return None;
         }
         // One fake machine stands for the whole fleet here, so an action
-        // aimed anywhere reaches the same domains the manager reads.
-        Some(self.fake.clone())
+        // aimed anywhere reaches the same domains the manager reads. Its
+        // `remove` deletes the files, as a runner's does (MULTI-NODE 11.5).
+        Some(Arc::new(RunnerLike {
+            fake: self.fake.clone(),
+            storage_dir: self.storage_dir.clone(),
+        }))
+    }
+
+    async fn redefine(&self, spec: &RedefineSpec) -> std::result::Result<State, DynError> {
+        let name = &spec.instance.name;
+        self.redefined.lock().unwrap().push(format!(
+            "{} {name} {}",
+            spec.host_id,
+            spec.previous_name.as_deref().unwrap_or("-")
+        ));
+        if let Some(error) = self.error.lock().unwrap().clone() {
+            return Err(boxed(&error));
+        }
+        // What a runner does: undefine the old name, keep every file, and
+        // define the new name stopped.
+        if let Some(previous) = spec.previous_name.as_deref().filter(|p| *p != name)
+            && let Some(mut domain) = self.fake.domain(previous)
+        {
+            if domain.state != State::Stopped {
+                return Err(boxed(&format!("{previous} is {}", domain.state)));
+            }
+            bento_hypervisor::Hypervisor::remove(self.fake.as_ref(), previous).await?;
+            domain.name.clone_from(name);
+            domain.xml = format!("<name>{name}</name>");
+            self.fake.set_domain(domain);
+        }
+        Ok(State::Stopped)
+    }
+}
+
+/// The hypervisor of another machine, reached through its runner. It is
+/// the shared fake, except that `remove` also deletes the overlay and the
+/// seed image, because a runner's `RemoveInstance` does (MULTI-NODE 11.5).
+/// A rename that undefines through it loses the disk, which is the bug
+/// these tests guard against.
+struct RunnerLike {
+    fake: Arc<Fake>,
+    storage_dir: PathBuf,
+}
+
+#[async_trait]
+impl Hypervisor for RunnerLike {
+    async fn create(&self, xml: &str) -> std::result::Result<(), HypervisorError> {
+        self.fake.create(xml).await
+    }
+    async fn start(&self, name: &str) -> std::result::Result<(), HypervisorError> {
+        self.fake.start(name).await
+    }
+    async fn stop(
+        &self,
+        name: &str,
+    ) -> std::result::Result<bento_hypervisor::StopResult, HypervisorError> {
+        self.fake.stop(name).await
+    }
+    async fn reboot(&self, name: &str) -> std::result::Result<(), HypervisorError> {
+        self.fake.reboot(name).await
+    }
+    async fn remove(&self, name: &str) -> std::result::Result<(), HypervisorError> {
+        let uuid = self.fake.domain(name).map(|domain| domain.uuid);
+        self.fake.remove(name).await?;
+        if let Some(uuid) = uuid {
+            for file in [format!("{uuid}.qcow2"), format!("{uuid}-seed.iso")] {
+                let _ = tokio::fs::remove_file(self.storage_dir.join(file)).await;
+            }
+        }
+        Ok(())
+    }
+    async fn list(&self) -> std::result::Result<Vec<DomainInfo>, HypervisorError> {
+        self.fake.list().await
+    }
+    async fn state(&self, name: &str) -> std::result::Result<State, HypervisorError> {
+        self.fake.state(name).await
     }
 }
 
@@ -1674,6 +1752,72 @@ async fn rename_store_failure_leaves_domain() {
     f.store.data().rename_error = Some("cooldown".into());
     assert!(f.manager.rename(&instance.uuid, "api").await.is_err());
     assert!(f.fake.domain("web").is_some());
+}
+
+/// Moves every instance row to machine 2, a runner, as the copy test does.
+fn move_to_runner(f: &Fixture) {
+    f.store
+        .data()
+        .instances
+        .iter_mut()
+        .for_each(|instance| instance.host_id = 2);
+}
+
+#[tokio::test]
+async fn rename_on_another_machine_keeps_the_disk() {
+    // A rename on a runner once undefined through `Hypervisor::remove`,
+    // which on a runner is `RemoveInstance` and deletes the disk. It must
+    // redefine on that machine instead (MULTI-NODE 11.5).
+    let f = fixture(true, false);
+    let instance = setup(&f).await;
+    f.manager.stop(&instance.uuid).await.unwrap();
+    move_to_runner(&f);
+    let overlay = f.manager.overlay_path(&instance.uuid);
+    assert!(overlay.exists());
+
+    f.manager.rename(&instance.uuid, "api").await.unwrap();
+
+    assert!(overlay.exists(), "the rename deleted the disk");
+    assert_eq!(f.store.instance(&instance.uuid).await.unwrap().name, "api");
+    assert_eq!(*f.images.redefined.lock().unwrap(), ["2 api web"]);
+    assert!(f.fake.domain("web").is_none());
+    assert_eq!(f.fake.domain("api").unwrap().uuid, instance.uuid);
+    assert!(
+        f.definer.xml.lock().unwrap().is_empty(),
+        "the controller defined a domain that runs on another machine"
+    );
+}
+
+#[tokio::test]
+async fn rename_on_another_machine_reverts_the_row_when_redefine_fails() {
+    let f = fixture(true, false);
+    let instance = setup(&f).await;
+    f.manager.stop(&instance.uuid).await.unwrap();
+    move_to_runner(&f);
+    *f.images.error.lock().unwrap() = Some("runner unreachable".into());
+
+    assert!(f.manager.rename(&instance.uuid, "api").await.is_err());
+
+    assert_eq!(f.store.instance(&instance.uuid).await.unwrap().name, "web");
+    assert!(f.manager.overlay_path(&instance.uuid).exists());
+    assert!(f.fake.domain("web").is_some());
+}
+
+#[tokio::test]
+async fn redefine_on_another_machine_goes_to_that_machine() {
+    // A resize that needs a restart redefines the domain. The local
+    // definer would put the domain on the controller (MULTI-NODE 11.5).
+    let f = fixture(true, false);
+    let mut instance = setup(&f).await;
+    move_to_runner(&f);
+    instance.host_id = 2;
+    instance.memory_mib = 4096;
+
+    f.manager.redefine(&instance).await.unwrap();
+
+    assert_eq!(*f.images.redefined.lock().unwrap(), ["2 web -"]);
+    assert!(f.definer.xml.lock().unwrap().is_empty());
+    assert!(f.manager.overlay_path(&instance.uuid).exists());
 }
 
 #[tokio::test]
