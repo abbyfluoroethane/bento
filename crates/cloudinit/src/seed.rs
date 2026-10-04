@@ -3,6 +3,20 @@ use std::net::IpAddr;
 
 use crate::builder::Error;
 
+/// The guest path of the DAMON_RECLAIM unit (SPEC 5.2).
+pub const DAMON_UNIT_PATH: &str = "/etc/systemd/system/bento-damon-reclaim.service";
+
+/// A boot-time unit that turns on DAMON_RECLAIM (SPEC 5.2, 5.3). Free
+/// page reporting returns only free guest pages to the host, and page
+/// cache is not free. DAMON_RECLAIM reclaims cold page cache, so the
+/// pages become free and free page reporting returns them. Module
+/// parameters reset at each boot and `runcmd` runs once per instance-id,
+/// so a unit must set them at every boot. It writes every parameter
+/// before `enabled`. The unit condition skips a kernel without the
+/// module, so the boot never fails. Hand-applied instances carry the
+/// same bytes; edit the file, never a copy.
+pub const DAMON_UNIT: &str = include_str!("../guest/bento-damon-reclaim.service");
+
 /// The data for one NoCloud seed: hostname, one user account with the
 /// owner's public keys, and the static network configuration that Bento
 /// assigned (SPEC sections 5.2 and 6.2).
@@ -102,8 +116,10 @@ impl Seed {
 
     /// Renders the NoCloud `user-data` file. Per SPEC section 5.2 it
     /// sets the host name to the instance name, creates one user account,
-    /// installs the public keys of the owner, and installs and starts
-    /// `qemu-guest-agent`. The static network settings live in
+    /// installs the public keys of the owner, installs and starts
+    /// `qemu-guest-agent`, and installs and enables the DAMON_RECLAIM unit
+    /// for every image kind, because `/etc` is writable on bootc too. The
+    /// static network settings live in
     /// [`Seed::network_config`].
     pub fn user_data(&self) -> Result<String, Error> {
         self.validate()?;
@@ -123,8 +139,14 @@ impl Seed {
             rendered.push_str("packages:\n");
             rendered.push_str("  - qemu-guest-agent\n");
         }
+        rendered.push_str("write_files:\n");
+        write_file(&mut rendered, DAMON_UNIT_PATH, "0644", DAMON_UNIT);
         rendered.push_str("runcmd:\n");
         rendered.push_str("  - [systemctl, enable, --now, qemu-guest-agent]\n");
+        // write_files runs after systemd loaded its units, so reload
+        // before the enable (SPEC 5.2).
+        rendered.push_str("  - [systemctl, daemon-reload]\n");
+        rendered.push_str("  - [systemctl, enable, --now, bento-damon-reclaim.service]\n");
         Ok(rendered)
     }
 
@@ -151,6 +173,24 @@ impl Seed {
         rendered.push_str("      addresses:\n");
         writeln!(rendered, "        - {}", quote(&self.dns)).unwrap();
         Ok(rendered)
+    }
+}
+
+/// Renders one `write_files` entry owned by root. A literal block keeps
+/// quotes, `$`, backslashes, and `#` verbatim, and its clip chomping keeps
+/// exactly one final newline (SPEC 5.2). The tests check that each file
+/// survives the round trip.
+fn write_file(rendered: &mut String, path: &str, permissions: &str, content: &str) {
+    writeln!(rendered, "  - path: {}", quote(path)).unwrap();
+    rendered.push_str("    owner: \"root:root\"\n");
+    writeln!(rendered, "    permissions: {}", quote(permissions)).unwrap();
+    rendered.push_str("    content: |\n");
+    for line in content.lines() {
+        if line.is_empty() {
+            rendered.push('\n');
+        } else {
+            writeln!(rendered, "      {line}").unwrap();
+        }
     }
 }
 
@@ -304,6 +344,97 @@ pub(crate) mod tests {
     fn user_data_starts_with_cloud_config_header() {
         let rendered = test_seed().user_data().unwrap();
         assert!(rendered.starts_with("#cloud-config\n"));
+    }
+
+    /// Reads back the `content: |` block after the entry for `path` the
+    /// way a YAML literal block parser does: strip the six-space indent,
+    /// keep empty lines, stop at the first less-indented line.
+    fn literal_content(rendered: &str, path: &str) -> String {
+        let mut lines = rendered.lines();
+        let entry = format!("  - path: {}", quote(path));
+        lines
+            .by_ref()
+            .find(|line| *line == entry)
+            .expect("no entry");
+        lines
+            .by_ref()
+            .find(|line| *line == "    content: |")
+            .expect("no content block");
+        let mut content = String::new();
+        for line in lines {
+            if line.is_empty() {
+                content.push('\n');
+            } else if let Some(text) = line.strip_prefix("      ") {
+                content.push_str(text);
+                content.push('\n');
+            } else {
+                break;
+            }
+        }
+        while content.ends_with("\n\n") {
+            content.pop();
+        }
+        content
+    }
+
+    /// SHA-256 of the unit on the hand-applied instance (SPEC 5.2).
+    const DAMON_UNIT_SHA256: &str =
+        "99ea853d56c94aad71ef3ee9aabd7f502d1e99a871491fda188467901e5f9c0a";
+
+    #[test]
+    fn user_data_installs_damon_reclaim() {
+        for install_guest_agent in [true, false] {
+            let mut seed = test_seed();
+            seed.install_guest_agent = install_guest_agent;
+            let rendered = seed.user_data().unwrap();
+            let header = format!(
+                "  - path: \"{DAMON_UNIT_PATH}\"\n    owner: \"root:root\"\n    permissions: \"0644\"\n    content: |\n"
+            );
+            assert!(rendered.contains(&header), "{rendered}");
+            assert_eq!(literal_content(&rendered, DAMON_UNIT_PATH), DAMON_UNIT);
+            let runcmd = rendered.split_once("runcmd:\n").unwrap().1;
+            assert_eq!(
+                runcmd,
+                "  - [systemctl, enable, --now, qemu-guest-agent]\n  - [systemctl, daemon-reload]\n  - [systemctl, enable, --now, bento-damon-reclaim.service]\n"
+            );
+        }
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    #[test]
+    fn damon_unit_matches_hand_applied_instance() {
+        assert_eq!(sha256_hex(DAMON_UNIT.as_bytes()), DAMON_UNIT_SHA256);
+        // A literal block cannot carry these without change.
+        assert!(DAMON_UNIT.ends_with('\n') && !DAMON_UNIT.ends_with("\n\n"));
+        assert!(!DAMON_UNIT.contains('\t') && !DAMON_UNIT.contains('\r'));
+        assert!(DAMON_UNIT.lines().all(|line| line == line.trim_end()));
+        assert!(
+            DAMON_UNIT
+                .contains("ConditionPathExists=/sys/module/damon_reclaim/parameters/enabled\n")
+        );
+    }
+
+    #[test]
+    fn damon_unit_writes_parameters_before_enabled() {
+        // DAMON_RECLAIM reads its parameters when it turns on, so a
+        // parameter written after `enabled` waits for `commit_inputs`.
+        let enabled = DAMON_UNIT.find("echo Y > enabled").unwrap();
+        for write in [
+            "echo 300000000 > min_age",
+            "echo Y > skip_anon",
+            "echo 1000 > wmarks_high",
+            "echo 999 > wmarks_mid",
+            "echo 0 > wmarks_low",
+        ] {
+            assert!(DAMON_UNIT.find(write).unwrap() < enabled, "{write}");
+        }
     }
 
     #[test]
