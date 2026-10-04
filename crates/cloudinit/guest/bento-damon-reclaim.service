@@ -1,0 +1,11 @@
+[Unit]
+Description=Bento: return cold guest page cache to the host (DAMON_RECLAIM)
+ConditionPathExists=/sys/module/damon_reclaim/parameters/enabled
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/sh -c 'cd /sys/module/damon_reclaim/parameters && echo 300000000 > min_age && echo Y > skip_anon && echo 1000 > wmarks_high && echo 999 > wmarks_mid && echo 0 > wmarks_low && if [ "$(cat enabled)" = Y ]; then echo Y > commit_inputs; else echo Y > enabled; fi'
+
+[Install]
+WantedBy=multi-user.target

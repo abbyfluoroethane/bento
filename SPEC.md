@@ -162,6 +162,23 @@ Bento configures the first boot with `cloud-init` and the NoCloud data source. B
 - Install the public keys of the owner.
 - Set the static address, the gateway, and the DNS server. See section 6.2.
 - Install and start `qemu-guest-agent` for a traditional cloud image. A bootc image must already contain the package because its `/usr` is immutable; first boot only enables it.
+- Write the unit `/etc/systemd/system/bento-damon-reclaim.service` and enable it. At each boot, the unit turns on the DAMON_RECLAIM kernel module. This applies to both image kinds, because `/etc` is writable in a bootc image.
+
+DAMON_RECLAIM finds cold pages in the guest and reclaims them. Free page reporting (section 5.3) returns only free pages to the host. Page cache is not free. Without DAMON_RECLAIM, the host keeps the page cache of each guest in memory and later swaps it. With DAMON_RECLAIM, cold page cache becomes free, and free page reporting returns it to the host. This gives the overcommit ratio in section 5.3 real memory to use.
+
+The unit sets these module parameters:
+
+- `min_age` is 300000000 microseconds (5 minutes).
+- `skip_anon` is `Y`. DAMON_RECLAIM reclaims only page cache. Application memory stays in guest memory and does not go to guest swap.
+- The watermarks are 1000, 999, and 0, so DAMON_RECLAIM is always active.
+
+The default watermarks make DAMON_RECLAIM active only when 20% to 40% of guest memory is free. An idle guest usually has more than 40% free memory, and a busy guest can have less than 20%.
+
+The kernel resets the parameters at each boot, and `runcmd` runs only once for each instance-id. Thus a unit must set them at each boot. The unit writes every parameter before it writes `enabled`. If DAMON_RECLAIM already runs, the unit writes `commit_inputs` instead.
+
+This feature is best effort. It operates only when the guest kernel has DAMON_RECLAIM, and only from Linux 6.17. If the kernel does not have the module, the unit condition is false, and systemd skips the unit. The boot does not fail.
+
+Before Linux 6.17, the module drops its own scheme when it starts, so it reclaims nothing (upstream fix fed48693bdfe). The Fedora 44 image has a correct kernel. The Debian 13 image does not, so the unit runs there but does nothing.
 
 A bootc OCI image must contain a kernel, `cloud-init` with the NoCloud data source, and `qemu-guest-agent`. Bento checks the required files before the privileged build. This is a useful preflight, not proof that the resulting guest boots. Bento uses the same cloud-init seed and instance lifecycle after conversion; there is no separate boot path. The source kind is stored on each immutable image version, and instance creation and copy use the kind of the exact backing checksum rather than the mutable allowlist row.
 
