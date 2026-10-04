@@ -477,6 +477,49 @@ impl bento_lifecycle::Fleet for RunnerFleet {
         )))
     }
 
+    async fn redefine(
+        &self,
+        spec: &bento_lifecycle::RedefineSpec,
+    ) -> Result<State, LifecycleError> {
+        if spec.host_id == self.host_id {
+            // The manager defines this machine's domains with its local
+            // definer and sends only other machines here.
+            return Err(Box::new(SimpleError(
+                "this machine redefines its own domains locally, not through the fleet".to_owned(),
+            )));
+        }
+        let runners = self.runners.as_ref().ok_or_else(|| {
+            Box::new(SimpleError(
+                "this deployment has no runner endpoints, so it cannot redefine an \
+                 instance on another machine"
+                    .to_owned(),
+            )) as LifecycleError
+        })?;
+        let host = self
+            .store
+            .host(spec.host_id)
+            .await
+            .map_err(|error| Box::new(SimpleError(error.to_string())) as LifecycleError)?;
+        let instance = &spec.instance;
+        let request = bento_runner::RedefineRequest {
+            instance: bento_runner::InstanceRef {
+                uuid: instance.uuid.clone(),
+                name: instance.name.clone(),
+            },
+            previous_name: spec.previous_name.clone(),
+            vcpu: instance.vcpu,
+            memory_mib: instance.memory_mib,
+            nested: instance.nested,
+            ksm: instance.ksm,
+            network: spec.network.clone(),
+            mac: instance.mac.clone(),
+        };
+        runners
+            .redefine(&host, request)
+            .await
+            .map_err(|error| Box::new(SimpleError(error.to_string())) as LifecycleError)
+    }
+
     async fn deprovision(
         &self,
         host_id: i64,

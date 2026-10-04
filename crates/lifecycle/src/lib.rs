@@ -19,8 +19,8 @@ mod runner;
 pub use actions::{ResizeRequest, ResizeResult};
 pub use manager::{
     Clock, Config, DeleteIso, DeleteIsoFuture, DynError, Fleet, ISOBuilder, IsoExists,
-    LifecycleLogger, Manager, NestedProbe, OverlayResizer, ProvisionSpec, Result, Sleep, Store,
-    UuidMint, random_uuid,
+    LifecycleLogger, Manager, NestedProbe, OverlayResizer, ProvisionSpec, RedefineSpec, Result,
+    Sleep, Store, UuidMint, random_uuid,
 };
 pub use new::{GUEST_USER, NewRequest};
 pub use reconcile::ReconcileReport;

@@ -152,6 +152,37 @@ pub enum Operation {
     RemoveInstance {
         instance: InstanceRef,
     },
+    /// Replace the definition of a domain that is already built, and keep
+    /// its overlay and seed image (MULTI-NODE 11.5).
+    ///
+    /// A rename and a resize both change only the definition. They must
+    /// never go through [`Operation::RemoveInstance`], which deletes the
+    /// disk.
+    RedefineInstance {
+        redefine: Box<RedefineRequest>,
+    },
+}
+
+/// The facts a machine needs to define an existing instance again.
+///
+/// Like [`ProvisionRequest`] it carries facts, never paths: the machine
+/// renders its own overlay and seed paths. It attaches the seed image
+/// only while that file is still on the machine (SPEC 5.2).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RedefineRequest {
+    /// The instance with the name it is to have.
+    pub instance: InstanceRef,
+    /// The domain name libvirt has now, when a rename changes it. The
+    /// machine undefines that name first and keeps the files. A running
+    /// domain is refused, as the controller refuses it (SPEC 7.3).
+    pub previous_name: Option<String>,
+    pub vcpu: u32,
+    pub memory_mib: i64,
+    pub nested: bool,
+    pub ksm: bool,
+    /// The libvirt network of the owner, for example `bento-user-1`.
+    pub network: String,
+    pub mac: String,
 }
 
 /// Everything a machine needs to build one instance.
@@ -238,7 +269,8 @@ impl Operation {
             | Operation::StartInstance { .. }
             | Operation::StopInstance { .. }
             | Operation::RebootInstance { .. }
-            | Operation::RemoveInstance { .. } => true,
+            | Operation::RemoveInstance { .. }
+            | Operation::RedefineInstance { .. } => true,
         }
     }
 }

@@ -28,6 +28,11 @@ impl Manager {
                 )));
             }
         };
+        if instance.host_id != self.host_id {
+            return self
+                .rename_elsewhere(instance, &old_name, new_name, domain_gone)
+                .await;
+        }
         if !domain_gone && self.definer.is_none() {
             return Err(Error::operation(format!(
                 "lifecycle: rename {old_name}: hypervisor cannot redefine domains"
@@ -76,6 +81,33 @@ impl Manager {
                     Error::operation(format!("define {new_name}: {error}")),
                 )
                 .await);
+        }
+        Ok(())
+    }
+
+    /// Renames an instance that runs on another machine (MULTI-NODE 11.5).
+    ///
+    /// That machine undefines the old name and defines the new one in a
+    /// single redefine, and keeps the disk. The local path above must not
+    /// run here: on another machine, `Hypervisor::remove` deletes the
+    /// overlay and the seed image along with the domain.
+    async fn rename_elsewhere(
+        &self,
+        mut instance: bento_types::Instance,
+        old_name: &str,
+        new_name: &str,
+        domain_gone: bool,
+    ) -> Result<()> {
+        self.store
+            .rename_instance(&instance.uuid, new_name, self.cooldown)
+            .await
+            .map_err(crate::actions::external)?;
+        if domain_gone {
+            return Ok(());
+        }
+        instance.name = new_name.to_string();
+        if let Err(error) = self.redefine_elsewhere(&instance, Some(old_name)).await {
+            return Err(self.unwind_rename(&instance, old_name, error).await);
         }
         Ok(())
     }

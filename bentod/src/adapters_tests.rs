@@ -87,6 +87,19 @@ impl Fleet for FakeImages {
     async fn hypervisor(&self, _host_id: i64) -> Option<Arc<dyn bento_hypervisor::Hypervisor>> {
         Some(self.hypervisor.clone())
     }
+
+    async fn redefine(
+        &self,
+        spec: &bento_lifecycle::RedefineSpec,
+    ) -> Result<bento_types::State, bento_lifecycle::DynError> {
+        // Every instance in these tests runs on the controller's own
+        // machine, which redefines locally.
+        Err(format!(
+            "unexpected redefine of {} on machine {}",
+            spec.instance.name, spec.host_id
+        )
+        .into())
+    }
 }
 
 #[derive(Default)]

@@ -720,6 +720,17 @@ At minimum the protocol supports:
 - finish first boot;
 - stream a stopped overlay for an operator-directed move or copy.
 
+Remove and redefine are different operations. Remove undefines the domain
+and deletes its overlay and seed image. Redefine replaces the definition and
+keeps every file.
+
+A controller must never undefine a domain on a runner through remove,
+because remove deletes the disk.
+
+A rename and a resize of an instance on a runner use redefine. The runner
+renders the new XML with its own paths. For a rename, it undefines the old
+name first and refuses a running domain.
+
 Protocol compatibility is negotiated. A controller does not schedule onto a
 runner whose protocol version or capabilities cannot satisfy the request.
 

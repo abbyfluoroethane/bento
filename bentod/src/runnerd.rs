@@ -8,7 +8,8 @@ use anyhow::{Context, Result};
 use bento_hypervisor::{Client, DomainSampler, Hypervisor};
 use bento_runner::{
     Capabilities, CpuTimeSample, Domain, DomainUsage, Fence, Health, Host, HostError, HostSample,
-    ImageRequest, InstanceRef, Inventory, PROTOCOL_VERSION, Reply, Samples, SqliteFence,
+    ImageRequest, InstanceRef, Inventory, PROTOCOL_VERSION, RedefineRequest, Reply, Samples,
+    SqliteFence,
 };
 use bento_types::State;
 
@@ -47,6 +48,46 @@ impl LocalHost {
     fn seed_iso_path(&self, uuid: &str) -> PathBuf {
         self.storage_dir.join(format!("{uuid}-seed.iso"))
     }
+
+    /// Renders the domain of one instance with this machine's own paths.
+    /// The controller sends facts and never paths, because only this
+    /// machine knows where its storage is (MULTI-NODE 11.5).
+    fn render(&self, facts: &DomainFacts<'_>) -> Result<String, HostError> {
+        let uuid = &facts.instance.uuid;
+        bento_hypervisor::domain_xml(&bento_hypervisor::DomainSpec {
+            name: facts.instance.name.clone(),
+            uuid: uuid.clone(),
+            vcpu: facts.vcpu,
+            memory_mib: facts.memory_mib,
+            disk_path: self.overlay_path(uuid).display().to_string(),
+            iso_path: if facts.with_seed_iso {
+                self.seed_iso_path(uuid).display().to_string()
+            } else {
+                String::new()
+            },
+            network: facts.network.to_owned(),
+            mac: facts.mac.to_owned(),
+            nested: facts.nested,
+            ksm: facts.ksm,
+            // Empty selects this machine's architecture. The controller
+            // never names one: it places only onto a machine of the right
+            // architecture (MULTI-NODE 12).
+            arch: String::new(),
+        })
+        .map_err(|error| HostError::new(format!("domain xml for {uuid}: {error}")))
+    }
+}
+
+/// What [`LocalHost::render`] needs, shared by a provision and a redefine.
+struct DomainFacts<'a> {
+    instance: &'a InstanceRef,
+    vcpu: u32,
+    memory_mib: i64,
+    nested: bool,
+    ksm: bool,
+    network: &'a str,
+    mac: &'a str,
+    with_seed_iso: bool,
 }
 
 #[async_trait::async_trait]
@@ -286,32 +327,22 @@ impl Host for LocalHost {
             return Err(HostError::new(format!("seed image for {uuid}: {error}")));
         }
 
-        let xml = bento_hypervisor::domain_xml(&bento_hypervisor::DomainSpec {
-            name: request.instance.name.clone(),
-            uuid: uuid.clone(),
+        let xml = self.render(&DomainFacts {
+            instance: &request.instance,
             vcpu: request.vcpu,
             memory_mib: request.memory_mib,
-            disk_path: overlay.display().to_string(),
-            iso_path: if request.with_seed_iso {
-                seed_iso.display().to_string()
-            } else {
-                String::new()
-            },
-            network: request.network.clone(),
-            mac: request.mac.clone(),
             nested: request.nested,
             ksm: request.ksm,
-            // Empty selects this machine's architecture. The controller
-            // never names one: it places only onto a machine of the right
-            // architecture (MULTI-NODE 12).
-            arch: String::new(),
+            network: &request.network,
+            mac: &request.mac,
+            with_seed_iso: request.with_seed_iso,
         });
         let xml = match xml {
             Ok(xml) => xml,
             Err(error) => {
                 self.unwind_provision(&overlay, request.with_seed_iso.then_some(&seed_iso))
                     .await;
-                return Err(HostError::new(format!("domain xml for {uuid}: {error}")));
+                return Err(error);
             }
         };
 
@@ -385,6 +416,63 @@ impl Host for LocalHost {
         // removed instance reads as stopped, which is what the controller
         // records for a domain that no longer runs.
         Ok(State::Stopped)
+    }
+
+    async fn redefine(&self, request: &RedefineRequest) -> Result<State, HostError> {
+        let uuid = &request.instance.uuid;
+        // The seed image stays until the first boot finishes (SPEC 5.2).
+        // It is on this machine, so this machine decides whether the
+        // drive stays attached.
+        let with_seed_iso = tokio::fs::try_exists(self.seed_iso_path(uuid))
+            .await
+            .unwrap_or(false);
+        let facts = |instance| DomainFacts {
+            instance,
+            vcpu: request.vcpu,
+            memory_mib: request.memory_mib,
+            nested: request.nested,
+            ksm: request.ksm,
+            network: &request.network,
+            mac: &request.mac,
+            with_seed_iso,
+        };
+        let xml = self.render(&facts(&request.instance))?;
+
+        let previous = request
+            .previous_name
+            .as_deref()
+            .filter(|name| *name != request.instance.name);
+        let Some(previous) = previous else {
+            // Same name: libvirt replaces the persistent definition in
+            // place. A running domain takes it at its next start
+            // (SPEC 11.1).
+            bento_hypervisor::Definer::define(self.hypervisor.as_ref(), &xml)
+                .await
+                .map_err(|error| HostError::new(format!("define {uuid}: {error}")))?;
+            return self.observed(&request.instance).await;
+        };
+
+        let old = InstanceRef {
+            uuid: uuid.clone(),
+            name: previous.to_owned(),
+        };
+        let old_xml = self.render(&facts(&old));
+        rename_domain(
+            self.hypervisor.as_ref(),
+            self.hypervisor.as_ref(),
+            previous,
+            &xml,
+            old_xml,
+        )
+        .await
+        .map_err(|error| HostError::new(format!("rename {uuid}: {error}")))?;
+        tracing::info!(
+            from = %previous,
+            to = %request.instance.name,
+            uuid = %uuid,
+            "runner: instance renamed"
+        );
+        self.observed(&request.instance).await
     }
 }
 
@@ -599,9 +687,163 @@ async fn runner_inner(app: &App) -> Result<()> {
     Ok(serve_result?)
 }
 
+/// Renames one stopped domain on this machine (MULTI-NODE 11.5).
+///
+/// libvirt refuses a second domain with the same UUID, so this undefines
+/// the old name first. It uses the hypervisor's own `remove`, which
+/// undefines the domain and its NVRAM and touches no other file. It must
+/// never use `Host::remove`, which also deletes the disk. When the new
+/// definition fails, it puts `old_xml` back, so the instance does not
+/// vanish from libvirt while its row still names it.
+async fn rename_domain(
+    hypervisor: &dyn Hypervisor,
+    definer: &dyn bento_hypervisor::Definer,
+    previous: &str,
+    xml: &str,
+    old_xml: Result<String, HostError>,
+) -> Result<(), String> {
+    match hypervisor.state(previous).await {
+        Ok(State::Stopped) => hypervisor
+            .remove(previous)
+            .await
+            .map_err(|error| format!("undefine {previous}: {error}"))?,
+        Ok(state) => {
+            return Err(format!(
+                "a rename needs a stopped domain, and {previous} is {state} (SPEC 7.3)"
+            ));
+        }
+        // Nothing is defined under the old name, so there is nothing to
+        // undefine.
+        Err(bento_hypervisor::Error::DomainNotFound(_)) => {}
+        Err(error) => return Err(format!("state of {previous}: {error}")),
+    }
+    if let Err(error) = definer.define(xml).await {
+        let restored = match old_xml {
+            Ok(old_xml) => definer.define(&old_xml).await.map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        if let Err(restore_error) = restored {
+            tracing::error!(
+                instance = %previous,
+                error = %restore_error,
+                "runner: rename failed and the old domain could not be defined again"
+            );
+        }
+        return Err(format!("define the new name: {error}"));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Defines into the shared fake, as libvirt would, and refuses one
+    /// name on request so a test can make the new definition fail.
+    struct FakeDefiner {
+        fake: Arc<bento_hypervisor::Fake>,
+        refuse: Option<&'static str>,
+    }
+
+    #[async_trait::async_trait]
+    impl bento_hypervisor::Definer for FakeDefiner {
+        async fn define(&self, xml: &str) -> Result<(), bento_hypervisor::Error> {
+            let field = |tag: &str| {
+                xml.split_once(&format!("<{tag}>"))
+                    .and_then(|(_, rest)| rest.split_once(&format!("</{tag}>")))
+                    .map(|(value, _)| value.to_owned())
+                    .unwrap_or_default()
+            };
+            let name = field("name");
+            if self.refuse == Some(name.as_str()) {
+                return Err(bento_hypervisor::Error::Operation(format!(
+                    "refused {name}"
+                )));
+            }
+            self.fake.set_domain(bento_hypervisor::FakeDomain {
+                name,
+                uuid: field("uuid"),
+                xml: xml.to_owned(),
+                state: State::Stopped,
+                autostart: false,
+            });
+            Ok(())
+        }
+    }
+
+    fn domain(name: &str, state: State) -> bento_hypervisor::FakeDomain {
+        bento_hypervisor::FakeDomain {
+            name: name.to_owned(),
+            uuid: "u-1".to_owned(),
+            xml: format!("<name>{name}</name><uuid>u-1</uuid>"),
+            state,
+            autostart: false,
+        }
+    }
+
+    fn xml(name: &str) -> String {
+        format!("<name>{name}</name><uuid>u-1</uuid>")
+    }
+
+    #[tokio::test]
+    async fn a_rename_keeps_the_disk() {
+        // The bug this test exists for: a rename on a runner went through
+        // `RemoveInstance`, which deleted the overlay (MULTI-NODE 11.5).
+        let storage = tempfile::tempdir().unwrap();
+        let overlay = storage.path().join("u-1.qcow2");
+        std::fs::write(&overlay, b"guest data").unwrap();
+        let fake = Arc::new(bento_hypervisor::Fake::default());
+        fake.set_domain(domain("web", State::Stopped));
+        let definer = FakeDefiner {
+            fake: fake.clone(),
+            refuse: None,
+        };
+
+        rename_domain(fake.as_ref(), &definer, "web", &xml("api"), Ok(xml("web")))
+            .await
+            .unwrap();
+
+        assert!(fake.domain("web").is_none());
+        assert_eq!(fake.domain("api").unwrap().uuid, "u-1");
+        assert_eq!(std::fs::read(&overlay).unwrap(), b"guest data");
+    }
+
+    #[tokio::test]
+    async fn a_rename_of_a_running_domain_is_refused() {
+        let fake = Arc::new(bento_hypervisor::Fake::default());
+        fake.set_domain(domain("web", State::Running));
+        let definer = FakeDefiner {
+            fake: fake.clone(),
+            refuse: None,
+        };
+
+        let error = rename_domain(fake.as_ref(), &definer, "web", &xml("api"), Ok(xml("web")))
+            .await
+            .unwrap_err();
+
+        assert!(error.contains("stopped"), "{error}");
+        assert!(fake.domain("web").is_some());
+        assert!(fake.domain("api").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_rename_puts_the_old_domain_back() {
+        let fake = Arc::new(bento_hypervisor::Fake::default());
+        fake.set_domain(domain("web", State::Stopped));
+        let definer = FakeDefiner {
+            fake: fake.clone(),
+            refuse: Some("api"),
+        };
+
+        assert!(
+            rename_domain(fake.as_ref(), &definer, "web", &xml("api"), Ok(xml("web")))
+                .await
+                .is_err()
+        );
+
+        assert!(fake.domain("web").is_some());
+        assert!(fake.domain("api").is_none());
+    }
 
     /// Serves fixed bytes on loopback, so the fetch path is tested with
     /// no network beyond this machine.
