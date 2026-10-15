@@ -72,6 +72,14 @@
   --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
   --sidebar-width: 15rem;
+  /* One type scale for every chart, line and bar alike (the uPlot axes
+   * read the label pair in app.js). */
+  --chart-title-size: 0.8rem;
+  --chart-title-weight: 600;
+  --chart-value-size: 0.85rem;
+  --chart-value-weight: 600;
+  --chart-label-size: 11px;
+  --chart-label-weight: 500;
   color-scheme: light;
 }
 
@@ -205,36 +213,32 @@ a:not(.btn) { color: inherit; }
 .tabs > [role="tablist"] a[data-variant="destructive"] { color: color-mix(in srgb, var(--destructive) 80%, var(--foreground)); }
 
 .charts { display: grid; gap: 1rem; }
-.chart-card { min-width: 0; border: 1px solid var(--border); padding: 0.75rem 0.75rem 0.5rem; display: grid; grid-template-rows: auto 1fr; gap: 0.5rem; background: var(--card); height: 15rem; box-sizing: border-box; }
-.chart-card > header { display: flex; align-items: baseline; justify-content: space-between; gap: 0.25rem 1rem; flex-wrap: wrap; }
-.chart-card > header h3 { font-size: 0.8rem; font-weight: 500; }
-.chart-card .now { font-family: var(--font-mono); font-size: 0.85rem; font-variant-numeric: tabular-nums; }
+.chart-card, .bar-card { min-width: 0; border: 1px solid var(--border); padding: 0.75rem; display: grid; gap: 0.5rem; background: var(--card); box-sizing: border-box; }
+.chart-card { grid-template-rows: auto 1fr; height: 15rem; }
+.chart-card > header, .bar-card > header { display: flex; align-items: baseline; justify-content: space-between; gap: 0.25rem 1rem; flex-wrap: wrap; }
+.chart-card > header h3, .bar-card > header h3 { font-size: var(--chart-title-size); font-weight: var(--chart-title-weight); white-space: nowrap; }
+.chart-card .now, .bar-card > header > span { font-family: var(--font-mono); font-size: var(--chart-value-size); font-weight: var(--chart-value-weight); font-variant-numeric: tabular-nums; text-align: right; }
 .chart { height: 100%; min-height: 0; min-width: 0; position: relative; overflow: hidden; }
 .chart > .uplot, .chart > .u-wrap { height: 100%; }
 .chart .u-legend { display: none; }
 .uplot, .uplot *, .uplot *::before, .uplot *::after { box-sizing: border-box; }
 .uplot { font-family: var(--font-sans); }
 .u-axis { color: var(--muted-foreground); }
-.chart-empty { color: var(--muted-foreground); font-size: 0.8rem; height: 100%; display: grid; place-items: center; }
+.chart-empty { color: var(--muted-foreground); font-size: var(--chart-label-size); font-weight: var(--chart-label-weight); height: 100%; display: grid; place-items: center; }
 
-.bar-card { border: 1px solid var(--border); padding: 0.75rem; display: grid; gap: 0.4rem; background: var(--card); }
-.bar-card > header { display: flex; justify-content: space-between; align-items: baseline; gap: 0.25rem 1rem; flex-wrap: wrap; }
-.bar-card > header h3 { white-space: nowrap; }
-.bar-card > header > span { text-align: right; }
-.bar-card > header h3 { font-size: 0.8rem; font-weight: 500; }
-.bar { display: flex; height: 1.75rem; border: 1px solid var(--border); overflow: hidden; font-size: 0.8rem; font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.bar { display: flex; height: 1.75rem; border: 1px solid var(--border); overflow: hidden; font-size: var(--chart-value-size); font-weight: var(--chart-value-weight); font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
 .bar > span { display: flex; align-items: center; justify-content: center; min-width: 0; overflow: hidden; white-space: nowrap; }
-.bar > .used { background: color-mix(in srgb, var(--primary) 30%, var(--card)); border-right: 1px solid var(--border); }
-.bar > .free { flex: 1; background: color-mix(in srgb, var(--chart-5) 18%, var(--card)); color: var(--muted-foreground); }
-.bar[data-over] > .used { background: color-mix(in srgb, var(--state-starting) 45%, var(--card)); border-right-color: color-mix(in srgb, var(--state-starting) 80%, transparent); }
-.bar[data-over] > .free { background: color-mix(in srgb, var(--destructive) 30%, var(--card)); color: var(--foreground); }
-.bar-key { display: flex; gap: 1rem; font-size: 0.75rem; color: var(--muted-foreground); }
+.bar > .used { background: var(--primary); color: var(--primary-foreground); border-right: 1px solid var(--border); }
+.bar > .free { flex: 1; background: var(--chart-5); color: var(--primary-foreground); }
+.bar[data-over] > .used { background: var(--state-starting); color: var(--primary-foreground); }
+.bar[data-over] > .free { background: var(--destructive); color: var(--primary-foreground); }
+.bar-key { display: flex; gap: 1rem; font-size: var(--chart-label-size); font-weight: var(--chart-label-weight); color: var(--muted-foreground); }
 .bar-key span { display: inline-flex; align-items: center; gap: 0.35rem; }
 .swatch { width: 0.7rem; height: 0.7rem; border: 1px solid var(--border); display: inline-block; }
-.swatch.left { background: color-mix(in srgb, var(--primary) 30%, var(--card)); }
-.swatch.right { background: color-mix(in srgb, var(--chart-5) 18%, var(--card)); }
-.bar-key[data-over] .swatch.left { background: color-mix(in srgb, var(--state-starting) 45%, var(--card)); }
-.bar-key[data-over] .swatch.right { background: color-mix(in srgb, var(--destructive) 30%, var(--card)); }
+.swatch.left { background: var(--primary); }
+.swatch.right { background: var(--chart-5); }
+.bar-key[data-over] .swatch.left { background: var(--state-starting); }
+.bar-key[data-over] .swatch.right { background: var(--destructive); }
 
 .tiles { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 0.75rem; margin: 0; }
 @media (max-width: 720px) { .tiles { grid-template-columns: repeat(2, minmax(0, 1fr)); } }

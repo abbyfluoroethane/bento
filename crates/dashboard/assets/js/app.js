@@ -39,6 +39,7 @@
     var color = cssVar("--chart-1");
     var grid = cssVar("--border");
     var ink = cssVar("--muted-foreground");
+    var font = cssVar("--chart-label-weight") + " " + cssVar("--chart-label-size") + " IBM Plex Sans";
     var opts = {
       width: el.clientWidth || 600,
       height: el.clientHeight || 160,
@@ -46,8 +47,8 @@
       legend: { show: false },
       scales: { x: { time: true }, y: { range: [0, max] } },
       axes: [
-        { stroke: ink, grid: { stroke: grid, width: 1 }, ticks: { stroke: grid }, font: "11px IBM Plex Sans", space: 80 },
-        { stroke: ink, grid: { stroke: grid, width: 1 }, ticks: { stroke: grid }, font: "11px IBM Plex Sans", size: 64, gap: 6,
+        { stroke: ink, grid: { stroke: grid, width: 1 }, ticks: { stroke: grid }, font: font, space: 80 },
+        { stroke: ink, grid: { stroke: grid, width: 1 }, ticks: { stroke: grid }, font: font, size: 64, gap: 6,
           values: function (u, vals) { return vals.map(function (v) { return fmtValue(kind, v, max); }); } }
       ],
       series: [
