@@ -324,6 +324,27 @@ async fn a_placement_refusal_returns_the_form_with_values_and_runner_reasons() {
 }
 
 #[tokio::test]
+async fn settings_lock_the_name_until_the_vm_stops() {
+    // Rename needs a stopped domain (SPEC 7.3). A read-only field still
+    // posts the current name, so the other settings save as before.
+    let fx = fixture();
+    let body = text(&get(&fx.pages, "/vm/uuid-web/settings").await);
+    assert!(body.contains("readonly aria-describedby=\"name-locked\""), "{body}");
+    assert!(body.contains("Stop the VM to rename it."), "{body}");
+
+    fx.store
+        .data
+        .lock()
+        .unwrap()
+        .instances
+        .get_mut("uuid-web")
+        .unwrap()
+        .state = bento_types::State::Stopped;
+    let body = text(&get(&fx.pages, "/vm/uuid-web/settings").await);
+    assert!(!body.contains("name-locked"), "{body}");
+}
+
+#[tokio::test]
 async fn settings_apply_only_what_changed_and_rename_last() {
     let fx = fixture();
     // Nothing changed.

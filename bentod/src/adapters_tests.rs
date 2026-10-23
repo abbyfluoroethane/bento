@@ -307,6 +307,42 @@ fn the_fleet_image_gate_maps_to_conflict() {
     assert!(status.to_string().contains("runner-b.example.org"));
 }
 
+#[test]
+fn client_refusals_from_lifecycle_are_not_server_errors() {
+    use bento_lifecycle::Error as E;
+    let cases = [
+        (
+            E::RenameNeedsStop("web is running".into()),
+            http::StatusCode::CONFLICT,
+        ),
+        (
+            E::CopySourceRunning("web".into()),
+            http::StatusCode::CONFLICT,
+        ),
+        (
+            E::NestedUnavailable("kvm_amd".into()),
+            http::StatusCode::CONFLICT,
+        ),
+        (
+            E::NoImageVersion("debian-13".into()),
+            http::StatusCode::CONFLICT,
+        ),
+        (
+            E::DiskShrink("40 to 20".into()),
+            http::StatusCode::BAD_REQUEST,
+        ),
+    ];
+    for (error, expected) in cases {
+        let text = error.to_string();
+        let mapped = api_lifecycle_error(error);
+        let status = mapped
+            .downcast_ref::<bento_api::StatusError>()
+            .unwrap_or_else(|| panic!("no status for {text}"));
+        assert_eq!(status.http_status(), expected, "{text}");
+        assert_eq!(status.to_string(), text);
+    }
+}
+
 #[tokio::test]
 async fn cli_backend_create_seeds_frontend_key() {
     let env = Env::new().await;

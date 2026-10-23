@@ -18,9 +18,12 @@
   <div class="field">
     <label for="name">VM name</label>
     <div class="name-field">
-      <input class="input mono" id="name" name="name" value="{{ vm.name }}" data-current="{{ vm.name }}" pattern="[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?" required autocomplete="off">
+      <input class="input mono" id="name" name="name" value="{{ vm.name }}" data-current="{{ vm.name }}" pattern="[a-z0-9]([a-z0-9\-]{0,61}[a-z0-9])?" required autocomplete="off"{% if vm.state != "stopped" %} readonly aria-describedby="name-locked"{% endif %}>
       <span class="suffix">.{{ instance_domain }}</span>
     </div>
+    {% if vm.state != "stopped" %}
+    <p class="hint" id="name-locked">Stop the VM to rename it.</p>
+    {% endif %}
     <p class="hint">Renaming breaks links to <span class="mono">{{ vm.name }}.{{ instance_domain }}</span> and changes the SSH user name.</p>
   </div>
   <div class="fields three">

@@ -174,6 +174,9 @@ pub(crate) fn error_parts(error: &BoxError) -> (StatusCode, String) {
     if let Some(status_error) = find_error::<StatusError>(error.as_ref()) {
         return (status_error.http_status(), status_error.to_string());
     }
+    // A 500 is a server fault. Log it here, the one place every handler
+    // passes through, so the journal holds the cause the client saw.
+    tracing::error!(%error, "request failed with 500");
     (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
 }
 

@@ -737,8 +737,21 @@ pub(crate) struct ApiBackend(pub(crate) Backend);
 /// row raised inside a lifecycle action reached the client as a bare 500
 /// rather than the documented 409 or 404 (SPEC 6.1, 7.2, 12).
 pub(crate) fn api_lifecycle_error(error: bento_lifecycle::Error) -> ApiError {
-    if matches!(&error, bento_lifecycle::Error::FleetImageNotReady { .. }) {
-        return Box::new(ApiStatusError::new(StatusCode::CONFLICT, error.to_string()));
+    use bento_lifecycle::Error as E;
+    // A refusal the client can act on is not a server fault. A request that
+    // conflicts with the instance or the host is 409; a disk shrink is a
+    // bad value (SPEC 5.1, 5.5, 7.3, 11.1, 15; MULTI-NODE 13.2).
+    let status = match &error {
+        E::FleetImageNotReady { .. }
+        | E::RenameNeedsStop(_)
+        | E::CopySourceRunning(_)
+        | E::NestedUnavailable(_)
+        | E::NoImageVersion(_) => Some(StatusCode::CONFLICT),
+        E::DiskShrink(_) => Some(StatusCode::BAD_REQUEST),
+        _ => None,
+    };
+    if let Some(status) = status {
+        return Box::new(ApiStatusError::new(status, error.to_string()));
     }
     let mut candidate: Option<&(dyn std::error::Error + 'static)> = Some(&error);
     while let Some(current) = candidate {
