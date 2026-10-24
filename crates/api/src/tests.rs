@@ -173,6 +173,15 @@ impl Store for FakeStore {
         comment: &str,
     ) -> Result<i64, BoxError> {
         let mut data = self.data.lock().unwrap();
+        // Like the store: a fingerprint is registered once (SPEC 13).
+        if data
+            .keys
+            .values()
+            .flatten()
+            .any(|key| key.fingerprint == fingerprint)
+        {
+            return Err(Box::new(StoreError::SshKeyTaken));
+        }
         data.next_key_id += 1;
         let id = data.next_key_id;
         data.keys.entry(user_id).or_default().push(SshKey {
@@ -1187,6 +1196,21 @@ const TEST_PUBLIC_KEY: &str = concat!(
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAILM+rvN+ot98qgEN796jTiQfZfG1KaT0PtFDJ/",
     "XFSqti alice@laptop"
 );
+
+#[tokio::test]
+async fn registering_a_taken_ssh_key_answers_409() {
+    let fixture = fixture();
+    let body = serde_json::json!({"public_key": TEST_PUBLIC_KEY}).to_string();
+    let response = request(&fixture.app, Method::POST, "/api/ssh-keys", &body).await;
+    assert_eq!(response.status, StatusCode::CREATED);
+    // The same key again, whether from this user or another, is refused.
+    let response = request(&fixture.app, Method::POST, "/api/ssh-keys", &body).await;
+    assert_eq!(response.status, StatusCode::CONFLICT);
+    let error: ErrorBody = decode(&response);
+    assert!(error.error.contains("already registered"), "{}", error.error);
+    let response = request(&fixture.app, Method::GET, "/api/ssh-keys", "").await;
+    assert_eq!(decode::<Vec<SshKeyJson>>(&response).len(), 1);
+}
 
 #[tokio::test]
 async fn ssh_keys_are_validated_fingerprinted_listed_and_scoped_on_delete() {

@@ -531,7 +531,7 @@ The `host_id` column exists in version 1 and always points to the one host. Sect
 
 The `released_names` table enforces the cooldown in section 7.2. The table also records what a name used to be. Keep a row after the cooldown expires and compare the timestamp. A kept row is more useful and costs nothing at this scale.
 
-Index `ssh_keys.fingerprint`. The SSH frontend reads this column on every connection.
+Index `ssh_keys.fingerprint` with a unique index. The SSH frontend reads this column on every connection, and a fingerprint must name one account (section 13).
 
 The `pairings` table holds pending key links from section 13. Only the hash of the link token is stored, as for `tokens.hash`. A row with `linked_user_id` set is spent. Unused rows are swept once they expire, so the table stays the size of the links in flight.
 
@@ -565,6 +565,8 @@ The command line interface uses SSH public key authentication. A key is attached
 3. The link expires in three minutes and works once. The session waits for it, so the terminal reports the result.
 4. Opening the link requires a session, so a first-time user goes through OIDC and gets an account on the way past.
 5. The page shows the fingerprint and the account name. Only a `POST` from that page attaches the key. A link that attached a key by being visited would let one user's link, sent to another, take over that account, and would fire on anything that follows links; the session cookie is `SameSite=Lax`, so a cross-site submission arrives without it and is refused.
+
+A fingerprint is unique across all accounts. A request to register a key that is already registered, by any account including the same one, is refused with `409 Conflict`. Without this rule, a user could register the public key of another person first, and the SSH logins of that person would go to the wrong account. Migration 8 enforces the rule on an existing database. For a fingerprint that more than one account held, it deletes every row, because the data does not show which account holds the private key; the owner links the key again. For a fingerprint that one account held more than once, it keeps the oldest row.
 
 An account with no keys is normal — it is what a dashboard-only user has. Keys are added by linking again from an already signed-in browser.
 

@@ -17,30 +17,22 @@ impl Store {
         let comment = comment.into();
         let now = self.clock();
         self.with_conn(move |conn| {
-            conn.execute(
-                "INSERT INTO ssh_keys \
-                 (user_id, public_key, fingerprint, comment, created_at) VALUES (?, ?, ?, ?, ?)",
-                params![
-                    user_id,
-                    public_key,
-                    fingerprint,
-                    comment,
-                    format_time(now())?
-                ],
-            )?;
+            insert_ssh_key(conn, user_id, &public_key, &fingerprint, &comment, now())?;
             Ok(conn.last_insert_rowid())
         })
         .await
     }
 
     /// Hot-path lookup run by the SSH frontend on every connection;
-    /// `idx_ssh_keys_fingerprint` backs it (SPEC 12).
+    /// `idx_ssh_keys_fingerprint` backs it (SPEC 12). The index is unique
+    /// (SPEC 13), so at most one row, and one user, matches. The lookup
+    /// never chooses between users.
     pub async fn ssh_key_by_fingerprint(&self, fingerprint: impl Into<String>) -> Result<SshKey> {
         let fingerprint = fingerprint.into();
         self.with_conn(move |conn| {
             conn.query_row(
                 "SELECT id, user_id, public_key, fingerprint, comment, created_at \
-                 FROM ssh_keys WHERE fingerprint = ? ORDER BY id LIMIT 1",
+                 FROM ssh_keys WHERE fingerprint = ?",
                 [fingerprint],
                 scan_ssh_key,
             )
@@ -80,6 +72,32 @@ impl Store {
     }
 }
 
+/// The one insert for `ssh_keys`, shared with `link_pairing`. The unique
+/// index on `fingerprint` is the check, so two racing requests cannot
+/// both pass it (SPEC 13).
+pub(crate) fn insert_ssh_key(
+    conn: &rusqlite::Connection,
+    user_id: i64,
+    public_key: &str,
+    fingerprint: &str,
+    comment: &str,
+    now: time::OffsetDateTime,
+) -> Result<()> {
+    match conn.execute(
+        "INSERT INTO ssh_keys \
+         (user_id, public_key, fingerprint, comment, created_at) VALUES (?, ?, ?, ?, ?)",
+        params![user_id, public_key, fingerprint, comment, format_time(now)?],
+    ) {
+        Ok(_) => Ok(()),
+        Err(rusqlite::Error::SqliteFailure(failure, _))
+            if failure.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE =>
+        {
+            Err(Error::SshKeyTaken)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 fn scan_ssh_key(row: &rusqlite::Row<'_>) -> rusqlite::Result<SshKey> {
     let created: String = row.get(5)?;
     Ok(SshKey {
@@ -95,7 +113,7 @@ fn scan_ssh_key(row: &rusqlite::Row<'_>) -> rusqlite::Result<SshKey> {
 #[cfg(test)]
 mod tests {
     use crate::Error;
-    use crate::tests::{new_test_store, seed_store};
+    use crate::tests::{FakeClock, new_test_store, new_test_store_with_clock, seed_store, test_range};
 
     #[tokio::test]
     async fn ssh_key_fingerprint_lookup() {
@@ -137,5 +155,79 @@ mod tests {
             store.ssh_key_by_fingerprint("SHA256:abcdef").await,
             Err(Error::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn another_user_cannot_register_a_fingerprint_that_is_taken() {
+        let store = new_test_store().await;
+        let (alice, _) = seed_store(&store).await;
+        let bob = store
+            .register_user("bob", "bob@example.org", None, test_range())
+            .await
+            .unwrap();
+        store
+            .add_ssh_key(alice.id, "ssh-ed25519 AAAA... a", "SHA256:shared", "a")
+            .await
+            .unwrap();
+        // Squatting: bob registers the key second, and must be refused.
+        assert!(matches!(
+            store
+                .add_ssh_key(bob.id, "ssh-ed25519 AAAA... b", "SHA256:shared", "b")
+                .await,
+            Err(Error::SshKeyTaken)
+        ));
+        assert!(store.ssh_keys_for_user(bob.id).await.unwrap().is_empty());
+        let key = store.ssh_key_by_fingerprint("SHA256:shared").await.unwrap();
+        assert_eq!(key.user_id, alice.id);
+    }
+
+    /// SPEC 13: a repeat registration by the same user is refused, not
+    /// ignored, so the caller learns the key is already there.
+    #[tokio::test]
+    async fn the_same_user_cannot_register_a_key_twice() {
+        let store = new_test_store().await;
+        let (alice, _) = seed_store(&store).await;
+        store
+            .add_ssh_key(alice.id, "ssh-ed25519 AAAA... a", "SHA256:once", "a")
+            .await
+            .unwrap();
+        assert!(matches!(
+            store
+                .add_ssh_key(alice.id, "ssh-ed25519 AAAA... a", "SHA256:once", "a")
+                .await,
+            Err(Error::SshKeyTaken)
+        ));
+        assert_eq!(store.ssh_keys_for_user(alice.id).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn linking_a_pairing_for_a_taken_key_is_refused_and_the_pairing_stays_open() {
+        let clock = FakeClock::new();
+        let store = new_test_store_with_clock(clock.clone()).await;
+        let (alice, _) = seed_store(&store).await;
+        let bob = store
+            .register_user("bob", "bob@example.org", None, test_range())
+            .await
+            .unwrap();
+        store
+            .add_ssh_key(alice.id, "ssh-ed25519 AAAA... a", "SHA256:linked", "a")
+            .await
+            .unwrap();
+        let pairing = store
+            .create_pairing(
+                "hash",
+                "ssh-ed25519 AAAA... a",
+                "SHA256:linked",
+                "",
+                clock.now() + time::Duration::minutes(3),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.link_pairing(pairing.id, bob.id).await,
+            Err(Error::SshKeyTaken)
+        ));
+        // The failed link rolled back, so the claim did not stick.
+        assert_eq!(store.pairing(pairing.id).await.unwrap().linked_user_id, None);
     }
 }

@@ -40,6 +40,11 @@ pub enum Error {
     /// (SPEC 7.2).
     #[error("store: name is taken by an existing instance")]
     NameTaken,
+    /// Another row already holds this public key (SPEC 13). A fingerprint
+    /// names one key for one account, so a second registration is
+    /// refused whoever asks. The message does not say whose key it is.
+    #[error("store: that SSH key is already registered")]
+    SshKeyTaken,
     /// A token row exists but its expiry has passed (SPEC 13). The row
     /// travels with the error on purpose: the auth service enforces
     /// expiry against its own clock, so it needs the row the store

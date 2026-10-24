@@ -75,6 +75,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "dispatch_generations",
         run: dispatch_generations,
     },
+    Migration {
+        version: 8,
+        name: "unique_ssh_key_fingerprints",
+        run: unique_ssh_key_fingerprints,
+    },
 ];
 
 /// Records which migrations a database has. Created before any of them
@@ -340,6 +345,70 @@ fn dispatch_generations(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     )
 }
 
+/// Makes an SSH key fingerprint unique (SPEC 13, SPEC 12).
+///
+/// Until now nothing stopped two rows sharing a fingerprint, and the SSH
+/// lookup took the oldest. A user could register another person's public
+/// key first and receive that person's logins.
+///
+/// A database may already hold such rows. The policy for them:
+///
+/// * Rows of one fingerprint that belong to one user: keep the oldest.
+///   They name the same account, so nothing is lost.
+/// * Rows of one fingerprint that belong to more than one user: delete
+///   all of them. The oldest row is what logins already used, but it may
+///   be the squatter, and no data in the database says which user holds
+///   the private key. Keeping either would hand a login to a guess. The
+///   real owner links the key again over SSH (SPEC 13), which proves
+///   possession. The cost is one re-link for a user who did nothing
+///   wrong; the alternative is a login to the wrong account.
+///
+/// The index keeps the name the baseline gives the plain index, so the
+/// baseline's `CREATE INDEX IF NOT EXISTS` finds it on the next start and
+/// does not add a second, non-unique one. A database that already has the
+/// unique index only records the version.
+fn unique_ssh_key_fingerprints(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    let already_unique = {
+        let mut statement = tx.prepare("PRAGMA index_list(ssh_keys)")?;
+        // Columns: seq, name, unique, origin, partial.
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+        })?;
+        let mut found = false;
+        for row in rows {
+            let (name, unique) = row?;
+            found |= name == "idx_ssh_keys_fingerprint" && unique == 1;
+        }
+        found
+    };
+    if already_unique {
+        return Ok(());
+    }
+
+    let contested: Vec<String> = {
+        let mut statement = tx.prepare(
+            "SELECT fingerprint FROM ssh_keys GROUP BY fingerprint \
+             HAVING COUNT(DISTINCT user_id) > 1",
+        )?;
+        let rows = statement.query_map([], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for fingerprint in &contested {
+        let removed = tx.execute("DELETE FROM ssh_keys WHERE fingerprint = ?", [fingerprint])?;
+        tracing::warn!(
+            fingerprint,
+            removed,
+            "ssh key was registered by more than one user: removed every copy, the owner must link it again"
+        );
+    }
+    tx.execute_batch(
+        "DELETE FROM ssh_keys WHERE id NOT IN \
+             (SELECT MIN(id) FROM ssh_keys GROUP BY fingerprint);
+         DROP INDEX IF EXISTS idx_ssh_keys_fingerprint;
+         CREATE UNIQUE INDEX idx_ssh_keys_fingerprint ON ssh_keys(fingerprint);",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,5 +606,92 @@ mod tests {
         assert!(result.is_err());
         drop(tx);
         assert_eq!(current_version(&conn).unwrap(), 0);
+    }
+
+    /// A database at version 7 with the pre-fix, non-unique index and
+    /// the given `(id, user_id, fingerprint)` rows.
+    fn at_version_7(rows: &[(i64, i64, &str)]) -> Connection {
+        let mut conn = baseline();
+        conn.execute_batch(MIGRATIONS_TABLE).unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.version <= 7) {
+            conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, 'x')",
+                rusqlite::params![migration.version, migration.name],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             INSERT INTO users (id, name, email, subnet, created_at)
+                 VALUES (1, 'alice', 'alice@example.org', '10.0.1.0/24', 'x'),
+                        (2, 'bob', 'bob@example.org', '10.0.2.0/24', 'x');",
+        )
+        .unwrap();
+        for (id, user, fingerprint) in rows {
+            conn.execute(
+                "INSERT INTO ssh_keys (id, user_id, public_key, fingerprint, created_at) \
+                 VALUES (?, ?, 'key', ?, 'x')",
+                rusqlite::params![id, user, fingerprint],
+            )
+            .unwrap();
+        }
+        apply(&mut conn, clock()).unwrap();
+        conn
+    }
+
+    fn key_ids(conn: &Connection) -> Vec<i64> {
+        let mut statement = conn
+            .prepare("SELECT id FROM ssh_keys ORDER BY id")
+            .unwrap();
+        statement
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|id| id.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn a_fingerprint_held_by_two_users_is_dropped_from_both() {
+        // Rows 1 and 2: alice and bob hold one fingerprint. The older row
+        // may be the squatter, so neither is trusted; the real owner
+        // links the key again. Row 3 is unrelated and stays.
+        let conn = at_version_7(&[(1, 2, "SHA256:x"), (2, 1, "SHA256:x"), (3, 1, "SHA256:y")]);
+        assert_eq!(key_ids(&conn), vec![3]);
+    }
+
+    #[test]
+    fn a_fingerprint_repeated_by_one_user_keeps_the_oldest_row() {
+        let conn = at_version_7(&[(1, 1, "SHA256:x"), (2, 1, "SHA256:x"), (3, 2, "SHA256:y")]);
+        assert_eq!(key_ids(&conn), vec![1, 3]);
+    }
+
+    #[test]
+    fn the_fingerprint_index_is_unique_after_migrating() {
+        let conn = at_version_7(&[(1, 1, "SHA256:x")]);
+        let refused = conn.execute(
+            "INSERT INTO ssh_keys (user_id, public_key, fingerprint, created_at) \
+             VALUES (2, 'key', 'SHA256:x', 'x')",
+            [],
+        );
+        assert!(refused.is_err());
+    }
+
+    #[test]
+    fn a_database_that_already_has_the_unique_index_only_records_the_version() {
+        let mut conn = baseline();
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF;
+             DROP INDEX idx_ssh_keys_fingerprint;
+             CREATE UNIQUE INDEX idx_ssh_keys_fingerprint ON ssh_keys(fingerprint);
+             INSERT INTO ssh_keys (id, user_id, public_key, fingerprint, created_at)
+                 VALUES (1, 1, 'key', 'SHA256:x', 'x');",
+        )
+        .unwrap();
+        apply(&mut conn, clock()).unwrap();
+        assert_eq!(key_ids(&conn), vec![1]);
+        assert_eq!(
+            current_version(&conn).unwrap(),
+            MIGRATIONS.last().unwrap().version
+        );
     }
 }
