@@ -134,6 +134,26 @@ pub(crate) async fn machine_network(
         frontends.push(address);
     }
 
+    // Every machine's management and underlay address is off limits to a
+    // guest (MULTI-NODE 11.1). The controller address is the controller
+    // host's underlay, so it is already among them. Names that do not
+    // parse as IPv4 are skipped: config validation refuses them before a
+    // host record goes active (MULTI-NODE 8.5).
+    let mut management = Vec::new();
+    for host in &hosts {
+        let endpoint = host
+            .endpoint
+            .as_deref()
+            .and_then(bento_config::endpoint_host);
+        for text in [endpoint, host.underlay.as_deref()].into_iter().flatten() {
+            if let Ok(address) = text.parse::<Ipv4Addr>() {
+                management.push(address);
+            }
+        }
+    }
+    management.sort();
+    management.dedup();
+
     // Both lists are sorted so the same database state always produces
     // the same description. The controller digests this state to decide
     // whether a machine needs telling again, and an unstable order would
@@ -147,6 +167,7 @@ pub(crate) async fn machine_network(
         users,
         remote_slots,
         frontends,
+        management,
     })
 }
 
@@ -239,6 +260,29 @@ mod tests {
         assert_eq!(there.routes().unwrap().len(), 2);
         here.check().unwrap();
         there.check().unwrap();
+    }
+
+    #[tokio::test]
+    async fn every_machine_lists_the_management_addresses_of_all_machines() {
+        let (_dir, store, konata, tsukasa) = fleet().await;
+        for host in [konata, tsukasa] {
+            let network = machine_network(&store, plan(), HIGH_PORTS, host, konata)
+                .await
+                .unwrap();
+            let rendered = network.ruleset().unwrap().render().unwrap();
+            assert_eq!(
+                network
+                    .management
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                ["10.0.0.97", "10.0.0.188"],
+            );
+            assert!(
+                rendered.contains("ip daddr { 10.0.0.97, 10.0.0.188 } drop"),
+                "{rendered}"
+            );
+        }
     }
 
     #[tokio::test]

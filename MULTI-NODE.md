@@ -512,6 +512,28 @@ established and related traffic, the five accept predicates are exact:
    set. The same source, interface, and destination predicate controls
    masquerading in `postrouting`.
 
+Three guard rules precede these accepts. They are in the rendered ruleset
+now:
+
+* **Anti-spoofing.** A packet from a user bridge whose source is not in a
+  slot this runner owns for that user is dropped. A guest cannot claim the
+  address of another user, or of a guest on another runner.
+* **Management denial.** A packet from a user bridge to a management
+  address (every runner endpoint and underlay address, and the controller)
+  is dropped. The listener bind of section 11.1 is a second layer, not the
+  only one.
+* **Host denial.** An `input` chain drops every packet from a user bridge
+  to the host itself, except ICMP, TCP ports 80 and 443 (public
+  ingress), and replies. Guests use static addresses
+  and public resolvers (SPEC 6.2) and need nothing else from the host.
+
+One difference from the list above is deliberate. The configuration has no
+setting for the underlay interface name. Predicates 3 and 4 therefore match
+`iifname` as "not a user bridge", together with the exact source and
+destination slots. The isolated underlay of section 8.5 and strict
+reverse-path filtering carry the rest of that check. A named interface
+setting is open work.
+
 All other new forwarding is dropped. In particular, an ingress bridge alone
 never authorizes egress, an underlay interface alone never authorizes delivery
 to a bridge, and a claimed source address never selects another user's rules.

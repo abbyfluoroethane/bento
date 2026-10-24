@@ -283,10 +283,17 @@ Bento writes one nftables table. Bento owns every rule in that table. Do not edi
 The rules do the following:
 
 1. Permit traffic from the host to any instance on port 22 and on the published HTTP ports.
-2. Permit egress from any instance to the internet.
+2. Permit egress from any instance to the internet, that is, to an address outside the private range.
 3. Drop traffic between the bridges of two different users.
 4. Permit traffic between two instances of the same user.
 5. Masquerade instance egress behind the address of the host.
+
+Four guard rules, kept apart from the five above, limit what a guest can do:
+
+* Drop every packet from an instance to an address of the host itself, except ICMP, TCP ports 80 and 443, and replies to traffic that the host started. An instance has no DHCP and no resolver on the host (section 6.2), so it needs nothing else. Ports 80 and 443 are the public ingress, which is public anyway; the proxy enforces visibility (section 9.2). This keeps a guest off the runner port and off every other service on the host.
+* Drop every packet from an instance to a management address: each runner endpoint and underlay address, and the controller.
+* Accept egress only to an address outside the private range. An instance reaches another address in the private range only through rule 4 and the same-user cross-machine rules of MULTI-NODE 9.
+* Drop a packet from a bridge whose source address is not an address that the machine owns in that user's `/24`. An instance cannot claim the address of another instance.
 
 Rule 4 is a decision, not an oversight. A user who runs a database instance and a web instance expects the two to communicate. The isolation boundary in version 1 is the user, not the instance.
 

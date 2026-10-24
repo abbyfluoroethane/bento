@@ -133,8 +133,14 @@ That makes two rules absolute:
   internet, and never run Bento on a network you share with people you do
   not trust.
 * Bind the runner listener to the **underlay address**, never to a
-  wildcard. Bento denies every guest prefix all management addresses, so a
-  guest cannot reach it; a wildcard bind would undo that.
+  wildcard. Bento's table drops every packet from a guest to the host's own
+  addresses (its `input` chain) except TCP 80 and 443, and every packet
+  from a guest to a runner or controller address (its `forward` chain).
+  A guest therefore reaches the public HTTP ingress and nothing else, and
+  never the runner port. The bind is a second layer; a wildcard bind
+  would remove it. A service on the host
+  that a guest needs, such as a resolver, must run outside the host or be
+  reached through the public address of another machine.
 
 Guests are not trusted and never were. The trust here is in your own
 network, not in the virtual machines running on it.
