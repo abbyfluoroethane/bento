@@ -6,7 +6,7 @@ CARGO ?= cargo
 # miss in a tree that had one for a long time.
 BINARIES = bentod bento-monitor
 
-.PHONY: build monitor test unit e2e clippy fmt fmt-check check clean
+.PHONY: build install install-runners monitor test unit script-test e2e clippy fmt fmt-check check clean
 
 build:
 	$(CARGO) build --release
@@ -16,6 +16,19 @@ build:
 	@echo
 	@echo "  bentod          the three processes, one subcommand each"
 	@echo "  bento-monitor   the terminal screen over the units; run it as root"
+	@scripts/build-info.sh
+
+# Installs the build on this machine: `sudo make install`. It keeps the
+# old binaries and, where serve runs, a database copy, then prints the
+# restart and the rollback (DEPLOYING.md section 6). It depends on no
+# build on purpose: under sudo, root has no toolchain.
+install:
+	@scripts/install.sh $(CURDIR)/target/release
+
+# Sends the build to every other runner over SSH and installs it there.
+# Run it as yourself, not with sudo.
+install-runners:
+	@scripts/install-runners.sh $(CURDIR)/target/release
 
 # Start the monitor against this host, without installing it first.
 monitor:
@@ -27,6 +40,10 @@ test:
 # The two halves separately, matching how CI runs them.
 unit:
 	$(CARGO) test --workspace --lib --bins
+
+# The install scripts, against fakes.
+script-test:
+	scripts/install_test.sh
 
 # The end-to-end suite (TESTING.md). It runs the real bentod binary, so
 # it needs qemu-img, xorriso, and a /dev/kvm the host check can stat.
@@ -44,7 +61,7 @@ fmt:
 fmt-check:
 	$(CARGO) fmt --all --check
 
-check: fmt-check clippy test
+check: fmt-check clippy test script-test
 
 clean:
 	$(CARGO) clean

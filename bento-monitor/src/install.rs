@@ -334,25 +334,38 @@ pub fn commands(kind: StepKind, paths: &Paths, euid: u32, role: Role) -> Result<
             // The build runs as the operator. Only the install into
             // /usr/local/bin needs privilege, and a root-owned target
             // directory would leave the tree unbuildable afterwards.
-            let mut commands = vec![
-                Cmd::new("cargo", &["build", "--release"]).in_dir(source.display().to_string()),
-            ];
-            for (built, installed) in paths.binaries() {
-                let built = built.ok_or("no source tree")?;
-                commands.push(
-                    Cmd::owned(
-                        "install",
-                        vec![
-                            "-m".into(),
-                            "0755".into(),
-                            built.display().to_string(),
-                            installed.display().to_string(),
-                        ],
-                    )
-                    .privileged(euid),
-                );
-            }
-            Ok(commands)
+            //
+            // The install is the one `sudo make install` runs, so the
+            // screen keeps the same way back: the old binaries and the
+            // database copy (DEPLOYING.md section 6). The script puts
+            // both binaries in one directory under their own names.
+            let bin_dir = paths.binary.parent().filter(|dir| {
+                paths.monitor.parent() == Some(*dir)
+                    && paths.binary.file_name() == Some("bentod".as_ref())
+                    && paths.monitor.file_name() == Some("bento-monitor".as_ref())
+            });
+            let bin_dir = bin_dir.ok_or(
+                "the install script needs bentod and bento-monitor side by side under those names",
+            )?;
+            let script = source.join("scripts/install.sh").display().to_string();
+            let release = source.join("target/release").display().to_string();
+            let install = if bin_dir == Path::new(DEFAULT_BINARY).parent().expect("absolute") {
+                Cmd::owned(script, vec![release])
+            } else {
+                // sudo clears the environment, so env sets it after.
+                Cmd::owned(
+                    "env",
+                    vec![
+                        format!("BENTO_BIN_DIR={}", bin_dir.display()),
+                        script,
+                        release,
+                    ],
+                )
+            };
+            Ok(vec![
+                Cmd::new("make", &["build"]).in_dir(source.display().to_string()),
+                install.privileged(euid),
+            ])
         }
         StepKind::Directories => {
             let mut args = vec!["-d".to_string(), "-m".to_string(), "0755".to_string()];
@@ -489,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn the_binary_step_builds_unprivileged_and_installs_both_binaries() {
+    fn the_binary_step_builds_unprivileged_and_installs_through_the_script() {
         let commands = commands(
             StepKind::Binary,
             &paths(Some(PathBuf::from("/srv/src"))),
@@ -497,18 +510,31 @@ mod tests {
             Role::Controller,
         )
         .expect("commands");
-        assert_eq!(commands[0].program, "cargo");
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].program, "make");
+        assert_eq!(commands[0].args, ["build"]);
         assert_eq!(commands[0].dir.as_deref(), Some("/srv/src"));
-        assert_eq!(commands.len(), 3);
-        for (command, name) in commands[1..].iter().zip(["bentod", "bento-monitor"]) {
-            let line = command.display();
-            assert_eq!(command.program, "sudo");
-            assert!(
-                line.contains(&format!("/srv/src/target/release/{name}")),
-                "{line}"
-            );
-            assert!(line.ends_with(&format!("/usr/local/bin/{name}")), "{line}");
-        }
+        // The same install as `sudo make install`, with its backup.
+        assert_eq!(
+            commands[1].display(),
+            "sudo /srv/src/scripts/install.sh /srv/src/target/release"
+        );
+    }
+
+    #[test]
+    fn the_binary_step_carries_a_moved_binary_directory() {
+        let mut paths = paths(Some(PathBuf::from("/srv/src")));
+        paths.binary = PathBuf::from("/opt/bento/bentod");
+        paths.monitor = PathBuf::from("/opt/bento/bento-monitor");
+        let step = commands(StepKind::Binary, &paths, 1000, Role::Controller).expect("commands");
+        assert_eq!(
+            step[1].display(),
+            "sudo env BENTO_BIN_DIR=/opt/bento /srv/src/scripts/install.sh /srv/src/target/release"
+        );
+
+        // The script cannot put the two binaries in two places.
+        paths.monitor = PathBuf::from("/usr/local/bin/bento-monitor");
+        assert!(commands(StepKind::Binary, &paths, 1000, Role::Controller).is_err());
     }
 
     #[test]
