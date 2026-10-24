@@ -329,7 +329,10 @@ async fn settings_lock_the_name_until_the_vm_stops() {
     // posts the current name, so the other settings save as before.
     let fx = fixture();
     let body = text(&get(&fx.pages, "/vm/uuid-web/settings").await);
-    assert!(body.contains("readonly aria-describedby=\"name-locked\""), "{body}");
+    assert!(
+        body.contains("readonly aria-describedby=\"name-locked\""),
+        "{body}"
+    );
     assert!(body.contains("Stop the VM to rename it."), "{body}");
 
     fx.store
