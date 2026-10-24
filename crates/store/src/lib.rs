@@ -94,6 +94,9 @@ pub enum Error {
     /// A smaller prefix would leave an owned slot with no number.
     #[error("store: prefix {prefix} has no room for slot {slot}, which is owned")]
     RunnerPrefixStrandsSlot { prefix: u8, slot: i64 },
+    /// A merge would give one prefix two owners (MULTI-NODE 17.2).
+    #[error("store: prefix {prefix} would merge slots with different owners into slot {slot}")]
+    RunnerPrefixSplitsOwners { prefix: u8, slot: i64 },
     /// The slot number is outside what the runner prefix divides into.
     #[error("store: slot {slot} does not exist: the deployment has {count}")]
     NoSuchSlot { slot: i64, count: i64 },

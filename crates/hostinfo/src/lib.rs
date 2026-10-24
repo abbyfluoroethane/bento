@@ -70,6 +70,15 @@ pub fn read_hostname() -> String {
         .unwrap_or_else(|| "localhost".to_owned())
 }
 
+/// The kernel boot ID. It is new on every boot, so a changed value means
+/// the machine restarted and lost its kernel network state. Empty when the
+/// kernel does not say.
+pub fn read_boot_id() -> String {
+    std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+        .map(|text| text.trim().to_owned())
+        .unwrap_or_default()
+}
+
 /// One reading of the aggregate processor counters of `/proc/stat`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CpuTimes {

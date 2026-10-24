@@ -496,8 +496,11 @@ async fn set_prefix(app: &App, prefix: u8) -> Result<()> {
         after.runner_prefix,
         after.slot_count()
     );
+    // Each old slot split into children that keep the old owner
+    // (MULTI-NODE 17.1).
     println!(
-        "{} slot(s) claimed; the rest are unowned until `bentod slots give`",
+        "{} slot(s) owned; each new slot kept the owner of the slot it split from. \
+         Move one with `bentod slots give`.",
         slots.len()
     );
     // Subdivision keeps every guest address and every guest's /24

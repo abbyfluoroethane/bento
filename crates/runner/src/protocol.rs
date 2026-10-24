@@ -330,6 +330,13 @@ pub struct Health {
     pub hostname: String,
     /// The highest controller epoch this runner has accepted.
     pub accepted_epoch: i64,
+    /// The kernel boot ID of the machine. It changes on every reboot, and
+    /// a reboot erases the routes, proxy ARP, and firewall that
+    /// `ApplyNetwork` installed, so the controller resends the network
+    /// when this value changes (MULTI-NODE 8.2). Empty from a runner
+    /// that does not report it.
+    #[serde(default)]
+    pub boot_id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

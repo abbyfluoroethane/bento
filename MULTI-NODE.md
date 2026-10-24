@@ -997,6 +997,12 @@ restarted runner is healthy, it also converges current user network, route,
 proxy-ARP, underlay ownership-ACL, firewall, and image state. An
 unreachable runner does not block restore on healthy runners.
 
+The controller sees a runner reboot through the `boot_id` field of the
+health report, which is the kernel boot ID. When the value changes, the
+controller forgets the network state that it last sent to that runner
+and sends it again. An empty `boot_id` comes from an older runner. The
+controller then does not assume a reboot.
+
 ## 15. State, health, and partial failure
 
 Observed instance state needs freshness. Store a separate observation time or
