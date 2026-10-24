@@ -10,3 +10,6 @@ async-trait = { workspace = true }
 bento-types = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

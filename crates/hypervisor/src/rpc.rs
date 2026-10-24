@@ -1,4 +1,5 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use async_trait::async_trait;
@@ -212,95 +213,79 @@ impl Transport {
     }
 }
 
+/// One libvirt connection that outlives the daemon behind it.
+///
+/// virtqemud restarts on a package update, and an idle modular daemon
+/// can exit on its own. Each restart closes the socket. A client that
+/// kept the first socket for its whole life then failed every call with
+/// "Broken pipe" until the process restarted, and a runner stopped
+/// observing its machine (SPEC 4.1).
+///
+/// An I/O error therefore drops the socket, and the next call opens a
+/// new one with the full handshake. The call that saw the error is not
+/// sent again: when the reply is lost, libvirt can already have done
+/// the work, and a create or a destroy must not run twice.
 #[derive(Debug)]
 pub(crate) struct RpcApi {
-    transport: Transport,
+    path: PathBuf,
+    flags: u32,
+    /// `None` after an I/O error, until the next call opens a new socket.
+    current: Mutex<Option<Arc<Transport>>>,
 }
 
 impl RpcApi {
     pub(crate) async fn connect(path: &Path, flags: u32) -> Result<Self, ApiError> {
-        let api = Self {
-            transport: Transport::connect(path).await?,
-        };
-        api.authenticate().await?;
-        let mut writer = Writer::new();
-        writer.optional_string(Some("qemu:///system"))?;
-        writer.u32(flags);
-        api.transport
-            .request(PROC_CONNECT_OPEN, writer.into_inner())
-            .await?;
-        Ok(api)
+        let transport = open(path, flags).await?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            flags,
+            current: Mutex::new(Some(Arc::new(transport))),
+        })
     }
 
-    /// Settles authentication before the connection opens. libvirtd
-    /// requires the auth-list call even when the socket needs no
-    /// authentication at all.
-    ///
-    /// The first type in the advertised list that we can satisfy wins.
-    /// `none` needs no exchange. `polkit` needs one more call, which is
-    /// what the read-write socket of the modular daemons asks for: it
-    /// authorizes the peer by its socket credentials, so membership of
-    /// the `libvirt` group is what actually decides the answer and
-    /// nothing is sent. A list with neither is a socket Bento cannot
-    /// use, and saying so plainly beats failing later inside
-    /// ConnectOpen.
-    async fn authenticate(&self) -> Result<(), ApiError> {
-        let advertised = self.auth_list().await?;
-        for auth in &advertised {
-            match *auth {
-                AUTH_NONE => return Ok(()),
-                AUTH_POLKIT => {
-                    self.auth_polkit().await?;
-                    return Ok(());
+    async fn request(&self, procedure: u32, payload: Vec<u8>) -> Result<Vec<u8>, ApiError> {
+        let transport = {
+            let mut current = self.current.lock().await;
+            match current.as_ref() {
+                Some(transport) => Arc::clone(transport),
+                None => {
+                    let transport = Arc::new(open(&self.path, self.flags).await?);
+                    *current = Some(Arc::clone(&transport));
+                    transport
                 }
-                _ => continue,
+            }
+        };
+        let result = transport.request(procedure, payload).await;
+        if let Err(ApiError::Io(_)) = &result {
+            // The socket is gone, or it stopped mid-packet and the next
+            // reply would be read out of step. Either way it is unusable.
+            // Another call may already have opened a new socket; keep it.
+            let mut current = self.current.lock().await;
+            if current
+                .as_ref()
+                .is_some_and(|open| Arc::ptr_eq(open, &transport))
+            {
+                *current = None;
             }
         }
-        if advertised.is_empty() {
-            return Ok(());
-        }
-        Err(ApiError::Protocol(format!(
-            "libvirt socket requires an unsupported authentication type: {advertised:?}"
-        )))
+        result
     }
 
-    /// Runs the polkit exchange. The reply carries a completion flag;
-    /// a refusal arrives as an error reply, not as a false flag.
-    async fn auth_polkit(&self) -> Result<(), ApiError> {
-        let payload = self.transport.request(PROC_AUTH_POLKIT, Vec::new()).await?;
-        let mut reader = Reader::new(&payload);
-        let complete = reader.i32()?;
-        reader.finish()?;
-        if complete == 0 {
-            return Err(ApiError::Protocol(
-                "libvirt refused the polkit authentication".to_string(),
-            ));
-        }
-        Ok(())
-    }
-
-    async fn auth_list(&self) -> Result<Vec<i32>, ApiError> {
-        let payload = self.transport.request(PROC_AUTH_LIST, Vec::new()).await?;
-        let mut reader = Reader::new(&payload);
-        let len = reader.array_len()?;
-        let mut auth = Vec::with_capacity(len);
-        for _ in 0..len {
-            auth.push(reader.i32()?);
-        }
-        reader.finish()?;
-        Ok(auth)
-    }
-
+    /// Sends `ConnectClose`. A connection the daemon already closed is
+    /// closed, so that is not an error: a runner stopping after a
+    /// libvirt restart must exit cleanly.
     pub(crate) async fn close(&self) -> Result<(), ApiError> {
-        self.transport
-            .request(PROC_CONNECT_CLOSE, Vec::new())
-            .await?;
-        Ok(())
+        let Some(transport) = self.current.lock().await.take() else {
+            return Ok(());
+        };
+        match transport.request(PROC_CONNECT_CLOSE, Vec::new()).await {
+            Ok(_) | Err(ApiError::Io(_)) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     pub(crate) async fn capabilities(&self) -> Result<String, ApiError> {
         let payload = self
-            .transport
             .request(PROC_CONNECT_GET_CAPABILITIES, Vec::new())
             .await?;
         let mut reader = Reader::new(&payload);
@@ -308,6 +293,79 @@ impl RpcApi {
         reader.finish()?;
         Ok(capabilities)
     }
+}
+
+/// Opens a socket and runs the handshake: authentication, then
+/// `ConnectOpen`.
+async fn open(path: &Path, flags: u32) -> Result<Transport, ApiError> {
+    let transport = Transport::connect(path).await?;
+    authenticate(&transport).await?;
+    let mut writer = Writer::new();
+    writer.optional_string(Some("qemu:///system"))?;
+    writer.u32(flags);
+    transport
+        .request(PROC_CONNECT_OPEN, writer.into_inner())
+        .await?;
+    Ok(transport)
+}
+
+/// Settles authentication before the connection opens. libvirtd
+/// requires the auth-list call even when the socket needs no
+/// authentication at all.
+///
+/// The first type in the advertised list that we can satisfy wins.
+/// `none` needs no exchange. `polkit` needs one more call, which is
+/// what the read-write socket of the modular daemons asks for: it
+/// authorizes the peer by its socket credentials, so membership of
+/// the `libvirt` group is what actually decides the answer and
+/// nothing is sent. A list with neither is a socket Bento cannot
+/// use, and saying so plainly beats failing later inside
+/// ConnectOpen.
+async fn authenticate(transport: &Transport) -> Result<(), ApiError> {
+    let advertised = auth_list(transport).await?;
+    for auth in &advertised {
+        match *auth {
+            AUTH_NONE => return Ok(()),
+            AUTH_POLKIT => {
+                auth_polkit(transport).await?;
+                return Ok(());
+            }
+            _ => continue,
+        }
+    }
+    if advertised.is_empty() {
+        return Ok(());
+    }
+    Err(ApiError::Protocol(format!(
+        "libvirt socket requires an unsupported authentication type: {advertised:?}"
+    )))
+}
+
+/// Runs the polkit exchange. The reply carries a completion flag;
+/// a refusal arrives as an error reply, not as a false flag.
+async fn auth_polkit(transport: &Transport) -> Result<(), ApiError> {
+    let payload = transport.request(PROC_AUTH_POLKIT, Vec::new()).await?;
+    let mut reader = Reader::new(&payload);
+    let complete = reader.i32()?;
+    reader.finish()?;
+    if complete == 0 {
+        return Err(ApiError::Protocol(
+            "libvirt refused the polkit authentication".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+async fn auth_list(transport: &Transport) -> Result<Vec<i32>, ApiError> {
+    let payload = transport.request(PROC_AUTH_LIST, Vec::new()).await?;
+    let mut reader = Reader::new(&payload);
+    let len = reader.array_len()?;
+    let mut auth = Vec::with_capacity(len);
+    for _ in 0..len {
+        auth.push(reader.i32()?);
+    }
+    reader.finish()?;
+    Ok(auth)
 }
 
 fn encode_domain(writer: &mut Writer, domain: &Domain) -> Result<(), ApiError> {
@@ -363,7 +421,6 @@ impl LibvirtApi for RpcApi {
         let mut writer = Writer::new();
         writer.string(xml)?;
         let payload = self
-            .transport
             .request(PROC_DOMAIN_DEFINE_XML, writer.into_inner())
             .await?;
         let mut reader = Reader::new(&payload);
@@ -375,8 +432,7 @@ impl LibvirtApi for RpcApi {
     async fn domain_create(&self, domain: &Domain) -> Result<(), ApiError> {
         let mut writer = Writer::new();
         encode_domain(&mut writer, domain)?;
-        self.transport
-            .request(PROC_DOMAIN_CREATE, writer.into_inner())
+        self.request(PROC_DOMAIN_CREATE, writer.into_inner())
             .await?;
         Ok(())
     }
@@ -384,8 +440,7 @@ impl LibvirtApi for RpcApi {
     async fn domain_shutdown(&self, domain: &Domain) -> Result<(), ApiError> {
         let mut writer = Writer::new();
         encode_domain(&mut writer, domain)?;
-        self.transport
-            .request(PROC_DOMAIN_SHUTDOWN, writer.into_inner())
+        self.request(PROC_DOMAIN_SHUTDOWN, writer.into_inner())
             .await?;
         Ok(())
     }
@@ -394,8 +449,7 @@ impl LibvirtApi for RpcApi {
         let mut writer = Writer::new();
         encode_domain(&mut writer, domain)?;
         writer.u32(flags);
-        self.transport
-            .request(PROC_DOMAIN_REBOOT, writer.into_inner())
+        self.request(PROC_DOMAIN_REBOOT, writer.into_inner())
             .await?;
         Ok(())
     }
@@ -403,8 +457,7 @@ impl LibvirtApi for RpcApi {
     async fn domain_destroy(&self, domain: &Domain) -> Result<(), ApiError> {
         let mut writer = Writer::new();
         encode_domain(&mut writer, domain)?;
-        self.transport
-            .request(PROC_DOMAIN_DESTROY, writer.into_inner())
+        self.request(PROC_DOMAIN_DESTROY, writer.into_inner())
             .await?;
         Ok(())
     }
@@ -413,8 +466,7 @@ impl LibvirtApi for RpcApi {
         let mut writer = Writer::new();
         encode_domain(&mut writer, domain)?;
         writer.u32(flags);
-        self.transport
-            .request(PROC_DOMAIN_UNDEFINE_FLAGS, writer.into_inner())
+        self.request(PROC_DOMAIN_UNDEFINE_FLAGS, writer.into_inner())
             .await?;
         Ok(())
     }
@@ -423,8 +475,7 @@ impl LibvirtApi for RpcApi {
         let mut writer = Writer::new();
         encode_domain(&mut writer, domain)?;
         writer.i32(value);
-        self.transport
-            .request(PROC_DOMAIN_SET_AUTOSTART, writer.into_inner())
+        self.request(PROC_DOMAIN_SET_AUTOSTART, writer.into_inner())
             .await?;
         Ok(())
     }
@@ -433,7 +484,6 @@ impl LibvirtApi for RpcApi {
         let mut writer = Writer::new();
         writer.string(name)?;
         let payload = self
-            .transport
             .request(PROC_DOMAIN_LOOKUP_BY_NAME, writer.into_inner())
             .await?;
         let mut reader = Reader::new(&payload);
@@ -447,7 +497,6 @@ impl LibvirtApi for RpcApi {
         encode_domain(&mut writer, domain)?;
         writer.u32(flags);
         let payload = self
-            .transport
             .request(PROC_DOMAIN_GET_STATE, writer.into_inner())
             .await?;
         let mut reader = Reader::new(&payload);
@@ -464,7 +513,6 @@ impl LibvirtApi for RpcApi {
         let mut writer = Writer::new();
         encode_domain(&mut writer, domain)?;
         let payload = self
-            .transport
             .request(PROC_DOMAIN_GET_INFO, writer.into_inner())
             .await?;
         let mut reader = Reader::new(&payload);
@@ -489,7 +537,6 @@ impl LibvirtApi for RpcApi {
         writer.u32(max_stats);
         writer.u32(flags);
         let payload = self
-            .transport
             .request(PROC_DOMAIN_MEMORY_STATS, writer.into_inner())
             .await?;
         let mut reader = Reader::new(&payload);
@@ -507,7 +554,6 @@ impl LibvirtApi for RpcApi {
         writer.i32(need_results);
         writer.u32(flags);
         let payload = self
-            .transport
             .request(PROC_CONNECT_LIST_ALL_DOMAINS, writer.into_inner())
             .await?;
         let mut reader = Reader::new(&payload);
@@ -528,7 +574,6 @@ impl NetworkApi for RpcApi {
         let mut writer = Writer::new();
         writer.string(name)?;
         let payload = self
-            .transport
             .request(PROC_NETWORK_LOOKUP_BY_NAME, writer.into_inner())
             .await?;
         let mut reader = Reader::new(&payload);
@@ -541,7 +586,6 @@ impl NetworkApi for RpcApi {
         let mut writer = Writer::new();
         writer.string(xml)?;
         let payload = self
-            .transport
             .request(PROC_NETWORK_DEFINE_XML, writer.into_inner())
             .await?;
         let mut reader = Reader::new(&payload);
@@ -553,8 +597,7 @@ impl NetworkApi for RpcApi {
     async fn network_create(&self, network: &Network) -> Result<(), ApiError> {
         let mut writer = Writer::new();
         encode_network(&mut writer, network)?;
-        self.transport
-            .request(PROC_NETWORK_CREATE, writer.into_inner())
+        self.request(PROC_NETWORK_CREATE, writer.into_inner())
             .await?;
         Ok(())
     }
@@ -563,7 +606,6 @@ impl NetworkApi for RpcApi {
         let mut writer = Writer::new();
         encode_network(&mut writer, network)?;
         let payload = self
-            .transport
             .request(PROC_NETWORK_IS_ACTIVE, writer.into_inner())
             .await?;
         let mut reader = Reader::new(&payload);
@@ -576,8 +618,7 @@ impl NetworkApi for RpcApi {
         let mut writer = Writer::new();
         encode_network(&mut writer, network)?;
         writer.i32(value);
-        self.transport
-            .request(PROC_NETWORK_SET_AUTOSTART, writer.into_inner())
+        self.request(PROC_NETWORK_SET_AUTOSTART, writer.into_inner())
             .await?;
         Ok(())
     }
@@ -776,6 +817,85 @@ mod tests {
                 assert!((0..64).contains(tag), "{:?} decoded tag {tag}", domain.name);
             }
         }
+        api.close().await.unwrap();
+    }
+
+    /// A fake daemon. Socket number `n` (from 1) answers `limits[n - 1]`
+    /// calls and then hangs up, the way a restarting virtqemud does; a
+    /// socket past the list never hangs up. The capabilities reply names
+    /// the socket, so a test can tell a new socket from the old one.
+    fn fake_daemon(
+        limits: Vec<usize>,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("virtqemud-sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let sockets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&sockets);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let number = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                let limit = limits.get(number - 1).copied().unwrap_or(usize::MAX);
+                tokio::spawn(async move {
+                    for _ in 0..limit {
+                        let Ok(call) = read_packet(&mut stream).await else {
+                            return;
+                        };
+                        let mut writer = Writer::new();
+                        match call.header.procedure {
+                            PROC_AUTH_LIST => writer.u32(0),
+                            PROC_CONNECT_GET_CAPABILITIES => {
+                                writer.string(&format!("socket {number}")).unwrap();
+                            }
+                            _ => {}
+                        }
+                        let header = Header {
+                            packet_type: PACKET_REPLY,
+                            status: STATUS_OK,
+                            ..call.header
+                        };
+                        let bytes = encode_packet(&header, &writer.into_inner()).unwrap();
+                        if stream.write_all(&bytes).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (directory, path, sockets)
+    }
+
+    #[tokio::test]
+    async fn a_daemon_restart_costs_one_call_and_the_next_one_reconnects() {
+        // The handshake is two calls, auth-list and open, then one more.
+        let (_directory, path, sockets) = fake_daemon(vec![3]);
+        let api = RpcApi::connect(&path, 0).await.unwrap();
+        assert_eq!(api.capabilities().await.unwrap(), "socket 1");
+
+        // The daemon has gone. This call fails, and it is not sent again.
+        let error = api.capabilities().await.unwrap_err();
+        assert!(matches!(error, ApiError::Io(_)), "{error:?}");
+        assert_eq!(sockets.load(Ordering::SeqCst), 1);
+
+        // The next call opens a new socket with the full handshake.
+        assert_eq!(api.capabilities().await.unwrap(), "socket 2");
+        assert_eq!(api.capabilities().await.unwrap(), "socket 2");
+        assert_eq!(sockets.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn closing_a_connection_the_daemon_already_closed_is_not_an_error() {
+        let (_directory, path, _sockets) = fake_daemon(vec![2]);
+        let api = RpcApi::connect(&path, 0).await.unwrap();
+        api.close().await.unwrap();
+        // A second close has nothing left to close.
         api.close().await.unwrap();
     }
 }
