@@ -58,6 +58,13 @@ pub trait Host: Send + Sync {
     /// image (MULTI-NODE 11.5). A rename undefines the previous name
     /// first; the files stay, because only the label changes.
     async fn redefine(&self, request: &RedefineRequest) -> Result<bento_types::State, HostError>;
+    /// Grows the overlay of an instance to `disk_gib` (SPEC 11.1). The
+    /// disk never shrinks. Returns the state the machine observed.
+    async fn resize_disk(
+        &self,
+        instance: &InstanceRef,
+        disk_gib: i64,
+    ) -> Result<bento_types::State, HostError>;
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -106,6 +113,9 @@ pub async fn serve_one(
                 },
                 Operation::RedefineInstance { redefine } => Reply::Changed {
                     state: host.redefine(redefine).await?,
+                },
+                Operation::ResizeDisk { instance, disk_gib } => Reply::Changed {
+                    state: host.resize_disk(instance, *disk_gib).await?,
                 },
             };
             // A change is recorded before the answer leaves, so a retry

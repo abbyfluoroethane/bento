@@ -90,7 +90,7 @@ async fn sshd_inner(app: &App) -> Result<()> {
     let mut server = bento_sshfront::Server::new(
         Arc::new(app.store.clone()),
         Arc::new(app.store.clone()),
-        Arc::new(Starter(hypervisor.clone())),
+        Arc::new(Starter(manager.clone())),
         Arc::new(CliRunner(cli)),
         host_key,
         frontend_key,

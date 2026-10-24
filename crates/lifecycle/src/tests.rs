@@ -305,6 +305,23 @@ impl Store for TestStore {
         data.released.push(old);
         Ok(())
     }
+    async fn check_resize(
+        &self,
+        uuid: &str,
+        _memory: i64,
+        _disk: i64,
+        _capacity: Capacity,
+    ) -> std::result::Result<(), DynError> {
+        let data = self.data();
+        if let Some(error) = &data.resize_error {
+            return Err(boxed(error));
+        }
+        data.instances
+            .iter()
+            .find(|item| item.uuid == uuid)
+            .map(|_| ())
+            .ok_or_else(|| boxed("not found"))
+    }
     async fn resize(
         &self,
         uuid: &str,
@@ -392,6 +409,10 @@ struct TestImages {
     unreachable: Mutex<Vec<i64>>,
     /// Every redefine request as `host name previous`, in order.
     redefined: Mutex<Vec<String>>,
+    /// Every remote disk resize as `host uuid gib`, in order.
+    disk_resized: Mutex<Vec<String>>,
+    /// Makes a remote disk resize fail.
+    disk_error: Mutex<Option<String>>,
     /// The machine this fake stands for. Only work aimed here reaches
     /// the hypervisor, as with the real one.
     fake: Arc<Fake>,
@@ -410,6 +431,8 @@ impl TestImages {
             acted_on: Mutex::new(Vec::new()),
             unreachable: Mutex::new(Vec::new()),
             redefined: Mutex::new(Vec::new()),
+            disk_resized: Mutex::new(Vec::new()),
+            disk_error: Mutex::new(None),
             fake,
             iso,
             storage_dir,
@@ -498,6 +521,22 @@ impl Fleet for TestImages {
             fake: self.fake.clone(),
             storage_dir: self.storage_dir.clone(),
         }))
+    }
+
+    async fn resize_disk(
+        &self,
+        host_id: i64,
+        instance: &Instance,
+        disk_gib: i64,
+    ) -> std::result::Result<(), DynError> {
+        self.disk_resized
+            .lock()
+            .unwrap()
+            .push(format!("{host_id} {} {disk_gib}", instance.uuid));
+        match self.disk_error.lock().unwrap().clone() {
+            Some(error) => Err(boxed(&error)),
+            None => Ok(()),
+        }
     }
 
     async fn redefine(&self, spec: &RedefineSpec) -> std::result::Result<State, DynError> {
@@ -1059,6 +1098,38 @@ async fn an_action_goes_to_the_machine_that_runs_the_instance() {
 }
 
 #[tokio::test]
+async fn a_connection_starts_an_instance_on_the_machine_that_runs_it() {
+    // The SSH frontend and the web terminal once started the domain on
+    // the controller's own libvirt, which has no such domain when the
+    // instance runs on a runner (MULTI-NODE 11.5).
+    let f = fixture(false, false);
+    let instance = setup(&f).await;
+    f.manager.stop(&instance.uuid).await.unwrap();
+    move_to_runner(&f);
+    f.images.acted_on.lock().unwrap().clear();
+
+    f.manager.start_for_connection(&instance.uuid).await.unwrap();
+
+    assert_eq!(f.images.acted_on.lock().unwrap().as_slice(), &[2]);
+    assert_eq!(f.fake.domain("web").unwrap().state, State::Running);
+}
+
+#[tokio::test]
+async fn a_connection_start_keeps_the_desired_state() {
+    // SPEC 10 step 7 and 11.2: a connection starts the domain and does
+    // not record that the user asked for it.
+    let f = fixture(false, false);
+    let instance = setup(&f).await;
+    f.manager.stop(&instance.uuid).await.unwrap();
+
+    f.manager.start_for_connection(&instance.uuid).await.unwrap();
+
+    assert_eq!(f.fake.domain("web").unwrap().state, State::Running);
+    let stored = f.store.instance(&instance.uuid).await.unwrap();
+    assert_eq!(stored.desired_state, DesiredState::Stopped);
+}
+
+#[tokio::test]
 async fn a_local_instance_never_leaves_this_machine() {
     // The fleet is not asked at all for an instance that runs here, so a
     // single-machine deployment needs no way to reach another machine.
@@ -1098,11 +1169,24 @@ async fn an_action_on_an_unreachable_machine_says_so() {
     );
 }
 
+/// Asserts that a refused copy touched nothing: no row, no file, no
+/// resize on this machine, no work sent to a runner (MULTI-NODE 13.3).
+fn assert_copy_left_nothing(f: &Fixture, mutations_before: usize) {
+    assert_eq!(f.store.data().mutations.len(), mutations_before);
+    assert_eq!(f.store.data().instances.len(), 1);
+    assert!(f.resizer.calls.lock().unwrap().is_empty());
+    // `setup` placed the source once; a copy adds nothing.
+    assert_eq!(f.images.placed_on.lock().unwrap().len(), 1);
+    assert!(f.images.disk_resized.lock().unwrap().is_empty());
+    assert!(f.iso.seeds.lock().unwrap().len() <= 1);
+}
+
 #[tokio::test]
 async fn a_copy_of_an_instance_on_another_machine_is_refused() {
-    // A copy is a local file copy of the source's overlay
-    // (MULTI-NODE 13.3). Copying between machines is a transfer with its
-    // own verification, which is the slot-move workflow of section 17.
+    // A copy is a file copy of the source's overlay on the source's
+    // machine. The runner has no operation for that yet, so the
+    // controller must refuse and never copy or resize its own paths
+    // (MULTI-NODE 13.3).
     let f = fixture(false, false);
     let source = setup(&f).await;
     f.manager.stop(&source.uuid).await.unwrap();
@@ -1111,6 +1195,29 @@ async fn a_copy_of_an_instance_on_another_machine_is_refused() {
         .instances
         .iter_mut()
         .for_each(|instance| instance.host_id = 2);
+    let before = f.store.data().mutations.len();
+    let owner = f.store.user_by_id(1).await.unwrap();
+    let mut request = copy_request(owner, "clone");
+    request.disk_gib = 30;
+
+    let error = f.manager.copy(&source.uuid, request).await.unwrap_err();
+
+    assert!(matches!(error, Error::CopyAcrossMachines(_)), "{error:?}");
+    assert_copy_left_nothing(&f, before);
+}
+
+#[tokio::test]
+async fn a_remote_source_is_not_judged_by_a_local_domain_of_the_same_name() {
+    // The domain state of a remote instance lives on its runner. A local
+    // domain with the same label says nothing about it.
+    let f = fixture(false, false);
+    let source = setup(&f).await; // still running here
+    f.store
+        .data()
+        .instances
+        .iter_mut()
+        .for_each(|instance| instance.host_id = 2);
+    let before = f.store.data().mutations.len();
     let owner = f.store.user_by_id(1).await.unwrap();
 
     let error = f
@@ -1119,7 +1226,27 @@ async fn a_copy_of_an_instance_on_another_machine_is_refused() {
         .await
         .unwrap_err();
 
-    assert!(error.to_string().contains("another machine"), "{error}");
+    assert!(matches!(error, Error::CopyAcrossMachines(_)), "{error:?}");
+    assert_copy_left_nothing(&f, before);
+}
+
+#[tokio::test]
+async fn a_copy_placed_on_another_machine_than_its_source_is_refused() {
+    // The row would say host 2 while the overlay copy and resize ran on
+    // this machine (MULTI-NODE 13.3).
+    let f = fixture(false, false);
+    let source = setup(&f).await;
+    f.manager.stop(&source.uuid).await.unwrap();
+    let before = f.store.data().mutations.len();
+    let owner = f.store.user_by_id(1).await.unwrap();
+    let mut request = copy_request(owner, "clone");
+    request.host_id = 2;
+    request.disk_gib = 30;
+
+    let error = f.manager.copy(&source.uuid, request).await.unwrap_err();
+
+    assert!(matches!(error, Error::CopyAcrossMachines(_)), "{error:?}");
+    assert_copy_left_nothing(&f, before);
 }
 
 #[tokio::test]
@@ -1564,6 +1691,60 @@ async fn resize_capacity_failure_changes_nothing() {
             .is_err()
     );
     assert!(f.resizer.calls.lock().unwrap().is_empty());
+}
+
+fn grow_to_30(uuid: &str) -> ResizeRequest {
+    ResizeRequest {
+        uuid: uuid.to_owned(),
+        vcpu: 2,
+        memory_mib: 2048,
+        disk_gib: 30,
+        nested: false,
+    }
+}
+
+#[tokio::test]
+async fn resize_on_another_machine_grows_the_disk_there() {
+    // The controller once ran `qemu-img` on a path of its own for an
+    // instance whose disk is on a runner (MULTI-NODE 11.5).
+    let f = fixture(false, false);
+    let instance = setup(&f).await;
+    move_to_runner(&f);
+
+    f.manager.resize(grow_to_30(&instance.uuid)).await.unwrap();
+
+    assert!(
+        f.resizer.calls.lock().unwrap().is_empty(),
+        "the controller grew a disk that is on another machine"
+    );
+    assert_eq!(
+        *f.images.disk_resized.lock().unwrap(),
+        [format!("2 {} 30", instance.uuid)]
+    );
+    assert_eq!(f.store.instance(&instance.uuid).await.unwrap().disk_gib, 30);
+}
+
+#[tokio::test]
+async fn a_failed_disk_resize_leaves_the_row_size() {
+    let f = fixture(false, false);
+    let instance = setup(&f).await;
+    move_to_runner(&f);
+    *f.images.disk_error.lock().unwrap() = Some("runner unreachable".into());
+
+    assert!(f.manager.resize(grow_to_30(&instance.uuid)).await.is_err());
+
+    assert_eq!(f.store.instance(&instance.uuid).await.unwrap().disk_gib, 20);
+}
+
+#[tokio::test]
+async fn a_failed_local_disk_resize_leaves_the_row_size() {
+    let f = fixture(false, false);
+    let instance = setup(&f).await;
+    *f.resizer.error.lock().unwrap() = Some("qemu-img failed".into());
+
+    assert!(f.manager.resize(grow_to_30(&instance.uuid)).await.is_err());
+
+    assert_eq!(f.store.instance(&instance.uuid).await.unwrap().disk_gib, 20);
 }
 
 fn copy_request(owner: User, name: &str) -> NewRequest {

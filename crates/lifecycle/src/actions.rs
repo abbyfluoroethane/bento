@@ -24,13 +24,7 @@ impl Manager {
     /// Starts a stopped instance and records desired running (SPEC 11.1).
     pub async fn start(&self, uuid: &str) -> Result<()> {
         let instance = self.store.instance(uuid).await.map_err(external)?;
-        self.hyp_for(&instance)
-            .await?
-            .start(&instance.name)
-            .await
-            .map_err(|error| {
-                Error::operation(format!("lifecycle: start {}: {error}", instance.name))
-            })?;
+        self.start_domain(&instance).await?;
         self.store
             .set_desired_state(uuid, DesiredState::Running)
             .await
@@ -39,6 +33,25 @@ impl Manager {
             .set_observed_state(uuid, State::Running)
             .await
             .map_err(external)
+    }
+
+    /// Starts the domain for an SSH or web terminal connection, on the
+    /// machine that runs it. Unlike [`Manager::start`] it leaves the desired
+    /// state alone, so a later host reboot returns the instance to what the
+    /// user last asked for (SPEC 10 step 7, 11.2).
+    pub async fn start_for_connection(&self, uuid: &str) -> Result<()> {
+        let instance = self.store.instance(uuid).await.map_err(external)?;
+        self.start_domain(&instance).await
+    }
+
+    async fn start_domain(&self, instance: &Instance) -> Result<()> {
+        self.hyp_for(instance)
+            .await?
+            .start(&instance.name)
+            .await
+            .map_err(|error| {
+                Error::operation(format!("lifecycle: start {}: {error}", instance.name))
+            })
     }
 
     /// Requests ACPI shutdown, waits, and only then destroys. Desired stopped
@@ -150,6 +163,22 @@ impl Manager {
             .host_capacity(instance.host_id)
             .await
             .map_err(external)?;
+        // A grown disk cannot shrink again, so the capacity check runs
+        // first. The row then changes only after the disk has grown: a
+        // failed grow must leave the stored size as the file has it
+        // (SPEC 11.1).
+        self.store
+            .check_resize(
+                &request.uuid,
+                request.memory_mib,
+                request.disk_gib,
+                capacity,
+            )
+            .await
+            .map_err(external)?;
+        if result.disk_grown {
+            self.grow_disk(&instance, request.disk_gib).await?;
+        }
         self.store
             .resize(
                 &request.uuid,
@@ -161,12 +190,6 @@ impl Manager {
             )
             .await
             .map_err(external)?;
-        if result.disk_grown {
-            self.resizer
-                .resize_overlay(&self.overlay_path(&request.uuid), request.disk_gib)
-                .await
-                .map_err(external)?;
-        }
         if result.restart_required {
             instance.vcpu = request.vcpu;
             instance.memory_mib = request.memory_mib;
@@ -175,6 +198,23 @@ impl Manager {
             self.redefine(&instance).await?;
         }
         Ok(result)
+    }
+
+    /// Grows the overlay on the machine that holds it. This machine uses
+    /// its own resizer; any other machine grows its own file
+    /// (MULTI-NODE 11.5).
+    async fn grow_disk(&self, instance: &Instance, disk_gib: i64) -> Result<()> {
+        if instance.host_id == self.host_id {
+            return self
+                .resizer
+                .resize_overlay(&self.overlay_path(&instance.uuid), disk_gib)
+                .await
+                .map_err(external);
+        }
+        self.fleet
+            .resize_disk(instance.host_id, instance, disk_gib)
+            .await
+            .map_err(external)
     }
 
     pub(crate) async fn redefine(&self, instance: &Instance) -> Result<()> {

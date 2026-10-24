@@ -88,6 +88,15 @@ impl Fleet for FakeImages {
         Some(self.hypervisor.clone())
     }
 
+    async fn resize_disk(
+        &self,
+        host_id: i64,
+        instance: &bento_types::Instance,
+        _disk_gib: i64,
+    ) -> Result<(), bento_lifecycle::DynError> {
+        Err(format!("unexpected disk resize of {} on machine {host_id}", instance.name).into())
+    }
+
     async fn redefine(
         &self,
         spec: &bento_lifecycle::RedefineSpec,
@@ -320,6 +329,10 @@ fn client_refusals_from_lifecycle_are_not_server_errors() {
             http::StatusCode::CONFLICT,
         ),
         (
+            E::CopyAcrossMachines("web runs on machine 2".into()),
+            http::StatusCode::CONFLICT,
+        ),
+        (
             E::NestedUnavailable("kvm_amd".into()),
             http::StatusCode::CONFLICT,
         ),
@@ -428,6 +441,70 @@ async fn placement_adapter_passes_the_configured_overcommit_ratio() {
     );
 }
 
+/// A runner whose report lacks a figure must not read as a host with no
+/// ceiling: a zero in `Capacity` skips the check (SPEC 6.1).
+async fn capacity_of_runner_reporting(
+    memory_total_mib: Option<i64>,
+    storage_total_gib: Option<i64>,
+) -> Result<bento_types::Capacity, bento_lifecycle::DynError> {
+    use bento_lifecycle::Store as _;
+    let env = Env::new().await;
+    let machine_id = "00000000000000000000000000000002";
+    let host = env
+        .store
+        .ensure_host(machine_id, "runner-b.example.org", "qemu:///system")
+        .await
+        .unwrap();
+    env.store
+        .observe_host(
+            host.id,
+            bento_store::HostSeen {
+                machine_id: Some(machine_id.into()),
+                memory_total_mib,
+                storage_total_gib,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let adapter = LifecycleStore(
+        env.store.clone(),
+        crate::adapters::LocalCapacity {
+            host_id: env.host_id,
+            capacity: bento_types::Capacity::unbounded(),
+            overcommit_ratio: 1.0,
+        },
+    );
+    adapter.host_capacity(host.id).await
+}
+
+#[tokio::test]
+async fn a_runner_with_missing_capacity_figures_is_refused_with_503() {
+    for (memory, storage) in [
+        (None, None),
+        (Some(4096), None),
+        (None, Some(100)),
+        (Some(0), Some(100)),
+        (Some(4096), Some(0)),
+    ] {
+        let error = capacity_of_runner_reporting(memory, storage)
+            .await
+            .expect_err("a host without figures must not read as unbounded");
+        let status = error
+            .downcast_ref::<bento_api::StatusError>()
+            .unwrap_or_else(|| panic!("no status on {error} for {memory:?} {storage:?}"));
+        assert_eq!(status.http_status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+}
+
+#[tokio::test]
+async fn a_runner_with_both_capacity_figures_has_a_ceiling() {
+    let capacity = capacity_of_runner_reporting(Some(4096), Some(100))
+        .await
+        .unwrap();
+    assert_eq!((capacity.memory_mib, capacity.disk_gib), (4096, 100));
+}
+
 #[tokio::test]
 async fn cli_backend_stop_start_restart() {
     let env = Env::new().await;
@@ -452,6 +529,29 @@ async fn cli_backend_stop_start_restart() {
         DesiredState::Running
     );
     backend.restart(instance).await.unwrap();
+}
+
+#[tokio::test]
+async fn ssh_starter_starts_through_the_manager_and_keeps_desired_state() {
+    use bento_sshfront::Starter as _;
+    let env = Env::new().await;
+    let owner = env.add_user("amber").await;
+    env.add_image().await;
+    let backend = env.backend("");
+    let instance = env.create(&backend, &owner, "web").await;
+    backend.stop(instance.clone()).await.unwrap();
+
+    crate::adapters::Starter(env.manager.clone())
+        .start_instance(instance.clone())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        env.hypervisor.state("web").await.unwrap(),
+        State::Running
+    );
+    let row = env.store.instance(&instance.uuid).await.unwrap();
+    assert_eq!(row.desired_state, DesiredState::Stopped);
 }
 
 #[tokio::test]

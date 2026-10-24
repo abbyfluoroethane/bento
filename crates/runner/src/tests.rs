@@ -140,6 +140,9 @@ impl Host for FakeHost {
     async fn redefine(&self, _: &RedefineRequest) -> Result<bento_types::State, HostError> {
         Ok(bento_types::State::Stopped)
     }
+    async fn resize_disk(&self, _: &InstanceRef, _: i64) -> Result<bento_types::State, HostError> {
+        Ok(bento_types::State::Stopped)
+    }
 }
 
 #[test]
@@ -502,6 +505,13 @@ async fn a_refused_request_never_reaches_the_host() {
             panic!("the host was asked despite a refusal");
         }
         async fn redefine(&self, _: &RedefineRequest) -> Result<bento_types::State, HostError> {
+            panic!("the host was asked despite a refusal");
+        }
+        async fn resize_disk(
+            &self,
+            _: &InstanceRef,
+            _: i64,
+        ) -> Result<bento_types::State, HostError> {
             panic!("the host was asked despite a refusal");
         }
     }

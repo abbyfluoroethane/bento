@@ -474,7 +474,7 @@ async fn control_plane_router(
     // needs no new secret (SPEC 14.6).
     let mut guests = bento_sshfront::Server::for_guests(
         Arc::new(app.store.clone()),
-        Arc::new(Starter(hypervisor.clone())),
+        Arc::new(Starter(manager.clone())),
         frontend_key,
     );
     guests.guest_user = bento_lifecycle::GUEST_USER.to_owned();

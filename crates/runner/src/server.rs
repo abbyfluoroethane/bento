@@ -148,6 +148,9 @@ mod tests {
         async fn redefine(&self, _: &RedefineRequest) -> Result<bento_types::State, HostError> {
             Ok(bento_types::State::Stopped)
         }
+        async fn resize_disk(&self, _: &InstanceRef, _: i64) -> Result<bento_types::State, HostError> {
+            Ok(bento_types::State::Stopped)
+        }
         async fn inventory(&self) -> Result<Inventory, HostError> {
             Ok(Inventory { domains: vec![] })
         }
