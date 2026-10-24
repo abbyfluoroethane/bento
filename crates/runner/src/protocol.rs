@@ -166,7 +166,7 @@ pub enum Operation {
     /// that machine can grow it (MULTI-NODE 11.5).
     ResizeDisk {
         instance: InstanceRef,
-        disk_gib: i64,
+        disk_gib: u64,
     },
 }
 
@@ -184,7 +184,7 @@ pub struct RedefineRequest {
     /// domain is refused, as the controller refuses it (SPEC 7.3).
     pub previous_name: Option<String>,
     pub vcpu: u32,
-    pub memory_mib: i64,
+    pub memory_mib: u64,
     pub nested: bool,
     pub ksm: bool,
     /// The libvirt network of the owner, for example `bento-user-1`.
@@ -205,9 +205,9 @@ pub struct ProvisionRequest {
     /// already: the fleet gate refuses a create until every machine does
     /// (MULTI-NODE 13.2).
     pub base_checksum: String,
-    pub disk_gib: i64,
+    pub disk_gib: u64,
     pub vcpu: u32,
-    pub memory_mib: i64,
+    pub memory_mib: u64,
     pub nested: bool,
     pub ksm: bool,
     /// The libvirt network to attach to, for example `bento-user-1`. The
@@ -317,7 +317,7 @@ pub enum Reply {
         checksum: String,
         /// `false` when the runner had to fetch it.
         already_present: bool,
-        size: i64,
+        size: u64,
     },
 }
 
@@ -342,10 +342,10 @@ pub struct Health {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
     pub arch: String,
-    pub cpu_count: i64,
-    pub memory_total_mib: i64,
-    pub storage_total_gib: i64,
-    pub storage_available_gib: i64,
+    pub cpu_count: u64,
+    pub memory_total_mib: u64,
+    pub storage_total_gib: u64,
+    pub storage_available_gib: u64,
     /// What libvirt reports, so the controller can refuse to place onto a
     /// runner whose hypervisor cannot serve the request.
     pub hypervisor_version: String,
@@ -397,7 +397,7 @@ pub struct HostSample {
     /// The volume the machine keeps its overlays on, not every volume.
     pub storage_total_bytes: u64,
     pub storage_available_bytes: u64,
-    pub cpu_count: i64,
+    pub cpu_count: u64,
 }
 
 /// What one running domain is using.

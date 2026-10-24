@@ -182,20 +182,20 @@ pub struct Runner {
     pub last_contact_at: Option<OffsetDateTime>,
     pub accepted_epoch: i64,
     pub arch: Option<String>,
-    pub cpu_count: Option<i64>,
-    pub memory_total_mib: Option<i64>,
-    pub storage_total_gib: Option<i64>,
-    pub storage_available_gib: Option<i64>,
+    pub cpu_count: Option<u64>,
+    pub memory_total_mib: Option<u64>,
+    pub storage_total_gib: Option<u64>,
+    pub storage_available_gib: Option<u64>,
     pub hypervisor_version: Option<String>,
     pub last_error: Option<String>,
     /// The slots this machine owns, and what each one is doing.
-    pub slots: Vec<(i64, SlotState)>,
+    pub slots: Vec<(u64, SlotState)>,
     pub instances: usize,
     pub running: usize,
     /// What the instance rows on this machine reserve (MULTI-NODE 12).
-    pub vcpu: i64,
-    pub memory_mib: i64,
-    pub disk_gib: i64,
+    pub vcpu: u64,
+    pub memory_mib: u64,
+    pub disk_gib: u64,
     pub images_ready: usize,
     pub images_wanted: usize,
     /// Whether this row describes the machine the screen runs on.
@@ -256,7 +256,7 @@ impl Runner {
                 .iter()
                 .filter(|instance| instance.state == bento_types::State::Running)
                 .count(),
-            vcpu: mine.iter().map(|instance| i64::from(instance.vcpu)).sum(),
+            vcpu: mine.iter().map(|instance| u64::from(instance.vcpu)).sum(),
             memory_mib: mine.iter().map(|instance| instance.memory_mib).sum(),
             disk_gib: mine.iter().map(|instance| instance.disk_gib).sum(),
             images_ready,
@@ -439,7 +439,7 @@ mod tests {
         }
     }
 
-    fn slot(number: i64, owner: i64, state: SlotState) -> Slot {
+    fn slot(number: u64, owner: i64, state: SlotState) -> Slot {
         Slot {
             slot: number,
             state,

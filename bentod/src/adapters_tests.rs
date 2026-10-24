@@ -13,7 +13,7 @@ use bento_auth::TokenStore as _;
 use bento_cli::Lifecycle as _;
 use bento_cloudinit::Seed;
 use bento_hypervisor::{Definer, Fake, Hypervisor};
-use bento_lifecycle::{Fleet, ISOBuilder, ProvisionSpec};
+use bento_lifecycle::{Fleet, IsoBuilder, ProvisionSpec};
 use bento_network::{Plan, PortRange};
 use bento_proxy::InstanceSource as _;
 use bento_sshfront::KeyLinker as _;
@@ -92,7 +92,7 @@ impl Fleet for FakeImages {
         &self,
         host_id: i64,
         instance: &bento_types::Instance,
-        _disk_gib: i64,
+        _disk_gib: u64,
     ) -> Result<(), bento_lifecycle::DynError> {
         Err(format!(
             "unexpected disk resize of {} on machine {host_id}",
@@ -119,7 +119,7 @@ impl Fleet for FakeImages {
 struct FakeIso(Mutex<HashMap<PathBuf, Seed>>);
 
 #[async_trait]
-impl ISOBuilder for FakeIso {
+impl IsoBuilder for FakeIso {
     async fn build(&self, seed: &Seed, path: &Path) -> Result<(), bento_lifecycle::DynError> {
         self.0.lock().unwrap().insert(path.to_owned(), seed.clone());
         Ok(())
@@ -175,33 +175,34 @@ impl Env {
         let iso = Arc::new(FakeIso::default());
         let manager = Arc::new(
             bento_lifecycle::Manager::new(bento_lifecycle::Config {
-                hypervisor: Some(hypervisor.clone()),
                 definer: Some(Arc::new(FakeDefiner(hypervisor.clone()))),
-                store: Some(Arc::new(LifecycleStore(
-                    store.clone(),
-                    crate::adapters::LocalCapacity {
-                        host_id: host.id,
-                        capacity: bento_types::Capacity::unbounded(),
-                        overcommit_ratio: 1.0,
-                    },
-                ))),
                 // The manager and the backend must agree which machine
                 // this is. A copy checks that its source runs here
                 // (MULTI-NODE 13.3), and a mismatch would refuse a copy
                 // of an instance that is in fact local.
                 host_id: host.id,
-                fleet: Some(Arc::new(FakeImages {
-                    hypervisor: hypervisor.clone(),
-                    iso: iso.clone(),
-                    storage_dir: temp.path().to_owned(),
-                })),
-                iso: Some(iso.clone()),
-                plan: Some(plan),
-                storage_dir: temp.path().to_owned(),
                 nested_enabled: Some(Arc::new(|| (true, String::new()))),
                 delete_iso: Some(Arc::new(|_| Box::pin(async { Ok(()) }))),
                 iso_exists: Some(Arc::new(|_| false)),
-                ..Default::default()
+                ..bento_lifecycle::Config::new(
+                    hypervisor.clone(),
+                    Arc::new(LifecycleStore(
+                        store.clone(),
+                        crate::adapters::LocalCapacity {
+                            host_id: host.id,
+                            capacity: bento_types::Capacity::unbounded(),
+                            overcommit_ratio: 1.0,
+                        },
+                    )),
+                    Arc::new(FakeImages {
+                        hypervisor: hypervisor.clone(),
+                        iso: iso.clone(),
+                        storage_dir: temp.path().to_owned(),
+                    }),
+                    iso.clone(),
+                    plan,
+                    temp.path().to_owned(),
+                )
             })
             .unwrap(),
         );
@@ -441,15 +442,15 @@ async fn placement_adapter_passes_the_configured_overcommit_ratio() {
     assert_eq!(adapter.choose_host(want).await.unwrap(), host.id);
     assert_eq!(
         adapter.host_capacity(host.id).await.unwrap().memory_mib,
-        6144
+        bento_types::Ceiling::Limit(6144)
     );
 }
 
 /// A runner whose report lacks a figure must not read as a host with no
-/// ceiling: a zero in `Capacity` skips the check (SPEC 6.1).
+/// ceiling (SPEC 6.1).
 async fn capacity_of_runner_reporting(
-    memory_total_mib: Option<i64>,
-    storage_total_gib: Option<i64>,
+    memory_total_mib: Option<u64>,
+    storage_total_gib: Option<u64>,
 ) -> Result<bento_types::Capacity, bento_lifecycle::DynError> {
     use bento_lifecycle::Store as _;
     let env = Env::new().await;
@@ -506,7 +507,7 @@ async fn a_runner_with_both_capacity_figures_has_a_ceiling() {
     let capacity = capacity_of_runner_reporting(Some(4096), Some(100))
         .await
         .unwrap();
-    assert_eq!((capacity.memory_mib, capacity.disk_gib), (4096, 100));
+    assert_eq!(capacity, bento_types::Capacity::limited(4096, 100));
 }
 
 #[tokio::test]
@@ -944,10 +945,7 @@ async fn auth_adapters_round_trip_and_access() {
         .token_by_hash(&bento_auth::hash_token(&owner_plaintext))
         .await
         .unwrap();
-    assert!(matches!(
-        token,
-        bento_auth::TokenLookup::Found(_) | bento_auth::TokenLookup::Expired(_)
-    ));
+    assert!(matches!(token, bento_auth::TokenLookup::Found(_)));
 }
 
 #[tokio::test]
@@ -1026,7 +1024,7 @@ async fn api_and_cli_changes_reload_firewall() {
 /// on a real runtime, which is what this does.
 #[tokio::test]
 async fn cli_runner_writes_output_from_inside_the_runtime() {
-    use bento_sshfront::CLIRunner as _;
+    use bento_sshfront::CliRunner as _;
 
     let env = Env::new().await;
     let user = env.add_user("riley").await;
@@ -1228,4 +1226,57 @@ fn channel_reader_reports_eof_when_the_sender_is_gone() {
     reader.read_to_end(&mut got).unwrap();
     assert_eq!(got, b"yes\n");
     assert_eq!(reader.read(&mut [0u8; 4]).unwrap(), 0);
+}
+
+/// Wraps a fleet failure the way the manager does (`Error::caused`), then
+/// translates it for the API.
+fn through_manager(error: bento_lifecycle::DynError) -> bento_api::BoxError {
+    api_lifecycle_error(bento_lifecycle::Error::Caused {
+        message: "lifecycle: dependency failed".into(),
+        source: error,
+    })
+}
+
+#[test]
+fn a_missing_host_in_the_fleet_is_not_found_not_a_server_fault() {
+    // `RunnerFleet` boxes the store error as it is. Before, it flattened
+    // the error to a string and the API answered 500.
+    let error = through_manager(Box::new(StoreError::NotFound));
+    assert!(matches!(
+        error.downcast_ref::<bento_api::StoreError>(),
+        Some(bento_api::StoreError::NotFound)
+    ));
+}
+
+#[test]
+fn an_anyhow_context_chain_from_a_runner_keeps_the_store_error() {
+    // The runner paths return `anyhow::Error`. Converting it must keep
+    // the typed cause.
+    let failure = anyhow::Error::new(StoreError::NameTaken).context("overlay for web");
+    let error = through_manager(bento_lifecycle::DynError::from(failure));
+    assert!(matches!(
+        error.downcast_ref::<bento_api::StoreError>(),
+        Some(bento_api::StoreError::NameTaken)
+    ));
+}
+
+#[test]
+fn an_anyhow_chain_without_a_store_error_keeps_its_context_text() {
+    let failure = anyhow::anyhow!("connection refused").context("machine b has no endpoint");
+    let error = through_manager(bento_lifecycle::DynError::from(failure));
+    let text = bento_types::error_chain(error.as_ref());
+    assert!(text.contains("machine b has no endpoint"), "{text}");
+    assert!(text.contains("connection refused"), "{text}");
+}
+
+#[test]
+fn the_error_chain_helper_joins_each_layer_once() {
+    let error = bento_hypervisor::Error::Io {
+        operation: "read the socket".into(),
+        source: std::io::Error::other("disk full"),
+    };
+    assert_eq!(
+        bento_types::error_chain(&error),
+        "read the socket: disk full"
+    );
 }

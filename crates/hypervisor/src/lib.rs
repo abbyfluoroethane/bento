@@ -10,8 +10,8 @@ mod xdr;
 mod xml;
 
 pub use check::{
-    CheckConfig, CheckDeps, CheckReport, CheckResult, FileKind, check, default_check_deps,
-    nested_enabled,
+    CheckConfig, CheckDeps, CheckReport, CheckResult, FileKind, NestedState, check,
+    default_check_deps, nested_enabled,
 };
 pub use client::{
     AutostartClearer, Client, Definer, DomainInfo, DomainSample, DomainSampler, Hypervisor,

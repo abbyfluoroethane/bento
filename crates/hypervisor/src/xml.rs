@@ -12,7 +12,7 @@ pub struct DomainSpec {
     pub name: String,
     pub uuid: String,
     pub vcpu: u32,
-    pub memory_mib: i64,
+    pub memory_mib: u64,
     /// Absolute path of the qcow2 overlay used as the virtio-blk root.
     pub disk_path: String,
     /// Optional cloud-init NoCloud ISO (SPEC 5.2).

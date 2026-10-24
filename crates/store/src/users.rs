@@ -5,16 +5,16 @@ use bento_config::Ipv4Prefix;
 use bento_types::User;
 use rusqlite::{OptionalExtension, params};
 
-use crate::{Error, Result, Store, format_time, parse_time};
+use crate::{Error, Result, Store, format_time, get_u64, parse_time};
 
 /// What one user has provisioned (SPEC 6.1). There is no per-user
 /// limit to compare it against; the dashboard shows it against the host.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Usage {
-    pub instances: i64,
-    pub vcpu: i64,
-    pub memory_mib: i64,
-    pub disk_gib: i64,
+    pub instances: u64,
+    pub vcpu: u64,
+    pub memory_mib: u64,
+    pub disk_gib: u64,
 }
 
 impl Store {
@@ -85,10 +85,10 @@ impl Store {
             let mut used = HashSet::new();
             for subnet in subnet_rows {
                 let subnet = subnet?;
-                let (address, bits) = parse_prefix_text(&subnet).map_err(|message| {
+                let parsed = subnet.parse::<Ipv4Prefix>().map_err(|message| {
                     Error::InvalidPrivateRange(format!("user subnet {subnet:?}: {message}"))
                 })?;
-                used.insert(masked_address(address, bits));
+                used.insert(masked_address(parsed.addr, parsed.bits));
             }
             drop(statement);
 
@@ -167,10 +167,10 @@ impl Store {
                 [user_id],
                 |row| {
                     Ok(Usage {
-                        instances: row.get(0)?,
-                        vcpu: row.get(1)?,
-                        memory_mib: row.get(2)?,
-                        disk_gib: row.get(3)?,
+                        instances: get_u64(row, 0)?,
+                        vcpu: get_u64(row, 1)?,
+                        memory_mib: get_u64(row, 2)?,
+                        disk_gib: get_u64(row, 3)?,
                     })
                 },
             )?)
@@ -231,22 +231,6 @@ fn next_free_subnet(range: Ipv4Prefix, used: &HashSet<Ipv4Addr>) -> Result<Strin
         }
     }
     Err(Error::SubnetsExhausted)
-}
-
-fn parse_prefix_text(value: &str) -> std::result::Result<(Ipv4Addr, u8), String> {
-    let (address, bits) = value
-        .split_once('/')
-        .ok_or_else(|| "not a CIDR range".to_string())?;
-    let address = address
-        .parse::<Ipv4Addr>()
-        .map_err(|_| "not an IPv4 address".to_string())?;
-    let bits = bits
-        .parse::<u8>()
-        .map_err(|_| "not a prefix length".to_string())?;
-    if bits > 32 {
-        return Err("prefix length exceeds /32".to_string());
-    }
-    Ok((address, bits))
 }
 
 fn masked_address(address: Ipv4Addr, bits: u8) -> Ipv4Addr {

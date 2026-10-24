@@ -62,7 +62,7 @@ pub enum Error {
     #[error("auth: no account for OIDC subject")]
     NoAccount,
     /// A consumer-side persistence operation failed.
-    #[error("{operation}: {source}")]
+    #[error("{operation}")]
     Store {
         operation: String,
         #[source]
@@ -105,17 +105,16 @@ pub trait AccessStore: Send + Sync {
 /// Persists API tokens. Only the hash of a token is stored (SPEC 13).
 #[async_trait]
 pub trait TokenStore: Send + Sync {
-    /// Inserts a token row. [`OffsetDateTime::UNIX_EPOCH`] means the token
-    /// does not expire.
+    /// Inserts a token row. `None` means the token does not expire.
     async fn create_token(
         &self,
         user_id: i64,
         hash: &str,
-        expires_at: OffsetDateTime,
+        expires_at: Option<OffsetDateTime>,
     ) -> std::result::Result<Token, BoxError>;
 
-    /// Returns the lookup outcome for `hash`. The expired outcome carries
-    /// its row because this crate enforces expiry against its own clock.
+    /// Returns the lookup outcome for `hash`. The row comes back whatever
+    /// its expiry, because this crate enforces expiry against its own clock.
     async fn token_by_hash(&self, hash: &str) -> std::result::Result<TokenLookup, BoxError>;
 
     /// Removes a token row.

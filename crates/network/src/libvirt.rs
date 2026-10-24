@@ -95,7 +95,7 @@ mod tests {
     use crate::subnet::format_prefix;
 
     fn prefix(cidr: &str) -> Ipv4Prefix {
-        bento_config::parse_prefix(cidr).unwrap()
+        cidr.parse().unwrap()
     }
 
     #[test]

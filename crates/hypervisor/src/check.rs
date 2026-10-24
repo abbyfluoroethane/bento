@@ -306,31 +306,61 @@ fn check_ksm(config: &CheckConfig, deps: &CheckDeps) -> CheckResult {
     }
 }
 
-/// Reports whether the first existing KVM nested parameter is enabled.
-/// The lifecycle layer uses this to reject `nested=true` when the host
-/// cannot provide it (SPEC 5.5).
-pub fn nested_enabled(config: CheckConfig, deps: &CheckDeps) -> (bool, Option<PathBuf>) {
+/// What the first existing KVM nested parameter says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NestedState {
+    /// The parameter at this path is on.
+    On(PathBuf),
+    /// The parameter at this path is off.
+    Off(PathBuf),
+    /// No KVM nested parameter exists.
+    Missing,
+}
+
+impl NestedState {
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        matches!(self, Self::On(_))
+    }
+
+    /// The parameter path, when one exists.
+    #[must_use]
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Self::On(path) | Self::Off(path) => Some(path),
+            Self::Missing => None,
+        }
+    }
+}
+
+/// Reads the first existing KVM nested parameter. The lifecycle layer
+/// uses this to reject `nested=true` when the host cannot provide it
+/// (SPEC 5.5).
+pub fn nested_enabled(config: CheckConfig, deps: &CheckDeps) -> NestedState {
     let config = config.with_defaults();
     for path in config.nested_paths {
         if let Ok(raw) = (deps.read_file)(&path) {
             let value = String::from_utf8_lossy(&raw);
             let value = value.trim();
-            return (value == "1" || value.eq_ignore_ascii_case("Y"), Some(path));
+            return if value == "1" || value.eq_ignore_ascii_case("Y") {
+                NestedState::On(path)
+            } else {
+                NestedState::Off(path)
+            };
         }
     }
-    (false, None)
+    NestedState::Missing
 }
 
 fn check_nested(config: &CheckConfig, deps: &CheckDeps) -> CheckResult {
-    let (enabled, path) = nested_enabled(config.clone(), deps);
-    match (enabled, path) {
-        (true, Some(path)) => CheckResult {
+    match nested_enabled(config.clone(), deps) {
+        NestedState::On(path) => CheckResult {
             name: "nested virtualization".to_string(),
             ok: true,
             fatal: false,
             detail: format!("{} is on", path.display()),
         },
-        (false, Some(path)) => CheckResult {
+        NestedState::Off(path) => CheckResult {
             name: "nested virtualization".to_string(),
             ok: false,
             fatal: false,
@@ -339,7 +369,7 @@ fn check_nested(config: &CheckConfig, deps: &CheckDeps) -> CheckResult {
                 path.display()
             ),
         },
-        (_, None) => CheckResult {
+        NestedState::Missing => CheckResult {
             name: "nested virtualization".to_string(),
             ok: false,
             fatal: false,
@@ -630,9 +660,13 @@ mod tests {
                 write_probe: Arc::new(|_| unreachable!()),
                 ping_libvirt: Arc::new(|_| unreachable!()),
             };
-            let (enabled, path) = nested_enabled(CheckConfig::default(), &deps);
-            assert_eq!(enabled, expected_enabled);
-            assert_eq!(path.as_deref(), expected_path.map(Path::new));
+            let state = nested_enabled(CheckConfig::default(), &deps);
+            assert_eq!(state.is_enabled(), expected_enabled);
+            assert_eq!(state.path(), expected_path.map(Path::new));
+            assert_eq!(
+                matches!(state, NestedState::Missing),
+                expected_path.is_none()
+            );
         }
     }
 }

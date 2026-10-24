@@ -26,27 +26,25 @@ impl Cli {
         if let Err(error) = validate_name(name, &self.options.reserved_names) {
             return env.fail_message(error);
         }
-        let image = flags
+        let Some(image) = flags
             .values
             .get("image")
+            .or(self.options.default_image.as_ref())
             .cloned()
-            .unwrap_or_else(|| self.options.default_image.clone());
-        if image.is_empty() {
+        else {
             return env.usage("new: --image is required (no default image is configured)");
-        }
+        };
         let cpu = match flags.values.get("cpu") {
-            Some(value) => match value.parse::<i64>() {
+            Some(value) => match value.parse::<u32>() {
                 Ok(value) => value,
                 Err(_) => return flag_error(env, format!("invalid value {value:?} for flag -cpu")),
             },
-            None => i64::from(self.options.default_vcpu),
+            None => self.options.default_vcpu,
         };
         if cpu < 1 {
             return env.fail_message("--cpu must be at least 1");
         }
-        let Ok(vcpu) = u32::try_from(cpu) else {
-            return flag_error(env, format!("invalid value {cpu:?} for flag -cpu"));
-        };
+        let vcpu = cpu;
         let memory_mib = match flags.values.get("memory") {
             Some(value) => match parse_memory_mib(value) {
                 Ok(value) => value,
@@ -305,17 +303,15 @@ impl Cli {
             };
         }
         if let Some(value) = flags.values.get("cpu") {
-            let cpu = match value.parse::<i64>() {
+            // `u32` rejects a negative or oversized count at the parse.
+            let cpu = match value.parse::<u32>() {
                 Ok(value) => value,
                 Err(_) => return flag_error(env, format!("invalid value {value:?} for flag -cpu")),
             };
             if cpu < 1 {
                 return env.fail_message("--cpu must be at least 1");
             }
-            request.vcpu = match u32::try_from(cpu) {
-                Ok(value) => Some(value),
-                Err(_) => return flag_error(env, format!("invalid value {value:?} for flag -cpu")),
-            };
+            request.vcpu = Some(cpu);
         }
         if let Some(value) = flags.values.get("disk") {
             let disk = match parse_disk_gib(value) {

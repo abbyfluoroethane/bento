@@ -140,7 +140,7 @@ mod tests {
     use super::*;
 
     fn prefix(cidr: &str) -> Ipv4Prefix {
-        bento_config::parse_prefix(cidr).unwrap()
+        cidr.parse::<bento_config::Ipv4Prefix>().unwrap()
     }
 
     #[test]

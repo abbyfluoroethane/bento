@@ -125,7 +125,7 @@ mod tests {
             .map(|index| bento_config::RunnerEntry {
                 name: format!("runner-{index}"),
                 endpoint: format!("http://10.0.0.2{index}:10443"),
-                underlay: String::new(),
+                underlay: None,
             })
             .collect();
         config

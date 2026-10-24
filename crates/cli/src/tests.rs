@@ -387,8 +387,8 @@ fn instance(
     state: State,
     address: &str,
     vcpu: u32,
-    memory_mib: i64,
-    disk_gib: i64,
+    memory_mib: u64,
+    disk_gib: u64,
     visibility: Visibility,
 ) -> Instance {
     Instance {
@@ -471,7 +471,7 @@ fn fixture() -> (Arc<FakeStore>, Arc<FakeLifecycle>, Cli) {
             domain: "bento.example.org".into(),
             instance_domain: "example.org".into(),
             reserved_names: vec!["www".into(), "bento".into()],
-            default_image: "debian-13".into(),
+            default_image: Some("debian-13".into()),
             now: Arc::new(test_time),
             ..Options::default()
         },

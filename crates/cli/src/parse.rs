@@ -15,7 +15,7 @@ pub(crate) fn validate_name(name: &str, reserved: &[String]) -> Result<(), Strin
     Ok(())
 }
 
-pub(crate) fn parse_memory_mib(value: &str) -> Result<i64, String> {
+pub(crate) fn parse_memory_mib(value: &str) -> Result<u64, String> {
     let (number, unit) =
         split_size(value).map_err(|()| format!("invalid memory size {value:?}"))?;
     match unit.as_str() {
@@ -27,7 +27,7 @@ pub(crate) fn parse_memory_mib(value: &str) -> Result<i64, String> {
     }
 }
 
-pub(crate) fn parse_disk_gib(value: &str) -> Result<i64, String> {
+pub(crate) fn parse_disk_gib(value: &str) -> Result<u64, String> {
     let (number, unit) = split_size(value).map_err(|()| format!("invalid disk size {value:?}"))?;
     match unit.as_str() {
         "" | "G" | "GB" | "GIB" => Ok(number),
@@ -35,15 +35,15 @@ pub(crate) fn parse_disk_gib(value: &str) -> Result<i64, String> {
     }
 }
 
-fn split_size(value: &str) -> Result<(i64, String), ()> {
+fn split_size(value: &str) -> Result<(u64, String), ()> {
     let value = value.trim().to_ascii_uppercase();
     let split = value
         .char_indices()
         .rev()
         .find(|(_, c)| c.is_ascii_digit())
         .map_or(0, |(i, c)| i + c.len_utf8());
-    let number = value[..split].parse::<i64>().map_err(|_| ())?;
-    if number <= 0 {
+    let number = value[..split].parse::<u64>().map_err(|_| ())?;
+    if number == 0 {
         return Err(());
     }
     Ok((number, value[split..].trim().to_owned()))

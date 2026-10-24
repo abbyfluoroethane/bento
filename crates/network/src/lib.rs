@@ -33,11 +33,11 @@ pub enum Error {
     /// Every usable address in a user subnet is assigned to an instance.
     #[error("network: no free address in the subnet")]
     AddressesExhausted,
-    #[error("network: list used subnets: {0}")]
+    #[error("network: list used subnets")]
     ListUsedSubnets(#[source] DynError),
-    #[error("network: list used addresses: {0}")]
+    #[error("network: list used addresses")]
     ListUsedAddresses(#[source] DynError),
-    #[error("{0}")]
+    #[error("network: apply")]
     Apply(#[source] DynError),
 }
 

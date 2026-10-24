@@ -82,7 +82,7 @@ pub trait Starter: Send + Sync {
 /// Runs one command line session (SPEC 15). The three streams are owned for
 /// the duration of the call and correspond to stdin, stdout, and stderr.
 #[async_trait]
-pub trait CLIRunner: Send + Sync {
+pub trait CliRunner: Send + Sync {
     async fn run(
         &self,
         user: User,
@@ -158,7 +158,7 @@ pub struct Server {
     pub keys: Arc<dyn KeyStore>,
     pub instances: Arc<dyn InstanceStore>,
     pub starter: Arc<dyn Starter>,
-    pub cli: Arc<dyn CLIRunner>,
+    pub cli: Arc<dyn CliRunner>,
     /// `None` rejects unknown keys outright, with no link offered.
     pub linker: Option<Arc<dyn KeyLinker>>,
 
@@ -169,17 +169,36 @@ pub struct Server {
     pub guest_user: String,
 
     pub dialer: Arc<dyn Dialer>,
-    pub start_timeout: Duration,
-    pub dial_interval: Duration,
+    /// Always above zero; [`Server::with_dial_timing`] is the only way to
+    /// change it from outside the crate.
+    pub(crate) start_timeout: Duration,
+    /// Always above zero, for the same reason.
+    pub(crate) dial_interval: Duration,
 }
 
 impl Server {
+    /// Sets how long the sshd wait lasts and how long it pauses between
+    /// attempts. Zero means nothing for either, so it is refused instead of
+    /// replaced with a default.
+    pub fn with_dial_timing(
+        mut self,
+        start_timeout: Duration,
+        dial_interval: Duration,
+    ) -> Result<Self, String> {
+        if start_timeout.is_zero() || dial_interval.is_zero() {
+            return Err("start timeout and dial interval must be above zero".to_owned());
+        }
+        self.start_timeout = start_timeout;
+        self.dial_interval = dial_interval;
+        Ok(self)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         keys: Arc<dyn KeyStore>,
         instances: Arc<dyn InstanceStore>,
         starter: Arc<dyn Starter>,
-        cli: Arc<dyn CLIRunner>,
+        cli: Arc<dyn CliRunner>,
         host_key: Arc<PrivateKey>,
         guest_key: Arc<PrivateKey>,
     ) -> Self {
@@ -411,7 +430,7 @@ mod tests {
     use tokio::net::{TcpListener, TcpStream};
 
     use super::{
-        BoxError, BoxedIo, CLIRunner, Dialer, InstanceStore, KeyLinker, KeyStore, PairingRequest,
+        BoxError, BoxedIo, CliRunner, Dialer, InstanceStore, KeyLinker, KeyStore, PairingRequest,
         PendingLink, Server, Starter,
     };
 
@@ -495,7 +514,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl CLIRunner for FakeCli {
+    impl CliRunner for FakeCli {
         async fn run(
             &self,
             user: User,
@@ -1187,6 +1206,29 @@ mod tests {
             frontend.attach(stopped, terminal).await,
             crate::Attached::NotRunning
         );
+    }
+
+    #[test]
+    fn dial_timing_refuses_zero() {
+        let new = || {
+            Server::for_guests(
+                Arc::new(FakeInstances::default()),
+                Arc::new(FakeStarter),
+                private_key(),
+            )
+        };
+        let one = std::time::Duration::from_secs(1);
+        assert!(
+            new()
+                .with_dial_timing(std::time::Duration::ZERO, one)
+                .is_err()
+        );
+        assert!(
+            new()
+                .with_dial_timing(one, std::time::Duration::ZERO)
+                .is_err()
+        );
+        assert_eq!(new().with_dial_timing(one, one).unwrap().start_timeout, one);
     }
 
     #[tokio::test]

@@ -235,7 +235,7 @@ impl App {
                 image_dir: PathBuf::from(&config.image_dir),
                 storage_dir: PathBuf::from(&config.storage_dir),
                 container_storage: PathBuf::from(&config.bootc.container_storage),
-                podman_required: config.images.iter().any(|image| !image.oci.is_empty()),
+                podman_required: config.images.iter().any(|image| image.source.is_oci()),
                 ..Default::default()
             },
             &bento_hypervisor::default_check_deps(),

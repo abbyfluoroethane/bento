@@ -84,7 +84,7 @@ impl LocalHost {
 struct DomainFacts<'a> {
     instance: &'a InstanceRef,
     vcpu: u32,
-    memory_mib: i64,
+    memory_mib: u64,
     nested: bool,
     ksm: bool,
     network: &'a str,
@@ -116,11 +116,11 @@ impl Host for LocalHost {
         })?;
         Ok(Capabilities {
             arch: std::env::consts::ARCH.to_owned(),
-            cpu_count: i64::try_from(bento_hostinfo::cpu_count())
+            cpu_count: u64::try_from(bento_hostinfo::cpu_count())
                 .map_err(|error| HostError::new(format!("read processor count: {error}")))?,
-            memory_total_mib: byte_units(memory.total, MIB, "memory")?,
-            storage_total_gib: byte_units(storage.total, GIB, "storage total")?,
-            storage_available_gib: byte_units(storage.available, GIB, "storage available")?,
+            memory_total_mib: memory.total / MIB,
+            storage_total_gib: storage.total / GIB,
+            storage_available_gib: storage.available / GIB,
             // The libvirt client does not expose a version call. This text
             // states which existing client path the runner uses.
             hypervisor_version: "libvirt local RPC".to_owned(),
@@ -162,7 +162,7 @@ impl Host for LocalHost {
             memory_available_bytes: memory.available,
             storage_total_bytes: storage.total,
             storage_available_bytes: storage.available,
-            cpu_count: i64::try_from(bento_hostinfo::cpu_count()).unwrap_or(0),
+            cpu_count: u64::try_from(bento_hostinfo::cpu_count()).unwrap_or(0),
         };
 
         let mut domains = Vec::new();
@@ -205,7 +205,7 @@ impl Host for LocalHost {
                     name: image.name.clone(),
                     checksum: format!("sha256-{hex}"),
                     already_present: true,
-                    size: metadata.len() as i64,
+                    size: metadata.len(),
                 });
             }
         }
@@ -478,7 +478,7 @@ impl Host for LocalHost {
         self.observed(&request.instance).await
     }
 
-    async fn resize_disk(&self, instance: &InstanceRef, disk_gib: i64) -> Result<State, HostError> {
+    async fn resize_disk(&self, instance: &InstanceRef, disk_gib: u64) -> Result<State, HostError> {
         // The overlay is a file on this machine, so the grow runs here
         // and not on the controller (SPEC 11.1, MULTI-NODE 11.5).
         self.resizer
@@ -556,7 +556,7 @@ fn sha256_hex(checksum: &str) -> Result<String, HostError> {
 /// what that name says, because every later reader treats the name as
 /// proof (SPEC 5.1). A failure removes the temporary file and leaves no
 /// content-addressed name behind.
-async fn fetch_into(url: &str, directory: &Path) -> Result<(String, i64), HostError> {
+async fn fetch_into(url: &str, directory: &Path) -> Result<(String, u64), HostError> {
     use sha2::Digest;
     use tokio::io::AsyncWriteExt;
 
@@ -578,7 +578,7 @@ async fn fetch_into(url: &str, directory: &Path) -> Result<(String, i64), HostEr
         .await
         .map_err(|error| HostError::new(format!("create {}: {error}", partial.display())))?;
     let mut hasher = sha2::Sha256::new();
-    let mut size: i64 = 0;
+    let mut size: u64 = 0;
     let outcome = async {
         while let Some(chunk) = response
             .chunk()
@@ -586,7 +586,7 @@ async fn fetch_into(url: &str, directory: &Path) -> Result<(String, i64), HostEr
             .map_err(|error| HostError::new(format!("read {url}: {error}")))?
         {
             hasher.update(&chunk);
-            size += chunk.len() as i64;
+            size = size.saturating_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX));
             file.write_all(&chunk)
                 .await
                 .map_err(|error| HostError::new(format!("write image: {error}")))?;
@@ -626,11 +626,6 @@ fn hex_digest(bytes: &[u8]) -> String {
         let _ = write!(text, "{byte:02x}");
         text
     })
-}
-
-fn byte_units(bytes: u64, unit: u64, name: &str) -> Result<i64, HostError> {
-    i64::try_from(bytes / unit)
-        .map_err(|error| HostError::new(format!("{name} is too large: {error}")))
 }
 
 pub(crate) async fn run_runner(config: &Path, _args: &[OsString]) -> Result<()> {
@@ -904,7 +899,7 @@ mod tests {
 
         let (checksum, size) = fetch_into(&url, directory.path()).await.unwrap();
         assert_eq!(checksum, format!("sha256-{}", body_digest()));
-        assert_eq!(size, BODY.len() as i64);
+        assert_eq!(size, u64::try_from(BODY.len()).unwrap());
 
         let landed = directory.path().join(format!("{checksum}.qcow2"));
         assert_eq!(std::fs::read(&landed).unwrap(), BODY);

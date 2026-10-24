@@ -79,7 +79,7 @@ fn gib(value: f64) -> String {
 }
 
 fn mib(value: f64) -> String {
-    super::mib(value.round() as i64)
+    super::mib(bento_types::whole_u64(value))
 }
 
 /// One machine's card on the front page: its charts and its bars.
@@ -91,13 +91,13 @@ fn mib(value: f64) -> String {
 pub(crate) struct HostFigures {
     host_id: i64,
     host_name: String,
-    memory_total_mib: i64,
-    memory_provisioned_mib: i64,
+    memory_total_mib: u64,
+    memory_provisioned_mib: u64,
     memory: Bar,
     storage_used_gib: f64,
-    storage_total_gib: i64,
+    storage_total_gib: u64,
     storage_usage: Bar,
-    storage_provisioned_gib: i64,
+    storage_provisioned_gib: u64,
     storage: Bar,
     placeholder: bool,
 }
@@ -147,7 +147,7 @@ async fn usage_tiles(
 ) -> Result<Vec<UsageTile>, crate::BoxError> {
     let host = (hosts.len() == 1).then(|| &hosts[0]);
     let usage = state.0.store.usage_for(user.id).await?;
-    let tile = |label, used: i64, max: Option<i64>, fmt: fn(i64) -> String| UsageTile {
+    let tile = |label, used: u64, max: Option<u64>, fmt: fn(u64) -> String| UsageTile {
         label,
         used: fmt(used),
         max: max.map(fmt),
@@ -339,7 +339,7 @@ struct HostMetricsJson {
     placeholder: bool,
     cpu_pct: SeriesJson,
     memory_used_mib: SeriesJson,
-    memory_total_mib: i64,
+    memory_total_mib: u64,
 }
 
 /// Chart data for the front page. `window` is seconds, at most a day.
@@ -403,7 +403,7 @@ pub(crate) struct NewForm {
     #[serde(default)]
     pub(crate) memory_gib: f64,
     #[serde(default)]
-    pub(crate) disk_gib: i64,
+    pub(crate) disk_gib: u64,
     #[serde(default)]
     pub(crate) public: Option<String>,
     #[serde(default)]
@@ -505,7 +505,7 @@ pub(crate) async fn create(
         name,
         image: form.image.clone(),
         vcpu: form.vcpu,
-        memory_mib: (form.memory_gib * 1024.0).round() as i64,
+        memory_mib: bento_types::mib_from_gib(form.memory_gib),
         disk_gib: form.disk_gib,
         nested: checked(&form.nested),
         ksm: checked(&form.ksm),

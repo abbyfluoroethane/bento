@@ -12,8 +12,8 @@ use crate::{Ipv4Prefix, Result, UserNetwork, invalid};
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
 pub struct PortRange {
-    pub from: i32,
-    pub to: i32,
+    pub from: u16,
+    pub to: u16,
 }
 
 /// One instance as the firewall sees it: its address and the HTTP ports
@@ -22,7 +22,7 @@ pub struct PortRange {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PublishedInstance {
     pub address: Ipv4Addr,
-    pub http_ports: Vec<i32>,
+    pub http_ports: Vec<u16>,
     pub port_ranges: Vec<PortRange>,
 }
 
@@ -140,7 +140,7 @@ impl Ruleset {
                     )));
                 }
                 for port in &instance.http_ports {
-                    if !(1..=65_535).contains(port) {
+                    if *port == 0 {
                         return Err(invalid(format!(
                             "invalid port {port} for instance {}",
                             instance.address
@@ -148,7 +148,7 @@ impl Ruleset {
                     }
                 }
                 for range in &instance.port_ranges {
-                    if range.from < 1 || range.to > 65_535 || range.from > range.to {
+                    if range.from < 1 || range.from > range.to {
                         return Err(invalid(format!(
                             "invalid port range {}-{} for instance {}",
                             range.from, range.to, instance.address
@@ -438,7 +438,7 @@ fn addr_set(addresses: &BTreeSet<Ipv4Addr>) -> String {
 // Renders the host-reachable ports of an instance as an nft set body:
 // port 22 plus the published HTTP ports and ranges, deduplicated and
 // sorted for stable output.
-fn port_set(http_ports: &[i32], ranges: &[PortRange]) -> String {
+fn port_set(http_ports: &[u16], ranges: &[PortRange]) -> String {
     let mut ports = BTreeSet::from([22]);
     ports.extend(http_ports.iter().copied());
     let mut parts: Vec<String> = ports.into_iter().map(|port| port.to_string()).collect();
@@ -457,7 +457,7 @@ pub(crate) mod tests {
 
     pub(crate) fn two_user_ruleset() -> Ruleset {
         Ruleset {
-            private_range: bento_config::parse_prefix("10.77.0.0/16").unwrap(),
+            private_range: "10.77.0.0/16".parse::<bento_config::Ipv4Prefix>().unwrap(),
             underlay_peers: false,
             frontends: Vec::new(),
             runner_prefix: 24,
@@ -468,7 +468,7 @@ pub(crate) mod tests {
                     network: UserNetwork {
                         name: "bento-user-2".to_string(),
                         bridge: "bento2".to_string(),
-                        subnet: bento_config::parse_prefix("10.77.2.0/24").unwrap(),
+                        subnet: "10.77.2.0/24".parse::<bento_config::Ipv4Prefix>().unwrap(),
                     },
                     instances: vec![PublishedInstance {
                         address: Ipv4Addr::new(10, 77, 2, 2),
@@ -480,7 +480,7 @@ pub(crate) mod tests {
                     network: UserNetwork {
                         name: "bento-user-1".to_string(),
                         bridge: "bento1".to_string(),
-                        subnet: bento_config::parse_prefix("10.77.1.0/24").unwrap(),
+                        subnet: "10.77.1.0/24".parse::<bento_config::Ipv4Prefix>().unwrap(),
                     },
                     instances: vec![
                         PublishedInstance {
@@ -823,7 +823,6 @@ pub(crate) mod tests {
             |rules| rules.users[0].network.bridge = r#"br"; flush ruleset; #"#.to_string(),
             |rules| rules.users[0].network.bridge = rules.users[1].network.bridge.clone(),
             |rules| rules.users[0].instances[0].address = Ipv4Addr::new(10, 99, 0, 2),
-            |rules| rules.users[0].instances[0].http_ports = vec![70_000],
             |rules| rules.users[0].instances[0].http_ports = vec![0],
             |rules| {
                 rules.users[0].instances[0].port_ranges = vec![PortRange {
@@ -832,17 +831,12 @@ pub(crate) mod tests {
                 }];
             },
             |rules| {
-                rules.users[0].instances[0].port_ranges = vec![PortRange {
-                    from: 3000,
-                    to: 70_000,
-                }];
-            },
-            |rules| {
                 rules.users[0].instances[0].port_ranges = vec![PortRange { from: 0, to: 100 }];
             },
             |rules| rules.private_range.bits = 33,
             |rules| {
-                rules.users[0].network.subnet = bento_config::parse_prefix("10.77.0.0/16").unwrap();
+                rules.users[0].network.subnet =
+                    "10.77.0.0/16".parse::<bento_config::Ipv4Prefix>().unwrap();
             },
         ];
         for mutate in mutations {

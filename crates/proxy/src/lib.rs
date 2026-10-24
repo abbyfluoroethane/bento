@@ -43,8 +43,6 @@ pub const DEFAULT_PORT: u16 = 443;
 pub const HIGH_PORT_MIN: u16 = 3000;
 pub const HIGH_PORT_MAX: u16 = 9999;
 
-const DEFAULT_HTTP_PORT: u16 = 80;
-
 /// An error that can cross a proxy integration seam.
 pub type BoxError = Box<dyn StdError + Send + Sync>;
 
@@ -361,11 +359,7 @@ impl Proxy {
         }
 
         let target_port = if listener_port == self.main_port {
-            if instance.http_port == 0 {
-                DEFAULT_HTTP_PORT
-            } else {
-                instance.http_port
-            }
+            instance.effective_http_port()
         } else {
             listener_port
         };
@@ -565,13 +559,13 @@ pub enum Error {
     EmptyHighPortRange { min: u16, max: u16 },
     #[error("proxy: main port {main} falls inside the high port range {min}-{max}")]
     MainPortInHighRange { main: u16, min: u16, max: u16 },
-    #[error("proxy: bind port {port}: {source}")]
+    #[error("proxy: bind port {port}")]
     Bind {
         port: u16,
         #[source]
         source: std::io::Error,
     },
-    #[error("proxy: serve port {port}: {source}")]
+    #[error("proxy: serve port {port}")]
     Serve {
         port: u16,
         #[source]

@@ -63,7 +63,7 @@ pub trait Host: Send + Sync {
     async fn resize_disk(
         &self,
         instance: &InstanceRef,
-        disk_gib: i64,
+        disk_gib: u64,
     ) -> Result<bento_types::State, HostError>;
 }
 

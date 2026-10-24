@@ -45,6 +45,8 @@ pub(crate) const INTERVAL: Duration = Duration::from_secs(30);
 /// accepts (`window_from` clamps to 86 400 seconds).
 const CAPACITY: usize = 24 * 60 * 60 / 30;
 
+const MIB_BYTES: u64 = 1024 * 1024;
+const GIB_BYTES: u64 = 1024 * 1024 * 1024;
 const MIB: f64 = 1024.0 * 1024.0;
 const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 /// One virtual processor, fully busy, spends this much processor time
@@ -105,10 +107,10 @@ struct HostState {
     name: String,
     cpu_pct: Series,
     memory_used_mib: Series,
-    memory_total_mib: i64,
+    memory_total_mib: u64,
     storage_used_gib: f64,
-    storage_total_gib: i64,
-    cpu_count: i64,
+    storage_total_gib: u64,
+    cpu_count: u64,
     previous_cpu: Option<CpuTimes>,
 }
 
@@ -128,7 +130,7 @@ pub(crate) struct HostReading {
     pub(crate) memory_available_bytes: u64,
     pub(crate) storage_total_bytes: u64,
     pub(crate) storage_available_bytes: u64,
-    pub(crate) cpu_count: i64,
+    pub(crate) cpu_count: u64,
 }
 
 /// The live [`Metrics`] implementation: it holds the series and answers
@@ -155,9 +157,9 @@ impl Sampler {
         &self,
         host_id: i64,
         name: &str,
-        cpu_count: i64,
-        memory_total_mib: i64,
-        storage_total_gib: i64,
+        cpu_count: u64,
+        memory_total_mib: u64,
+        storage_total_gib: u64,
     ) {
         let mut state = self.state.lock().expect("metrics state");
         let entry = state.hosts.entry(host_id).or_default();
@@ -201,12 +203,12 @@ impl Sampler {
             .memory_total_bytes
             .saturating_sub(reading.memory_available_bytes);
         host.memory_used_mib.push(at, used as f64 / MIB);
-        host.memory_total_mib = (reading.memory_total_bytes as f64 / MIB) as i64;
+        host.memory_total_mib = reading.memory_total_bytes / MIB_BYTES;
         let storage_used = reading
             .storage_total_bytes
             .saturating_sub(reading.storage_available_bytes);
         host.storage_used_gib = storage_used as f64 / GIB;
-        host.storage_total_gib = (reading.storage_total_bytes as f64 / GIB) as i64;
+        host.storage_total_gib = reading.storage_total_bytes / GIB_BYTES;
         host.cpu_count = reading.cpu_count;
     }
 
@@ -340,7 +342,7 @@ impl SamplerTask {
                 memory_available_bytes: memory.available,
                 storage_total_bytes: storage.total,
                 storage_available_bytes: storage.available,
-                cpu_count: bento_hostinfo::cpu_count() as i64,
+                cpu_count: u64::try_from(bento_hostinfo::cpu_count()).unwrap_or(0),
             },
             at,
         );
@@ -535,7 +537,7 @@ impl Metrics for Sampler {
                 .map_or(0, |host| host.cpu_count)
                 .max(1) as f64;
             cpu_pct += entry.cpu_ns_per_sec / (cores * NS_PER_SEC) * 100.0;
-            totals.memory_used_mib += entry.memory_used_mib.last() as i64;
+            totals.memory_used_mib += bento_types::whole_u64(entry.memory_used_mib.last());
             totals.storage_used_gib += entry.storage_used_gib;
         }
         totals.cpu_pct = cpu_pct.clamp(0.0, 100.0);

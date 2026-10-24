@@ -383,3 +383,34 @@ async fn a_read_only_store_reads_a_live_database_and_writes_nothing() {
     );
     assert_eq!(writer.hosts().await.unwrap().len(), 1);
 }
+
+#[test]
+fn a_value_too_large_for_sqlite_is_not_written() {
+    assert_eq!(crate::to_sql_int(512).unwrap(), 512);
+    assert!(crate::to_sql_int(u64::MAX).is_err());
+    assert!(crate::from_sql_int(0, -1).is_err());
+}
+
+#[tokio::test]
+async fn a_negative_stored_size_is_a_store_error_not_a_wrapped_number() {
+    let store = new_test_store().await;
+    let (user, host) = seed_store(&store).await;
+    let instance = test_instance(1, "web", &user, &host);
+    store
+        .create_instance(
+            instance.clone(),
+            std::time::Duration::ZERO,
+            bento_types::Capacity::unbounded(),
+        )
+        .await
+        .unwrap();
+    store
+        .with_conn(|conn| {
+            conn.execute("UPDATE instances SET memory = -1", [])?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let error = store.instance(instance.uuid).await.unwrap_err();
+    assert!(matches!(error, crate::Error::Sqlite(_)), "{error}");
+}

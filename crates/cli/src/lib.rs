@@ -26,10 +26,6 @@ use time::OffsetDateTime;
 
 use parse::format_cooldown;
 
-const FALLBACK_VCPU: u32 = 2;
-const FALLBACK_MEMORY_MIB: i64 = 2048;
-const FALLBACK_DISK_GIB: i64 = 20;
-
 /// Thread-safe time source used for deterministic last-use rendering.
 pub type Clock = Arc<dyn Fn() -> OffsetDateTime + Send + Sync>;
 pub type OperatorPredicate = Arc<dyn Fn(&User) -> bool + Send + Sync>;
@@ -45,17 +41,17 @@ pub struct Options {
     pub instance_domain: String,
     /// Names an instance may not take (SPEC 7.4).
     pub reserved_names: Vec<String>,
-    /// The image `new` uses when `--image` is absent. Empty makes the flag
+    /// The image `new` uses when `--image` is absent. `None` makes the flag
     /// mandatory.
-    pub default_image: String,
+    pub default_image: Option<String>,
     /// Default vCPU count for `new` when its flag is absent.
     pub default_vcpu: u32,
     /// Default memory for `new` when its flag is absent.
-    pub default_memory_mib: i64,
+    pub default_memory_mib: u64,
     /// Default disk size for `new` when its flag is absent.
-    pub default_disk_gib: i64,
+    pub default_disk_gib: u64,
     /// The operator cooldown setting (SPEC 7.2), used in messages only; the
-    /// store enforces it.
+    /// store enforces it. Zero means no cooldown.
     pub name_cooldown: Duration,
     /// Time source for last-use formatting.
     pub now: Clock,
@@ -69,37 +65,14 @@ impl Default for Options {
             domain: String::new(),
             instance_domain: String::new(),
             reserved_names: Vec::new(),
-            default_image: String::new(),
-            default_vcpu: FALLBACK_VCPU,
-            default_memory_mib: FALLBACK_MEMORY_MIB,
-            default_disk_gib: FALLBACK_DISK_GIB,
-            name_cooldown: Duration::from_secs(24 * 60 * 60),
+            default_image: None,
+            default_vcpu: bento_config::defaults::VCPU,
+            default_memory_mib: bento_config::defaults::MEMORY_MIB,
+            default_disk_gib: bento_config::defaults::DISK_GIB,
+            name_cooldown: bento_config::defaults::NAME_COOLDOWN,
             now: Arc::new(OffsetDateTime::now_utc),
             is_operator: None,
         }
-    }
-}
-
-impl Options {
-    fn with_defaults(mut self) -> Self {
-        // An unset instance domain follows the control plane's own domain,
-        // which is what a single-domain deployment wants (SPEC 7.1).
-        if self.instance_domain.is_empty() {
-            self.instance_domain.clone_from(&self.domain);
-        }
-        if self.default_vcpu == 0 {
-            self.default_vcpu = FALLBACK_VCPU;
-        }
-        if self.default_memory_mib == 0 {
-            self.default_memory_mib = FALLBACK_MEMORY_MIB;
-        }
-        if self.default_disk_gib == 0 {
-            self.default_disk_gib = FALLBACK_DISK_GIB;
-        }
-        if self.name_cooldown.is_zero() {
-            self.name_cooldown = Duration::from_secs(24 * 60 * 60);
-        }
-        self
     }
 }
 
@@ -165,7 +138,7 @@ impl Cli {
             store,
             lifecycle,
             image_admin: None,
-            options: options.with_defaults(),
+            options,
         }
     }
 
@@ -295,11 +268,7 @@ impl Cli {
     /// not the control plane's own domain (SPEC 7.1): `ssh_host` is the one
     /// that stays on `base_domain`.
     fn instance_url(&self, name: &str) -> String {
-        if self.options.instance_domain.is_empty() {
-            format!("the URL of {name}")
-        } else {
-            format!("https://{name}.{}/", self.options.instance_domain)
-        }
+        format!("https://{name}.{}/", self.options.instance_domain)
     }
 }
 
@@ -354,7 +323,11 @@ impl Env<'_> {
                 _ => {}
             }
         }
-        let _ = writeln!(self.err, "bento: {error}");
+        let _ = writeln!(
+            self.err,
+            "bento: {}",
+            bento_types::error_chain(error.as_ref())
+        );
         1
     }
 

@@ -106,8 +106,8 @@ pub struct CreateRequest {
     pub name: String,
     pub image: String,
     pub vcpu: u32,
-    pub memory_mib: i64,
-    pub disk_gib: i64,
+    pub memory_mib: u64,
+    pub disk_gib: u64,
     pub nested: bool,
     pub ksm: bool,
 }
@@ -117,8 +117,8 @@ pub struct CreateRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResizeRequest {
     pub vcpu: Option<u32>,
-    pub memory_mib: Option<i64>,
-    pub disk_gib: Option<i64>,
+    pub memory_mib: Option<u64>,
+    pub disk_gib: Option<u64>,
     pub nested: Option<bool>,
 }
 

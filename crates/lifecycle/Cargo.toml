@@ -8,6 +8,7 @@ repository.workspace = true
 [dependencies]
 async-trait.workspace = true
 bento-cloudinit.workspace = true
+bento-config.workspace = true
 bento-hypervisor.workspace = true
 bento-network.workspace = true
 bento-types.workspace = true

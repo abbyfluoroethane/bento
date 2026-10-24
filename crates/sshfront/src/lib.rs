@@ -14,7 +14,7 @@ mod session;
 
 pub use attach::{Attached, Terminal, TerminalSize, WEB_TERM};
 pub use server::{
-    AsyncReadWrite, BoxError, BoxedIo, CLIRunner, Dialer, InstanceStore, KeyLinker, KeyStore,
+    AsyncReadWrite, BoxError, BoxedIo, CliRunner, Dialer, InstanceStore, KeyLinker, KeyStore,
     PairingRequest, PendingLink, Server, Starter,
 };
 

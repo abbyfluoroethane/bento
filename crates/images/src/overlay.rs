@@ -18,10 +18,10 @@ impl Store {
         &self,
         checksum: &str,
         overlay_path: impl Into<PathBuf>,
-        disk_gib: i64,
+        disk_gib: u64,
     ) -> Result<()> {
         let checksum = normalize_checksum(checksum)?;
-        if disk_gib <= 0 {
+        if disk_gib == 0 {
             return Err(Error::Invalid(format!(
                 "overlay disk size must be positive, got {disk_gib} GiB"
             )));
@@ -174,7 +174,7 @@ mod tests {
             .create_overlay(&checksum, &overlay, 10)
             .await
             .expect_err("resize failure");
-        let message = error.to_string();
+        let message = bento_types::error_chain(&error);
         assert!(message.contains("resize failed"), "{message}");
         assert!(message.contains("boom"), "{message}");
         assert!(!overlay.exists());

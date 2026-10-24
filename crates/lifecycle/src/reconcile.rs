@@ -27,14 +27,20 @@ impl Manager {
     /// is worse than a wrong row.
     pub async fn reconcile(&self) -> Result<ReconcileReport> {
         let domains = self.hyp.list().await.map_err(|error| {
-            Error::operation(format!("lifecycle: reconcile: list domains: {error}"))
+            Error::operation(format!(
+                "lifecycle: reconcile: list domains: {error}",
+                error = bento_types::error_chain(&error)
+            ))
         })?;
         let rows = self
             .store
             .instances_on_host(self.host_id)
             .await
             .map_err(|error| {
-                Error::operation(format!("lifecycle: reconcile: list instances: {error}"))
+                Error::operation(format!(
+                    "lifecycle: reconcile: list instances: {error}",
+                    error = bento_types::error_chain(&*error)
+                ))
             })?;
         let row_ids: HashSet<_> = rows.iter().map(|row| row.uuid.clone()).collect();
         let domain_ids: HashSet<_> = domains.iter().map(|domain| domain.uuid.clone()).collect();

@@ -2,7 +2,6 @@ use std::ffi::OsString;
 use std::fmt;
 use std::fs::File;
 use std::io;
-use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -11,11 +10,6 @@ use async_trait::async_trait;
 use bento_types::{Image, ImageVersion};
 use reqwest::{Request, Response};
 use tokio::sync::{Mutex, OwnedMutexGuard};
-
-/// The image directory from SPEC section 5.1. It must never move after
-/// the first instance exists: a qcow2 overlay records the absolute path
-/// of its backing file.
-pub const DEFAULT_DIR: &str = "/var/lib/bento/images";
 
 /// The flock file inside the image directory. It guards image version
 /// creation and deletion across processes (SPEC section 19).
@@ -31,13 +25,13 @@ pub type DynError = Box<dyn std::error::Error + Send + Sync + 'static>;
 pub enum Error {
     #[error("images: invalid sha256 checksum {0:?}")]
     InvalidChecksum(String),
-    #[error("images: {context}: {source}")]
+    #[error("images: {context}")]
     Io {
         context: String,
         #[source]
         source: io::Error,
     },
-    #[error("images: {context}: {source}")]
+    #[error("images: {context}")]
     Dependency {
         context: String,
         #[source]
@@ -47,7 +41,7 @@ pub enum Error {
     Invalid(String),
     #[error("images: {0}")]
     Http(String),
-    #[error("images: {context}: {source}: {output}")]
+    #[error("images: {context}: {output}")]
     Command {
         context: &'static str,
         #[source]
@@ -440,26 +434,23 @@ pub struct Store {
 }
 
 impl Store {
-    /// Returns a store rooted at `dir`. An empty path selects [`DEFAULT_DIR`].
+    /// Returns a store rooted at `dir`. The bootc settings start at the
+    /// operator defaults; `bentod` overrides them from the parsed config.
     pub fn new<D>(dir: impl Into<PathBuf>, db: D) -> Self
     where
         D: DB + 'static,
     {
-        let mut dir = dir.into();
-        if dir.as_os_str().is_empty() {
-            dir = PathBuf::from(DEFAULT_DIR);
-        }
         Self {
-            dir,
+            dir: dir.into(),
             db: Arc::new(db),
             client: Arc::new(ReqwestClient::default()),
             runner: Arc::new(CommandRunner),
             qemu_img: OsString::from("qemu-img"),
             podman: OsString::from("podman"),
             builder_image: String::new(),
-            bootc_rootfs: "ext4".to_owned(),
-            container_storage: PathBuf::from("/var/lib/containers/storage"),
-            build_timeout: std::time::Duration::from_secs(30 * 60),
+            bootc_rootfs: bento_config::defaults::BOOTC_ROOTFS.to_owned(),
+            container_storage: PathBuf::from(bento_config::defaults::CONTAINER_STORAGE),
+            build_timeout: bento_config::defaults::BOOTC_BUILD_TIMEOUT,
             lock: Arc::new(Mutex::new(())),
             oci_lock: Arc::new(Mutex::new(())),
         }
@@ -584,7 +575,7 @@ impl Store {
                 .write(true)
                 .open(dir.join(file_name))
                 .map_err(|error| io_error("open lock file", error))?;
-            flock(&file, LOCK_EX).map_err(|error| io_error("flock", error))?;
+            file.lock().map_err(|error| io_error("flock", error))?;
             Ok(StoreLock {
                 _process_guard: process_guard,
                 file,
@@ -614,24 +605,7 @@ pub(crate) struct StoreLock {
 
 impl Drop for StoreLock {
     fn drop(&mut self) {
-        let _ = flock(&self.file, LOCK_UN);
-    }
-}
-
-const LOCK_EX: i32 = 2;
-const LOCK_UN: i32 = 8;
-
-fn flock(file: &File, operation: i32) -> io::Result<()> {
-    unsafe extern "C" {
-        #[link_name = "flock"]
-        fn libc_flock(fd: i32, operation: i32) -> i32;
-    }
-    // SAFETY: `file` owns a valid descriptor for the duration of this call,
-    // and flock neither retains the descriptor nor accesses Rust memory.
-    if unsafe { libc_flock(file.as_raw_fd(), operation) } == -1 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
+        let _ = self.file.unlock();
     }
 }
 
@@ -662,13 +636,6 @@ mod tests {
                 assert_eq!(result.expect(name), expected, "{name}");
             }
         }
-    }
-
-    #[test]
-    fn default_dir() {
-        let store = Store::new("", FakeDb::new());
-        assert_eq!(store.dir(), Path::new(DEFAULT_DIR));
-        assert_eq!(DEFAULT_DIR, "/var/lib/bento/images");
     }
 
     #[test]

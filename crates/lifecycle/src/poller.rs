@@ -10,10 +10,12 @@ impl Manager {
     /// then finishes first boot for running instances whose seed remains.
     /// The sweep uses only this host's rows (MULTI-NODE 21).
     pub async fn poll_once(&self) -> Result<()> {
-        let domains =
-            self.hyp.list().await.map_err(|error| {
-                Error::operation(format!("lifecycle: poll: list domains: {error}"))
-            })?;
+        let domains = self.hyp.list().await.map_err(|error| {
+            Error::operation(format!(
+                "lifecycle: poll: list domains: {error}",
+                error = bento_types::error_chain(&error)
+            ))
+        })?;
         let states: HashMap<_, _> = domains
             .into_iter()
             .map(|domain| (domain.uuid, domain.state))
@@ -22,14 +24,20 @@ impl Manager {
             .update_observed_states(states.clone())
             .await
             .map_err(|error| {
-                Error::operation(format!("lifecycle: poll: record observed states: {error}"))
+                Error::operation(format!(
+                    "lifecycle: poll: record observed states: {error}",
+                    error = bento_types::error_chain(&*error)
+                ))
             })?;
         let instances = self
             .store
             .instances_on_host(self.host_id)
             .await
             .map_err(|error| {
-                Error::operation(format!("lifecycle: poll: list instances: {error}"))
+                Error::operation(format!(
+                    "lifecycle: poll: list instances: {error}",
+                    error = bento_types::error_chain(&*error)
+                ))
             })?;
         for instance in instances {
             if states.get(&instance.uuid) != Some(&State::Running) {
@@ -37,7 +45,8 @@ impl Manager {
             }
             if let Err(error) = self.finish_first_boot(&instance).await {
                 self.log.warn(&format!(
-                    "poll: first boot cleanup failed; retry next poll: {error}"
+                    "poll: first boot cleanup failed; retry next poll: {error}",
+                    error = bento_types::error_chain(&error)
                 ));
             }
         }
@@ -58,7 +67,7 @@ impl Manager {
                 () = &mut shutdown => return Ok(()),
                 _ = interval.tick() => {
                     if let Err(error) = self.poll_once().await {
-                        self.log.warn(&format!("poll failed: {error}"));
+                        self.log.warn(&format!("poll failed: {error}", error = bento_types::error_chain(&error)));
                     }
                 }
             }
@@ -72,7 +81,8 @@ impl Manager {
             Ok(instance) => instance,
             Err(error) => {
                 self.log.warn(&format!(
-                    "event: no row for {uuid}, ignoring {state}: {error}"
+                    "event: no row for {uuid}, ignoring {state}: {error}",
+                    error = bento_types::error_chain(&*error)
                 ));
                 return Ok(());
             }
@@ -85,7 +95,8 @@ impl Manager {
             && let Err(error) = self.finish_first_boot(&instance).await
         {
             self.log.warn(&format!(
-                "event: first boot cleanup failed; retry next poll: {error}"
+                "event: first boot cleanup failed; retry next poll: {error}",
+                error = bento_types::error_chain(&error)
             ));
         }
         Ok(())
@@ -105,7 +116,8 @@ impl Manager {
             definer.define(&xml).await.map_err(|error| {
                 Error::operation(format!(
                     "lifecycle: detach seed iso of {}: {error}",
-                    instance.name
+                    instance.name,
+                    error = bento_types::error_chain(&error)
                 ))
             })?;
         } else {
@@ -114,7 +126,8 @@ impl Manager {
         (self.delete_iso)(path).await.map_err(|error| {
             Error::operation(format!(
                 "lifecycle: delete seed iso of {}: {error}",
-                instance.name
+                instance.name,
+                error = bento_types::error_chain(&*error)
             ))
         })?;
         self.log.info(&format!(

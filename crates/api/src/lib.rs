@@ -180,8 +180,10 @@ pub(crate) fn error_parts(error: &BoxError) -> (StatusCode, String) {
     }
     // A 500 is a server fault. Log it here, the one place every handler
     // passes through, so the journal holds the cause the client saw.
-    tracing::error!(%error, "request failed with 500");
-    (StatusCode::INTERNAL_SERVER_ERROR, error.to_string())
+    // Display names one layer. The client and the journal get the chain.
+    let message = bento_types::error_chain(error.as_ref());
+    tracing::error!(error = %message, "request failed with 500");
+    (StatusCode::INTERNAL_SERVER_ERROR, message)
 }
 
 pub(crate) fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
@@ -254,21 +256,58 @@ pub(crate) fn optional_rfc3339(value: Option<OffsetDateTime>) -> String {
 
 pub(crate) async fn decode_json<T: for<'de> Deserialize<'de>>(
     request: Request<Body>,
-) -> Result<T, Box<Response>> {
+) -> Result<T, HandlerError> {
     let bytes = to_bytes(request.into_body(), 1 << 20)
         .await
-        .map_err(|error| {
-            Box::new(error_response(
-                StatusCode::BAD_REQUEST,
-                format!("bad request body: {error}"),
-            ))
-        })?;
-    serde_json::from_slice(&bytes).map_err(|error| {
-        Box::new(error_response(
-            StatusCode::BAD_REQUEST,
-            format!("bad request body: {error}"),
-        ))
-    })
+        .map_err(bad_body)?;
+    serde_json::from_slice(&bytes).map_err(bad_body)
+}
+
+fn bad_body(error: impl std::fmt::Display) -> HandlerError {
+    StatusError::new(
+        StatusCode::BAD_REQUEST,
+        format!("bad request body: {error}"),
+    )
+    .into()
+}
+
+/// What a handler returns in its `Err` arm, so that it can use `?`.
+///
+/// The JSON handlers carry a [`BoxError`], which [`IntoResponse`] maps
+/// through [`mapped_error`] and so through [`error_parts`], the one place
+/// an error becomes a status. The page handlers carry a page they already
+/// rendered, such as an error inside the dashboard shell.
+#[derive(Debug)]
+pub(crate) enum HandlerError {
+    Failure(BoxError),
+    Page(Box<Response>),
+}
+
+impl From<BoxError> for HandlerError {
+    fn from(error: BoxError) -> Self {
+        Self::Failure(error)
+    }
+}
+
+impl From<StatusError> for HandlerError {
+    fn from(error: StatusError) -> Self {
+        Self::Failure(Box::new(error))
+    }
+}
+
+impl From<Response> for HandlerError {
+    fn from(response: Response) -> Self {
+        Self::Page(Box::new(response))
+    }
+}
+
+impl IntoResponse for HandlerError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Failure(error) => mapped_error(error),
+            Self::Page(response) => *response,
+        }
+    }
 }
 
 pub(crate) fn is_not_found(error: &BoxError) -> bool {

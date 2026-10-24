@@ -3,8 +3,8 @@ use bento_network::GuestNetwork;
 use bento_types::{DesiredState, ImageKind, Instance, Placing, State, User, Visibility};
 
 use crate::fs::remove_file;
-use crate::manager::parse_prefix;
 use crate::{Error, Manager, Result};
+use bento_network::Ipv4Prefix;
 
 /// The one account cloud-init creates in every instance (SPEC 5.2). A fixed
 /// name lets the SSH frontend authenticate to every guest (SPEC 10 step 9).
@@ -25,8 +25,8 @@ pub struct NewRequest {
     pub ssh_keys: Vec<String>,
     pub image_name: String,
     pub vcpu: u32,
-    pub memory_mib: i64,
-    pub disk_gib: i64,
+    pub memory_mib: u64,
+    pub disk_gib: u64,
     pub nested: bool,
     /// The zero value keeps same-page merging enabled (SPEC 5.4).
     pub disable_ksm: bool,
@@ -45,7 +45,7 @@ impl Manager {
         if request.image_name.is_empty() {
             return Err(Error::operation("lifecycle: new needs an image"));
         }
-        if request.vcpu == 0 || request.memory_mib <= 0 || request.disk_gib <= 0 {
+        if request.vcpu == 0 || request.memory_mib == 0 || request.disk_gib == 0 {
             return Err(Error::operation(
                 "lifecycle: new needs positive vcpu, memory, and disk",
             ));
@@ -60,7 +60,8 @@ impl Manager {
             .map_err(|error| {
                 Error::operation(format!(
                     "lifecycle: image {:?}: {error}",
-                    request.image_name
+                    request.image_name,
+                    error = bento_types::error_chain(&*error)
                 ))
             })?;
         let checksum = image
@@ -80,14 +81,21 @@ impl Manager {
             });
         }
         let image_version = self.store.image_version(&checksum).await.map_err(|error| {
-            Error::operation(format!("lifecycle: image version {checksum:?}: {error}"))
-        })?;
-        let subnet = parse_prefix(&request.owner.subnet).map_err(|error| {
             Error::operation(format!(
-                "lifecycle: user {} has a bad subnet {:?}: {error}",
-                request.owner.name, request.owner.subnet
+                "lifecycle: image version {checksum:?}: {error}",
+                error = bento_types::error_chain(&*error)
             ))
         })?;
+        let subnet = request
+            .owner
+            .subnet
+            .parse::<Ipv4Prefix>()
+            .map_err(|error| {
+                Error::operation(format!(
+                    "lifecycle: user {} has a bad subnet {:?}: {error}",
+                    request.owner.name, request.owner.subnet
+                ))
+            })?;
         let host_id = self.place(&request).await?;
         let (address, slot) =
             crate::manager::allocate_in_owned_slot(&self.store, host_id, subnet).await?;
@@ -164,7 +172,8 @@ impl Manager {
         instance.state = observed;
         if let Err(error) = self.store.set_observed_state(&uuid, observed).await {
             self.log.warn(&format!(
-                "new: observed state not recorded; poller will catch up: {error}"
+                "new: observed state not recorded; poller will catch up: {error}",
+                error = bento_types::error_chain(&*error)
             ));
         }
         self.log
@@ -185,7 +194,7 @@ impl Manager {
         }
         self.store
             .choose_host(Placing {
-                vcpu: i64::from(request.vcpu),
+                vcpu: request.vcpu,
                 memory_mib: request.memory_mib,
                 disk_gib: request.disk_gib,
                 // An image version carries no architecture of its own:
@@ -203,7 +212,7 @@ impl Manager {
     /// The libvirt network of an owner, by the deterministic name every
     /// machine derives from the subnet index (SPEC 6.2).
     pub(crate) fn user_network_name(&self, owner: &User) -> Result<String> {
-        let subnet = parse_prefix(&owner.subnet).map_err(|error| {
+        let subnet = owner.subnet.parse::<Ipv4Prefix>().map_err(|error| {
             Error::operation(format!(
                 "lifecycle: user {} has a bad subnet {:?}: {error}",
                 owner.name, owner.subnet
@@ -212,7 +221,9 @@ impl Manager {
         let index = self.plan.index(subnet).map_err(|error| {
             Error::operation(format!(
                 "lifecycle: subnet {}/{} outside the private range: {error}",
-                subnet.addr, subnet.bits
+                subnet.addr,
+                subnet.bits,
+                error = bento_types::error_chain(&error)
             ))
         })?;
         Ok(bento_network::UserNetwork::new(self.plan, index as isize)
@@ -227,18 +238,29 @@ impl Manager {
     /// [`Manager::unwind_new`], where the files are on the machine that
     /// tried to build the instance.
     pub(crate) async fn unwind_copy(&self, instance: &Instance, cause: crate::DynError) -> Error {
-        let mut errors = vec![cause.to_string()];
+        let mut errors = vec![bento_types::error_chain(&*cause)];
         if let Err(error) = (self.delete_iso)(self.seed_iso_path(&instance.uuid)).await {
-            errors.push(format!("unwind seed iso: {error}"));
+            errors.push(format!(
+                "unwind seed iso: {error}",
+                error = bento_types::error_chain(&*error)
+            ));
         }
         if let Err(error) = remove_file(&self.overlay_path(&instance.uuid)).await {
-            errors.push(format!("unwind overlay: {error}"));
+            errors.push(format!(
+                "unwind overlay: {error}",
+                error = bento_types::error_chain(&error)
+            ));
         }
         if let Err(error) = self.store.delete_instance(&instance.uuid).await {
-            errors.push(format!("unwind instance row: {error}"));
+            errors.push(format!(
+                "unwind instance row: {error}",
+                error = bento_types::error_chain(&*error)
+            ));
         }
-        self.log
-            .warn(&format!("cp: failed, partial work unwound: {cause}"));
+        self.log.warn(&format!(
+            "cp: failed, partial work unwound: {}",
+            bento_types::error_chain(&*cause)
+        ));
         Error::operation(format!(
             "lifecycle: cp {}: {}",
             instance.name,
@@ -253,12 +275,17 @@ impl Manager {
     /// failure, and it is the only side that can: a controller cannot
     /// delete a file on another machine (MULTI-NODE 13.1).
     pub(crate) async fn unwind_new(&self, instance: &Instance, cause: crate::DynError) -> Error {
-        let mut errors = vec![cause.to_string()];
+        let mut errors = vec![bento_types::error_chain(&*cause)];
         if let Err(error) = self.store.delete_instance(&instance.uuid).await {
-            errors.push(format!("unwind instance row: {error}"));
+            errors.push(format!(
+                "unwind instance row: {error}",
+                error = bento_types::error_chain(&*error)
+            ));
         }
-        self.log
-            .warn(&format!("new: failed, partial work unwound: {cause}"));
+        self.log.warn(&format!(
+            "new: failed, partial work unwound: {}",
+            bento_types::error_chain(&*cause)
+        ));
         Error::operation(format!(
             "lifecycle: new {}: {}",
             instance.name,

@@ -1,7 +1,7 @@
 use bento_types::{Image, ImageVersion};
 use rusqlite::{OptionalExtension, params};
 
-use crate::{Error, Result, Store, format_time, parse_time};
+use crate::{Error, Result, Store, format_time, get_u64, parse_time, to_sql_int};
 
 impl Store {
     /// Appends an allowlist entry without replacing an existing name.
@@ -82,7 +82,7 @@ impl Store {
                     version.checksum,
                     version.image_name,
                     version.path,
-                    version.size,
+                    to_sql_int(version.size)?,
                     version.kind.as_str(),
                     version.source_digest,
                     format_time(version.fetched_at)?
@@ -275,7 +275,7 @@ fn scan_image_version(row: &rusqlite::Row<'_>) -> rusqlite::Result<ImageVersion>
         checksum: row.get(0)?,
         image_name: row.get(1)?,
         path: row.get(2)?,
-        size: row.get(3)?,
+        size: get_u64(row, 3)?,
         kind: kind.parse().map_err(|message: String| {
             rusqlite::Error::FromSqlConversionFailure(
                 4,

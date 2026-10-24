@@ -24,7 +24,8 @@ impl Manager {
             Err(HypervisorError::DomainNotFound(_)) => true,
             Err(error) => {
                 return Err(Error::operation(format!(
-                    "lifecycle: rename {old_name}: {error}"
+                    "lifecycle: rename {old_name}: {error}",
+                    error = bento_types::error_chain(&error)
                 )));
             }
         };
@@ -33,18 +34,25 @@ impl Manager {
                 .rename_elsewhere(instance, &old_name, new_name, domain_gone)
                 .await;
         }
-        if !domain_gone && self.definer.is_none() {
-            return Err(Error::operation(format!(
-                "lifecycle: rename {old_name}: hypervisor cannot redefine domains"
-            )));
-        }
+        // A domain that exists must be redefined under the new name, so
+        // the capability is checked before the row changes. A domain that
+        // is gone needs only the row.
+        let definer = if domain_gone {
+            None
+        } else {
+            Some(self.definer.as_ref().ok_or_else(|| {
+                Error::operation(format!(
+                    "lifecycle: rename {old_name}: hypervisor cannot redefine domains"
+                ))
+            })?)
+        };
         self.store
             .rename_instance(uuid, new_name, self.cooldown)
             .await
             .map_err(crate::actions::external)?;
-        if domain_gone {
+        let Some(definer) = definer else {
             return Ok(());
-        }
+        };
         instance.name = new_name.to_string();
         let with_iso = (self.iso_exists)(&self.seed_iso_path(uuid));
         let xml = match self.domain_xml_by_uuid(&instance, with_iso).await {
@@ -58,12 +66,14 @@ impl Manager {
                     .unwind_rename(
                         &instance,
                         &old_name,
-                        Error::operation(format!("undefine {old_name}: {error}")),
+                        Error::operation(format!(
+                            "undefine {old_name}: {error}",
+                            error = bento_types::error_chain(&error)
+                        )),
                     )
                     .await);
             }
         }
-        let definer = self.definer.as_ref().expect("capability checked");
         if let Err(error) = definer.define(&xml).await {
             let mut old = instance.clone();
             old.name.clone_from(&old_name);
@@ -78,7 +88,10 @@ impl Manager {
                 .unwind_rename(
                     &instance,
                     &old_name,
-                    Error::operation(format!("define {new_name}: {error}")),
+                    Error::operation(format!(
+                        "define {new_name}: {error}",
+                        error = bento_types::error_chain(&error)
+                    )),
                 )
                 .await);
         }
@@ -123,12 +136,15 @@ impl Manager {
             .rename_instance(&instance.uuid, old_name, self.cooldown)
             .await
         {
-            self.log
-                .error(&format!("rename: revert to old name failed: {error}"));
+            self.log.error(&format!(
+                "rename: revert to old name failed: {error}",
+                error = bento_types::error_chain(&*error)
+            ));
         }
         Error::operation(format!(
-            "lifecycle: rename {old_name} to {}: {cause}",
-            instance.name
+            "lifecycle: rename {old_name} to {}: {}",
+            instance.name,
+            bento_types::error_chain(&cause)
         ))
     }
 }

@@ -476,7 +476,9 @@ async fn seed_account(db_path: &Path) -> (String, String) {
     let store = bento_store::Store::open(db_path)
         .await
         .expect("open database");
-    let range = bento_config::parse_prefix("10.100.0.0/16").expect("parse private range");
+    let range = "10.100.0.0/16"
+        .parse::<bento_config::Ipv4Prefix>()
+        .expect("parse private range");
     let user = store
         .register_user(USER_NAME, "tester@e2e.test", None, range)
         .await
@@ -485,11 +487,7 @@ async fn seed_account(db_path: &Path) -> (String, String) {
     // nowhere else (SPEC 13).
     let plaintext = format!("{}e2e-{}", bento_auth::TOKEN_PREFIX, std::process::id());
     store
-        .create_token(
-            user.id,
-            bento_auth::hash_token(&plaintext),
-            time::OffsetDateTime::UNIX_EPOCH,
-        )
+        .create_token(user.id, bento_auth::hash_token(&plaintext), None)
         .await
         .expect("create token");
     store.close().await.expect("close database");
@@ -678,7 +676,9 @@ fn free_port() -> u16 {
 /// does, through the same `bento_network` types.
 fn network_name(subnet: &str) -> String {
     let plan = bento_network::Plan::new("10.100.0.0/16").expect("build the address plan");
-    let prefix = bento_config::parse_prefix(subnet).expect("parse the user subnet");
+    let prefix = subnet
+        .parse::<bento_config::Ipv4Prefix>()
+        .expect("parse the user subnet");
     let index = plan.index(prefix).expect("locate the subnet in the plan");
     bento_network::UserNetwork::new(plan, index as isize)
         .expect("build the user network")

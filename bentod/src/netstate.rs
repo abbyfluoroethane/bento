@@ -61,8 +61,12 @@ pub(crate) async fn machine_network(
             tracing::warn!(slot = slot.slot, "slot is moving, so it gets no route");
             continue;
         }
+        let Ok(number) = u32::try_from(slot.slot) else {
+            tracing::warn!(slot = slot.slot, "slot number is too large for a route");
+            continue;
+        };
         remote_slots.push(RemoteSlot {
-            slot: slot.slot as u32,
+            slot: number,
             next_hop,
         });
     }
@@ -86,13 +90,7 @@ pub(crate) async fn machine_network(
             instance.visibility,
             Visibility::Private | Visibility::Public
         ) {
-            published
-                .http_ports
-                .push(i32::from(if instance.http_port == 0 {
-                    80
-                } else {
-                    instance.http_port
-                }));
+            published.http_ports.push(instance.effective_http_port());
             published.port_ranges.push(high_ports);
         }
         by_owner
@@ -106,7 +104,7 @@ pub(crate) async fn machine_network(
     // that user is placed later (MULTI-NODE 7.2).
     let mut users = Vec::new();
     for user in store.users().await? {
-        let Ok(subnet) = bento_config::parse_prefix(&user.subnet) else {
+        let Ok(subnet) = user.subnet.parse::<bento_config::Ipv4Prefix>() else {
             tracing::warn!(user = %user.name, subnet = %user.subnet, "user subnet skipped");
             continue;
         };

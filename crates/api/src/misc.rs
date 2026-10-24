@@ -8,8 +8,8 @@ use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
 use crate::{
-    AppState, UsageJson, decode_json, error_response, is_not_found, json_response, mapped_error,
-    owned_instance, rfc3339,
+    AppState, HandlerError, StatusError, UsageJson, decode_json, error_response, is_not_found,
+    json_response, owned_instance, rfc3339,
 };
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -22,15 +22,9 @@ pub(crate) async fn list_shares(
     State(state): State<AppState>,
     Extension(user): Extension<User>,
     AxumPath(uuid): AxumPath<String>,
-) -> Response {
-    let instance = match owned_instance(&state, &uuid, &user).await {
-        Ok(instance) => instance,
-        Err(response) => return *response,
-    };
-    let shares = match state.0.store.shares_for(&instance.uuid).await {
-        Ok(shares) => shares,
-        Err(error) => return mapped_error(error),
-    };
+) -> Result<Response, HandlerError> {
+    let instance = owned_instance(&state, &uuid, &user).await?;
+    let shares = state.0.store.shares_for(&instance.uuid).await?;
     let mut response = Vec::with_capacity(shares.len());
     for share in shares {
         let name = state
@@ -45,7 +39,7 @@ pub(crate) async fn list_shares(
             created_at: rfc3339(share.created_at),
         });
     }
-    json_response(StatusCode::OK, &response)
+    Ok(json_response(StatusCode::OK, &response))
 }
 
 #[derive(Deserialize)]
@@ -59,63 +53,59 @@ pub(crate) async fn add_share(
     Extension(user): Extension<User>,
     AxumPath(uuid): AxumPath<String>,
     request: Request<Body>,
-) -> Response {
-    let instance = match owned_instance(&state, &uuid, &user).await {
-        Ok(instance) => instance,
-        Err(response) => return *response,
-    };
-    let request: ShareRequest = match decode_json(request).await {
-        Ok(request) => request,
-        Err(response) => return *response,
-    };
+) -> Result<Response, HandlerError> {
+    let instance = owned_instance(&state, &uuid, &user).await?;
+    let request: ShareRequest = decode_json(request).await?;
     let target = match state.0.store.user_by_name(&request.user).await {
         Ok(target) => target,
         Err(error) if is_not_found(&error) => {
-            return error_response(
+            return Err(StatusError::new(
                 StatusCode::NOT_FOUND,
                 format!("no user named {}", request.user),
-            );
+            )
+            .into());
         }
-        Err(error) => return mapped_error(error),
+        Err(error) => return Err(error.into()),
     };
     if target.id == user.id {
-        return error_response(StatusCode::BAD_REQUEST, "you already own this instance");
+        return Ok(error_response(
+            StatusCode::BAD_REQUEST,
+            "you already own this instance",
+        ));
     }
-    match state.0.store.add_share(&instance.uuid, target.id).await {
-        Ok(()) => json_response(
-            StatusCode::CREATED,
-            &ShareJson {
-                user: target.name,
-                created_at: String::new(),
-            },
-        ),
-        Err(error) => mapped_error(error),
-    }
+    state.0.store.add_share(&instance.uuid, target.id).await?;
+    Ok(json_response(
+        StatusCode::CREATED,
+        &ShareJson {
+            user: target.name,
+            created_at: String::new(),
+        },
+    ))
 }
 
 pub(crate) async fn remove_share(
     State(state): State<AppState>,
     Extension(user): Extension<User>,
     AxumPath((uuid, target_name)): AxumPath<(String, String)>,
-) -> Response {
-    let instance = match owned_instance(&state, &uuid, &user).await {
-        Ok(instance) => instance,
-        Err(response) => return *response,
-    };
+) -> Result<Response, HandlerError> {
+    let instance = owned_instance(&state, &uuid, &user).await?;
     let target = match state.0.store.user_by_name(&target_name).await {
         Ok(target) => target,
         Err(error) if is_not_found(&error) => {
-            return error_response(
+            return Err(StatusError::new(
                 StatusCode::NOT_FOUND,
                 format!("no user named {target_name}"),
-            );
+            )
+            .into());
         }
-        Err(error) => return mapped_error(error),
+        Err(error) => return Err(error.into()),
     };
-    match state.0.store.remove_share(&instance.uuid, target.id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => mapped_error(error),
-    }
+    state
+        .0
+        .store
+        .remove_share(&instance.uuid, target.id)
+        .await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -146,13 +136,10 @@ pub(crate) fn is_operator(state: &AppState, user: &User) -> bool {
 pub(crate) async fn handle_whoami(
     State(state): State<AppState>,
     Extension(user): Extension<User>,
-) -> Response {
-    let usage = match state.0.store.usage_for(user.id).await {
-        Ok(usage) => usage,
-        Err(error) => return mapped_error(error),
-    };
+) -> Result<Response, HandlerError> {
+    let usage = state.0.store.usage_for(user.id).await?;
     let operator = is_operator(&state, &user);
-    json_response(
+    Ok(json_response(
         StatusCode::OK,
         &WhoamiResponse {
             user: UserJson {
@@ -169,7 +156,7 @@ pub(crate) async fn handle_whoami(
                 String::new()
             },
         },
-    )
+    ))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -230,11 +217,9 @@ pub(crate) async fn images_with_counts(
 pub(crate) async fn list_images(
     State(state): State<AppState>,
     Extension(_user): Extension<User>,
-) -> Response {
-    match images_with_counts(&state).await {
-        Ok(response) => json_response(StatusCode::OK, &response),
-        Err(error) => mapped_error(error),
-    }
+) -> Result<Response, HandlerError> {
+    let response = images_with_counts(&state).await?;
+    Ok(json_response(StatusCode::OK, &response))
 }
 
 #[derive(Debug, Deserialize)]
@@ -248,27 +233,24 @@ pub(crate) async fn add_image(
     State(state): State<AppState>,
     Extension(user): Extension<User>,
     request: Request<Body>,
-) -> Response {
+) -> Result<Response, HandlerError> {
     if !is_operator(&state, &user) {
-        return error_response(StatusCode::FORBIDDEN, "operator only");
+        return Ok(error_response(StatusCode::FORBIDDEN, "operator only"));
     }
-    let request: AddImageRequest = match decode_json(request).await {
-        Ok(request) => request,
-        Err(response) => return *response,
-    };
+    let request: AddImageRequest = decode_json(request).await?;
     let Some(admin) = &state.0.image_admin else {
-        return error_response(
+        return Ok(error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "runtime image management is unavailable",
-        );
+        ));
     };
-    match admin.add_oci_image(&request.name, &request.reference).await {
-        Ok(()) => json_response(
-            StatusCode::CREATED,
-            &serde_json::json!({ "name": request.name }),
-        ),
-        Err(error) => mapped_error(error),
-    }
+    admin
+        .add_oci_image(&request.name, &request.reference)
+        .await?;
+    Ok(json_response(
+        StatusCode::CREATED,
+        &serde_json::json!({ "name": request.name }),
+    ))
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -295,14 +277,12 @@ impl From<SshKey> for SshKeyJson {
 pub(crate) async fn list_ssh_keys(
     State(state): State<AppState>,
     Extension(user): Extension<User>,
-) -> Response {
-    match state.0.store.ssh_keys_for_user(user.id).await {
-        Ok(keys) => json_response(
-            StatusCode::OK,
-            &keys.into_iter().map(SshKeyJson::from).collect::<Vec<_>>(),
-        ),
-        Err(error) => mapped_error(error),
-    }
+) -> Result<Response, HandlerError> {
+    let keys = state.0.store.ssh_keys_for_user(user.id).await?;
+    Ok(json_response(
+        StatusCode::OK,
+        &keys.into_iter().map(SshKeyJson::from).collect::<Vec<_>>(),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -317,16 +297,13 @@ pub(crate) async fn add_ssh_key(
     State(state): State<AppState>,
     Extension(user): Extension<User>,
     request: Request<Body>,
-) -> Response {
-    let request: AddSshKeyRequest = match decode_json(request).await {
-        Ok(request) => request,
-        Err(response) => return *response,
-    };
-    let public_key = match PublicKey::from_openssh(&request.public_key) {
-        Ok(public_key) => public_key,
-        Err(_) => {
-            return error_response(StatusCode::BAD_REQUEST, "not a valid SSH public key");
-        }
+) -> Result<Response, HandlerError> {
+    let request: AddSshKeyRequest = decode_json(request).await?;
+    let Ok(public_key) = PublicKey::from_openssh(&request.public_key) else {
+        return Ok(error_response(
+            StatusCode::BAD_REQUEST,
+            "not a valid SSH public key",
+        ));
     };
     let comment = if request.comment.is_empty() {
         public_key.comment().to_string()
@@ -334,16 +311,12 @@ pub(crate) async fn add_ssh_key(
         request.comment
     };
     let fingerprint = public_key.fingerprint(HashAlg::Sha256).to_string();
-    let id = match state
+    let id = state
         .0
         .store
         .add_ssh_key(user.id, &request.public_key, &fingerprint, &comment)
-        .await
-    {
-        Ok(id) => id,
-        Err(error) => return mapped_error(error),
-    };
-    json_response(
+        .await?;
+    Ok(json_response(
         StatusCode::CREATED,
         &SshKeyJson {
             id,
@@ -352,22 +325,19 @@ pub(crate) async fn add_ssh_key(
             public_key: request.public_key,
             created_at: String::new(),
         },
-    )
+    ))
 }
 
 pub(crate) async fn delete_ssh_key(
     State(state): State<AppState>,
     Extension(user): Extension<User>,
     AxumPath(id): AxumPath<String>,
-) -> Response {
-    let id = match id.parse::<i64>() {
-        Ok(id) => id,
-        Err(_) => return error_response(StatusCode::BAD_REQUEST, "bad key id"),
+) -> Result<Response, HandlerError> {
+    let Ok(id) = id.parse::<i64>() else {
+        return Ok(error_response(StatusCode::BAD_REQUEST, "bad key id"));
     };
-    match state.0.store.delete_ssh_key(user.id, id).await {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-        Err(error) => mapped_error(error),
-    }
+    state.0.store.delete_ssh_key(user.id, id).await?;
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// Serves a consistent database snapshot (SPEC 12.1). The store writes it
@@ -376,22 +346,19 @@ pub(crate) async fn delete_ssh_key(
 pub(crate) async fn dump_db(
     State(state): State<AppState>,
     Extension(user): Extension<User>,
-) -> Response {
+) -> Result<Response, HandlerError> {
     if !is_operator(&state, &user) {
-        return error_response(StatusCode::FORBIDDEN, "operator only");
+        return Ok(error_response(StatusCode::FORBIDDEN, "operator only"));
     }
-    let directory = match tempfile::Builder::new().prefix("bento-dump-").tempdir() {
-        Ok(directory) => directory,
-        Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
-    };
+    let directory = tempfile::Builder::new()
+        .prefix("bento-dump-")
+        .tempdir()
+        .map_err(|error| HandlerError::from(crate::BoxError::from(error)))?;
     let destination = directory.path().join("bento.db");
-    if let Err(error) = state.0.store.dump_db(&destination).await {
-        return mapped_error(error);
-    }
-    let bytes = match tokio::fs::read(&destination).await {
-        Ok(bytes) => bytes,
-        Err(error) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
-    };
+    state.0.store.dump_db(&destination).await?;
+    let bytes = tokio::fs::read(&destination)
+        .await
+        .map_err(|error| HandlerError::from(crate::BoxError::from(error)))?;
     let content_length = bytes.len();
     let timestamp = OffsetDateTime::now_utc()
         .format(time::macros::format_description!(
@@ -412,5 +379,5 @@ pub(crate) async fn dump_db(
         header::CONTENT_DISPOSITION,
         HeaderValue::from_str(&disposition).expect("generated disposition is valid"),
     );
-    response
+    Ok(response)
 }

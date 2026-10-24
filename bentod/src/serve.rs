@@ -3,6 +3,8 @@
 //! libvirt, user networks, firewall, reboot restore, then HTTP.
 
 use std::ffi::OsString;
+use std::future::Future;
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -31,6 +33,38 @@ use crate::setup::{App, host_checks, shutdown_signal};
 
 const CONTROLLER_LEASE_TTL: Duration = Duration::from_secs(30);
 
+/// Runs `step` once per `period` until `shutdown` fires or `step` breaks.
+/// The first run comes one period after the call. A late tick is delayed,
+/// not repeated: a burst of catch-up runs would see the same instant.
+async fn every<F, Fut>(period: Duration, shutdown: &CancellationToken, mut step: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = ControlFlow<()>>,
+{
+    let mut ticker = tokio::time::interval(period);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    ticker.tick().await;
+    loop {
+        tokio::select! {
+            () = shutdown.cancelled() => return,
+            _ = ticker.tick() => {
+                if step().await.is_break() {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Logs a task that panicked. A cancelled task is not an error.
+fn log_join(name: &str, result: Result<(), tokio::task::JoinError>) {
+    if let Err(error) = result
+        && error.is_panic()
+    {
+        tracing::error!(task = name, %error, "background task panicked");
+    }
+}
+
 pub(crate) async fn run_serve(config: &Path, _args: &[OsString]) -> Result<()> {
     let app = App::new(config).await?;
     let holder_id = bento_lifecycle::random_uuid();
@@ -52,7 +86,7 @@ pub(crate) async fn run_serve(config: &Path, _args: &[OsString]) -> Result<()> {
     );
     let result = serve_inner(&app, lease_receiver, cancellation.clone()).await;
     cancellation.cancel();
-    let _ = renewal.await;
+    log_join("lease renewal", renewal.await);
     let release = app.store.release_lease(holder_id).await;
     if let Err(error) = &release {
         tracing::warn!(%error, "controller lease release failed");
@@ -80,40 +114,35 @@ fn spawn_lease_renewal(
     cancellation: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(CONTROLLER_LEASE_TTL / 3);
-        // The lease already has a full TTL. Wait one renewal period before
-        // writing it again (MULTI-NODE 11.3).
-        ticker.tick().await;
-        loop {
-            tokio::select! {
-                _ = cancellation.cancelled() => return,
-                _ = ticker.tick() => {
-                    match store.renew_lease(holder_id.clone(), CONTROLLER_LEASE_TTL).await {
-                        Ok(lease) => {
-                            lease_sender.send_replace(lease);
-                        }
-                        Err(bento_store::Error::LeaseLost) => {
-                            tracing::error!(
-                                "controller lease lost; this process has been replaced and must not dispatch"
-                            );
-                            cancellation.cancel();
-                            return;
-                        }
-                        Err(error) => {
-                            // The controller cannot prove that it still owns
-                            // the lease. Stop before it can dispatch stale work
-                            // (MULTI-NODE 11.3).
-                            tracing::error!(
-                                %error,
-                                "controller lease renewal failed; this process must not dispatch"
-                            );
-                            cancellation.cancel();
-                            return;
-                        }
-                    }
+        // The lease already has a full TTL, so the first renewal comes one
+        // period after the start (MULTI-NODE 11.3).
+        every(CONTROLLER_LEASE_TTL / 3, &cancellation, || async {
+            match store.renew_lease(holder_id.clone(), CONTROLLER_LEASE_TTL).await {
+                Ok(lease) => {
+                    lease_sender.send_replace(lease);
+                    ControlFlow::Continue(())
+                }
+                Err(bento_store::Error::LeaseLost) => {
+                    tracing::error!(
+                        "controller lease lost; this process has been replaced and must not dispatch"
+                    );
+                    cancellation.cancel();
+                    ControlFlow::Break(())
+                }
+                Err(error) => {
+                    // The controller cannot prove that it still owns
+                    // the lease. Stop before it can dispatch stale work
+                    // (MULTI-NODE 11.3).
+                    tracing::error!(
+                        %error,
+                        "controller lease renewal failed; this process must not dispatch"
+                    );
+                    cancellation.cancel();
+                    ControlFlow::Break(())
                 }
             }
-        }
+        })
+        .await;
     })
 }
 
@@ -184,8 +213,8 @@ async fn serve_inner(
         app.plan,
         Arc::new(NftApplier::default()),
         PortRange {
-            from: i32::from(app.cfg.listen.proxy_port_min),
-            to: i32::from(app.cfg.listen.proxy_port_max),
+            from: app.cfg.listen.proxy_port_min,
+            to: app.cfg.listen.proxy_port_max,
         },
         host.id,
     ));
@@ -217,6 +246,7 @@ async fn serve_inner(
         "control plane listening"
     );
 
+    let mut tasks = tokio::task::JoinSet::new();
     let restore = tokio::spawn({
         let manager = manager.clone();
         async move {
@@ -225,7 +255,7 @@ async fn serve_inner(
             }
         }
     });
-    let poller = tokio::spawn({
+    tasks.spawn({
         let manager = manager.clone();
         let cancellation = cancellation.clone();
         async move {
@@ -234,7 +264,7 @@ async fn serve_inner(
             }
         }
     });
-    let sampling = tokio::spawn({
+    tasks.spawn({
         let task = crate::metrics::SamplerTask {
             sampler: sampler.clone(),
             store: app.store.clone(),
@@ -252,26 +282,23 @@ async fn serve_inner(
         };
         let cancellation = cancellation.clone();
         async move {
-            let mut ticker = tokio::time::interval(crate::metrics::INTERVAL);
-            // A tick that arrives late must not start a burst of catch-up
-            // readings: every one of them would measure the same instant.
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tokio::select! {
-                    _ = cancellation.cancelled() => break,
-                    _ = ticker.tick() => task.tick().await,
-                }
-            }
+            // The first reading comes at once, the others one period apart.
+            task.tick().await;
+            every(crate::metrics::INTERVAL, &cancellation, || async {
+                task.tick().await;
+                ControlFlow::Continue(())
+            })
+            .await;
         }
     });
-    let runner_poll = tokio::spawn({
+    tasks.spawn({
         let network_sync = crate::runners::NetworkSync::new(
             app.store.clone(),
             lease.clone(),
             app.plan,
             PortRange {
-                from: i32::from(app.cfg.listen.proxy_port_min),
-                to: i32::from(app.cfg.listen.proxy_port_max),
+                from: app.cfg.listen.proxy_port_min,
+                to: app.cfg.listen.proxy_port_max,
             },
             host.id,
         );
@@ -281,7 +308,7 @@ async fn serve_inner(
             task.run(cancellation.cancelled()).await;
         }
     });
-    let convergence = tokio::spawn({
+    tasks.spawn({
         let store = app.store.clone();
         let plan = app.plan;
         let hypervisor = hypervisor.clone();
@@ -303,11 +330,11 @@ async fn serve_inner(
         .await;
     cancellation.cancel();
     restore.abort();
-    let _ = restore.await;
-    let _ = poller.await;
-    let _ = convergence.await;
-    let _ = sampling.await;
-    let _ = runner_poll.await;
+    log_join("restore", restore.await);
+    // Every task ends on cancellation. A panic is logged, not dropped.
+    while let Some(result) = tasks.join_next().await {
+        log_join("background", result);
+    }
     drop(manager);
     drop(firewall);
     hypervisor.close().await?;
@@ -342,28 +369,25 @@ async fn converge(
     firewall: Arc<Firewall>,
     cancellation: CancellationToken,
 ) {
-    let mut interval = tokio::time::interval(Duration::from_secs(30));
-    interval.tick().await;
-    loop {
-        tokio::select! {
-            () = cancellation.cancelled() => return,
-            _ = interval.tick() => {
-                for user in store.users().await.unwrap_or_default() {
-                    let result = async {
-                        let network = user_network(plan, &user.subnet)?;
-                        NetworkManager::ensure_network(networks.as_ref(), &network.name, &network.xml()?).await?;
-                        Ok::<_, anyhow::Error>(())
-                    }.await;
-                    if let Err(error) = result {
-                        tracing::warn!(user = %user.name, %error, "network convergence");
-                    }
-                }
-                if let Err(error) = firewall.reload().await {
-                    tracing::warn!(%error, "firewall convergence");
-                }
+    every(Duration::from_secs(30), &cancellation, || async {
+        for user in store.users().await.unwrap_or_default() {
+            let result = async {
+                let network = user_network(plan, &user.subnet)?;
+                NetworkManager::ensure_network(networks.as_ref(), &network.name, &network.xml()?)
+                    .await?;
+                Ok::<_, anyhow::Error>(())
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(user = %user.name, %error, "network convergence");
             }
         }
-    }
+        if let Err(error) = firewall.reload().await {
+            tracing::warn!(%error, "firewall convergence");
+        }
+        ControlFlow::Continue(())
+    })
+    .await;
 }
 
 /// The wait before the second discovery attempt, and the ceiling the wait
@@ -443,7 +467,9 @@ async fn control_plane_router(
     .with_pairings(Arc::new(AuthPairings(app.store.clone())))
     .with_instance_domain(&app.cfg.instance_domain)
     .with_instance_names(Arc::new(AuthInstanceNames(app.store.clone())))
-    .with_provider_name(provider_name(&app.cfg.oidc.issuer));
+    .with_provider_name(provider_name(
+        app.cfg.oidc.issuer.as_deref().unwrap_or_default(),
+    ));
     if app.cfg.oidc.allow_signup {
         // Wiring the provisioner is what opens signups: without it a login
         // for an unknown identity is refused (SPEC 13).
@@ -456,18 +482,17 @@ async fn control_plane_router(
     } else {
         tracing::warn!("signups are off; only existing accounts can log in");
     }
-    if app.cfg.oidc.issuer.is_empty() {
-        tracing::warn!("no OIDC issuer configured; dashboard login disabled");
-    }
     let auth = Arc::new(auth);
-    if !app.cfg.oidc.issuer.is_empty() {
+    if let Some(issuer) = &app.cfg.oidc.issuer {
         spawn_oidc_discovery(
             auth.clone(),
-            app.cfg.oidc.issuer.clone(),
+            issuer.clone(),
             app.cfg.oidc.client_id.clone(),
             app.cfg.oidc.client_secret.clone(),
             format!("https://{}/callback", app.cfg.base_domain),
         );
+    } else {
+        tracing::warn!("no OIDC issuer configured; dashboard login disabled");
     }
     let frontend_public = authorized_key_line(frontend_key.public_key(), "bento-frontend")?;
     // This process already holds the frontend key, so the web terminal
@@ -616,6 +641,54 @@ fn auth_response(response: http::Response<String>) -> Response<Body> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn every_runs_each_period_and_stops_on_shutdown() {
+        let shutdown = CancellationToken::new();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task = tokio::spawn({
+            let shutdown = shutdown.clone();
+            let count = count.clone();
+            async move {
+                every(Duration::from_secs(10), &shutdown, || async {
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    ControlFlow::Continue(())
+                })
+                .await;
+            }
+        });
+        tokio::time::sleep(Duration::from_secs(35)).await;
+        assert_eq!(count.load(std::sync::atomic::Ordering::SeqCst), 3);
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn every_stops_when_the_step_breaks() {
+        let shutdown = CancellationToken::new();
+        let mut runs = 0;
+        every(Duration::from_secs(1), &shutdown, || {
+            runs += 1;
+            let flow = if runs == 2 {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            };
+            async move { flow }
+        })
+        .await;
+        assert_eq!(runs, 2);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_task_surfaces_as_a_join_error() {
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async { panic!("boom") });
+        let error = tasks.join_next().await.unwrap().unwrap_err();
+        assert!(error.is_panic());
+        // log_join must accept it without panicking itself.
+        log_join("test", Err(error));
+    }
 
     #[tokio::test]
     async fn startup_refuses_a_lease_held_by_another_process() {

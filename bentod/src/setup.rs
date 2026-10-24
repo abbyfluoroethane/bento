@@ -1,7 +1,7 @@
 //! Shared bootstrap for the subcommands: configuration, logging, the store,
 //! the libvirt connection, and the lifecycle manager.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -29,7 +29,7 @@ impl App {
     /// documented path printed at control-plane startup.
     pub(crate) async fn new(config_path: &Path) -> Result<Self> {
         let cfg = Config::load(config_path)?;
-        let plan = Plan::new(&cfg.private_range)?;
+        let plan = Plan::from_prefix(cfg.private_range)?;
         let store = Store::open(&cfg.db_path)
             .await
             .with_context(|| format!("open database {}", cfg.db_path))?;
@@ -59,7 +59,7 @@ impl App {
     pub(crate) fn image_store(&self) -> Arc<ImageStore> {
         Arc::new(
             ImageStore::new(&self.cfg.image_dir, ImageDb(self.store.clone()))
-                .with_builder_image(&self.cfg.bootc.builder_image)
+                .with_builder_image(self.cfg.bootc.builder_image.as_deref().unwrap_or_default())
                 .with_bootc_rootfs(&self.cfg.bootc.rootfs)
                 .with_container_storage(&self.cfg.bootc.container_storage)
                 .with_build_timeout(self.cfg.bootc.build_timeout.std()),
@@ -84,57 +84,47 @@ impl App {
         host_id: i64,
         runners: Option<crate::runners::InstanceSync>,
     ) -> Result<Arc<Manager>> {
-        let dns = self.dns_addrs()?;
         let images = self.image_store();
         let capacity = host_capacity(&self.cfg)?;
         tracing::info!(
-            memory_mib = capacity.memory_mib,
-            disk_gib = capacity.disk_gib,
+            memory_mib = %capacity.memory_mib,
+            disk_gib = %capacity.disk_gib,
             overcommit_ratio = self.cfg.overcommit_ratio,
             "host capacity: the ceiling on create and resize (SPEC 6.1)"
         );
+        let store = Arc::new(LifecycleStore(
+            self.store.clone(),
+            crate::adapters::LocalCapacity {
+                host_id,
+                capacity,
+                overcommit_ratio: self.cfg.overcommit_ratio,
+            },
+        ));
+        let fleet = Arc::new(crate::adapters::RunnerFleet {
+            store: self.store.clone(),
+            images,
+            seeds: Arc::new(bento_cloudinit::Builder::default()),
+            hypervisor: hypervisor.clone(),
+            storage_dir: PathBuf::from(&self.cfg.storage_dir),
+            host_id,
+            runners,
+        });
         Ok(Arc::new(Manager::new(bento_lifecycle::Config {
-            hypervisor: Some(hypervisor.clone()),
             definer: Some(hypervisor.clone()),
             autostart_clearer: Some(hypervisor.clone()),
-            store: Some(Arc::new(LifecycleStore(
-                self.store.clone(),
-                crate::adapters::LocalCapacity {
-                    host_id,
-                    capacity,
-                    overcommit_ratio: self.cfg.overcommit_ratio,
-                },
-            ))),
             host_id,
-            fleet: Some(Arc::new(crate::adapters::RunnerFleet {
-                store: self.store.clone(),
-                images,
-                seeds: Arc::new(bento_cloudinit::Builder::default()),
-                hypervisor: hypervisor.clone(),
-                storage_dir: PathBuf::from(&self.cfg.storage_dir),
-                host_id,
-                runners,
-            })),
-            iso: Some(Arc::new(bento_cloudinit::Builder::default())),
-            plan: Some(self.plan),
-            storage_dir: PathBuf::from(&self.cfg.storage_dir),
             name_cooldown: self.cfg.cooldown(),
-            batch_size: self.cfg.restore_batch_size as usize,
-            dns,
-            ..Default::default()
+            batch_size: usize::try_from(self.cfg.restore_batch_size)?,
+            dns: self.cfg.dns.clone(),
+            ..bento_lifecycle::Config::new(
+                hypervisor.clone(),
+                store,
+                fleet,
+                Arc::new(bento_cloudinit::Builder::default()),
+                self.plan,
+                PathBuf::from(&self.cfg.storage_dir),
+            )
         })?))
-    }
-
-    fn dns_addrs(&self) -> Result<Vec<IpAddr>> {
-        self.cfg
-            .dns
-            .iter()
-            .map(|value| {
-                value
-                    .parse::<IpAddr>()
-                    .with_context(|| format!("config dns {value:?} is not an IP address"))
-            })
-            .collect()
     }
 }
 
@@ -156,7 +146,7 @@ pub(crate) async fn host_checks(app: &App) -> Result<()> {
             image_dir: PathBuf::from(&app.cfg.image_dir),
             storage_dir: PathBuf::from(&app.cfg.storage_dir),
             container_storage: PathBuf::from(&app.cfg.bootc.container_storage),
-            podman_required: app.cfg.images.iter().any(|image| !image.oci.is_empty()),
+            podman_required: app.cfg.images.iter().any(|image| image.source.is_oci()),
             nested_wanted,
             ..Default::default()
         },
@@ -207,11 +197,7 @@ fn host_capacity(cfg: &Config) -> Result<Capacity> {
 
 /// The arithmetic of [`host_capacity`], apart from the host it reads.
 fn capacity_from(memory_bytes: u64, storage_bytes: u64, overcommit_ratio: f64) -> Capacity {
-    Capacity::from_host(
-        (memory_bytes / MIB) as i64,
-        (storage_bytes / GIB) as i64,
-        overcommit_ratio,
-    )
+    Capacity::from_host(memory_bytes / MIB, storage_bytes / GIB, overcommit_ratio)
 }
 
 /// Extracts the Unix socket from a `qemu:///system` style URI. The default
@@ -230,8 +216,8 @@ pub(crate) fn socket_path(uri: &str) -> PathBuf {
         .unwrap_or_default()
 }
 
-pub(crate) fn default_image(cfg: &Config) -> String {
-    cfg.default_image().unwrap_or_default().to_owned()
+pub(crate) fn default_image(cfg: &Config) -> Option<String> {
+    cfg.default_image().map(str::to_owned)
 }
 
 /// Turns the control-plane listen address into a URL the proxy can dial: an
@@ -315,10 +301,7 @@ mod tests {
         // The default ratio of 1.0 is the host as it is (SPEC 5.3).
         assert_eq!(
             capacity_from(memory, storage, 1.0),
-            Capacity {
-                memory_mib: 65_536,
-                disk_gib: 900,
-            }
+            Capacity::limited(65_536, 900)
         );
 
         // A higher ratio raises memory. Disk is never overcommitted: the
@@ -326,22 +309,16 @@ mod tests {
         // on the host at once.
         assert_eq!(
             capacity_from(memory, storage, 1.5),
-            Capacity {
-                memory_mib: 98_304,
-                disk_gib: 900,
-            }
+            Capacity::limited(98_304, 900)
         );
     }
 
     #[test]
     fn capacity_rounds_down_rather_than_promising_room() {
-        // A volume smaller than one GiB offers no whole GiB, and a
-        // ceiling of zero bounds nothing, so the host check would pass
-        // everything. `host_capacity` is the only caller and it runs on
-        // a real storage volume; this records the edge rather than
-        // claiming it is reachable.
+        // A volume smaller than one GiB offers no whole GiB. The ceiling
+        // is a limit of zero, which refuses every disk. It never reads as
+        // unbounded.
         let capacity = capacity_from(MIB * 3 / 2, GIB / 2, 1.0);
-        assert_eq!(capacity.memory_mib, 1);
-        assert_eq!(capacity.disk_gib, 0);
+        assert_eq!(capacity, Capacity::limited(1, 0));
     }
 }

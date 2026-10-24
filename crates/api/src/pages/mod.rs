@@ -209,11 +209,11 @@ fn escape(text: &str) -> String {
 // Formatting helpers, exposed to templates as filters
 
 /// `1536` → `1.5 GiB`, `512` → `512 MiB`.
-pub(crate) fn mib(value: i64) -> String {
+pub(crate) fn mib(value: u64) -> String {
     if value >= 1024 {
         let gib = value as f64 / 1024.0;
         if (gib - gib.round()).abs() < 0.005 {
-            return format!("{} GiB", gib.round() as i64);
+            return format!("{} GiB", gib.round() as u64);
         }
         return format!("{gib:.1} GiB");
     }
@@ -442,9 +442,9 @@ pub(crate) struct VmView {
     pub(crate) address: String,
     pub(crate) image: String,
     pub(crate) vcpu: u32,
-    pub(crate) memory_mib: i64,
+    pub(crate) memory_mib: u64,
     pub(crate) memory_gib: f64,
-    pub(crate) disk_gib: i64,
+    pub(crate) disk_gib: u64,
     pub(crate) nested: bool,
     pub(crate) ksm: bool,
     pub(crate) http_port: u16,

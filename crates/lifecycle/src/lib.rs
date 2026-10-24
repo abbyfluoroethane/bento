@@ -18,7 +18,7 @@ mod runner;
 
 pub use actions::{ResizeRequest, ResizeResult};
 pub use manager::{
-    Clock, Config, DeleteIso, DeleteIsoFuture, DynError, Fleet, ISOBuilder, IsoExists,
+    Clock, Config, DeleteIso, DeleteIsoFuture, DynError, Fleet, IsoBuilder, IsoExists,
     LifecycleLogger, Manager, NestedProbe, OverlayResizer, ProvisionSpec, RedefineSpec, Result,
     Sleep, Store, UuidMint, random_uuid,
 };
@@ -31,7 +31,8 @@ use thiserror::Error as ThisError;
 /// Errors returned by lifecycle actions.
 #[derive(Debug, ThisError)]
 pub enum Error {
-    /// A required manager dependency was omitted.
+    /// A required manager setting was left empty. The type system covers
+    /// every dependency, so only the storage directory can be missing.
     #[error("lifecycle: config needs {0}")]
     Config(&'static str),
     /// Nested virtualization was requested while the KVM module has it off.
@@ -92,7 +93,7 @@ impl Error {
     pub(crate) fn caused(source: impl Into<DynError>) -> Self {
         let source = source.into();
         Self::Caused {
-            message: source.to_string(),
+            message: "lifecycle: dependency failed".to_owned(),
             source,
         }
     }

@@ -2,7 +2,7 @@ use bento_types::Token;
 use http::HeaderMap;
 use http::header::AUTHORIZATION;
 use sha2::{Digest, Sha256};
-use time::{Duration, OffsetDateTime};
+use time::Duration;
 
 use crate::{Error, Result, Service, random_token, store_error};
 
@@ -10,12 +10,11 @@ use crate::{Error, Result, Service, random_token, store_error};
 /// recognizable in logs and secret scanners.
 pub const TOKEN_PREFIX: &str = "bento_";
 
-/// The result of a token-store lookup. An expired row travels with the
-/// outcome because the auth service enforces expiry against its own clock.
+/// The result of a token-store lookup. The store returns the row whatever
+/// its expiry; the auth service enforces expiry against its own clock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TokenLookup {
     Found(Token),
-    Expired(Token),
     NotFound,
 }
 
@@ -44,11 +43,7 @@ impl Service {
     /// expire.
     pub async fn mint_token(&self, user_id: i64, ttl: Duration) -> Result<(String, Token)> {
         let plaintext = format!("{TOKEN_PREFIX}{}", random_token());
-        let expires_at = if ttl.is_positive() {
-            (self.now)() + ttl
-        } else {
-            OffsetDateTime::UNIX_EPOCH
-        };
+        let expires_at = ttl.is_positive().then(|| (self.now)() + ttl);
         let token = self
             .tokens
             .create_token(user_id, &hash_token(&plaintext), expires_at)
@@ -59,7 +54,8 @@ impl Service {
 
     /// Checks a plaintext bearer token and returns its row. Returns
     /// [`Error::Unauthenticated`] for an unknown token and
-    /// [`Error::TokenExpired`] for a known token past its expiry.
+    /// [`Error::TokenExpired`] for a known token past its expiry. A token
+    /// with no expiry stays valid.
     pub async fn authenticate_token(&self, plaintext: &str) -> Result<Token> {
         if plaintext.is_empty() {
             return Err(Error::Unauthenticated);
@@ -70,12 +66,10 @@ impl Service {
             .await
             .map_err(|error| store_error("token lookup", error))?;
         let token = match lookup {
-            TokenLookup::Found(token) | TokenLookup::Expired(token) => token,
+            TokenLookup::Found(token) => token,
             TokenLookup::NotFound => return Err(Error::Unauthenticated),
         };
-        // UNIX_EPOCH is the persistent zero-time sentinel for a token
-        // that never expires.
-        if token.expires_at != OffsetDateTime::UNIX_EPOCH && token.expires_at <= (self.now)() {
+        if token.expires_at.is_some_and(|at| at <= (self.now)()) {
             return Err(Error::TokenExpired);
         }
         Ok(token)
@@ -106,7 +100,7 @@ mod tests {
         let (plaintext, token) = service.mint_token(7, Duration::HOUR).await.unwrap();
         assert!(plaintext.starts_with(TOKEN_PREFIX));
         assert_eq!(token.user_id, 7);
-        assert_eq!(token.expires_at, TEST_EPOCH + Duration::HOUR);
+        assert_eq!(token.expires_at, Some(TEST_EPOCH + Duration::HOUR));
         let created = tokens.created();
         assert_eq!(created.len(), 1);
         assert_ne!(created[0].hash, plaintext);
@@ -158,12 +152,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_expiry_is_rechecked_against_the_auth_clock() {
+    async fn a_token_without_expiry_has_none_and_stays_valid() {
         let clock = FakeClock::new(TEST_EPOCH);
-        let (service, _, _, tokens) = new_test_service(&clock);
-        let (plaintext, token) = service.mint_token(7, Duration::HOUR).await.unwrap();
-        tokens.report_expired(token.id);
+        let (service, _, _, _) = new_test_service(&clock);
+        let (plaintext, token) = service.mint_token(7, Duration::ZERO).await.unwrap();
+        assert_eq!(token.expires_at, None);
+        clock.advance(Duration::hours(100_000));
         assert_eq!(service.authenticate_token(&plaintext).await.unwrap(), token);
+    }
+
+    #[tokio::test]
+    async fn a_token_is_rejected_from_its_expiry_instant() {
+        let clock = FakeClock::new(TEST_EPOCH);
+        let (service, _, _, _) = new_test_service(&clock);
+        let (plaintext, _) = service.mint_token(7, Duration::HOUR).await.unwrap();
+        clock.advance(Duration::HOUR - Duration::SECOND);
+        assert!(service.authenticate_token(&plaintext).await.is_ok());
+        clock.advance(Duration::SECOND);
+        assert!(matches!(
+            service.authenticate_token(&plaintext).await,
+            Err(Error::TokenExpired)
+        ));
     }
 
     #[tokio::test]

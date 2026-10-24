@@ -22,13 +22,13 @@ pub enum Error {
     DomainNotFound(String),
     #[error("hypervisor: domain already exists: {0}")]
     DomainExists(String),
-    #[error("{operation}: {source}")]
+    #[error("{operation}")]
     Libvirt {
         operation: String,
         #[source]
         source: LibvirtError,
     },
-    #[error("{operation}: {source}")]
+    #[error("{operation}")]
     Io {
         operation: String,
         #[source]

@@ -245,7 +245,6 @@ struct FakeTokenState {
     next_id: i64,
     by_hash: HashMap<String, Token>,
     created: Vec<Token>,
-    reported_expired: HashSet<i64>,
 }
 
 impl FakeTokenStore {
@@ -258,10 +257,6 @@ impl FakeTokenStore {
     pub(crate) fn created(&self) -> Vec<Token> {
         self.state.lock().unwrap().created.clone()
     }
-
-    pub(crate) fn report_expired(&self, id: i64) {
-        self.state.lock().unwrap().reported_expired.insert(id);
-    }
 }
 
 #[async_trait]
@@ -270,7 +265,7 @@ impl TokenStore for FakeTokenStore {
         &self,
         user_id: i64,
         hash: &str,
-        expires_at: OffsetDateTime,
+        expires_at: Option<OffsetDateTime>,
     ) -> std::result::Result<Token, BoxError> {
         let mut state = self.state.lock().unwrap();
         state.next_id += 1;
@@ -287,14 +282,10 @@ impl TokenStore for FakeTokenStore {
 
     async fn token_by_hash(&self, hash: &str) -> std::result::Result<TokenLookup, BoxError> {
         let state = self.state.lock().unwrap();
-        let Some(token) = state.by_hash.get(hash).cloned() else {
-            return Ok(TokenLookup::NotFound);
-        };
-        if state.reported_expired.contains(&token.id) {
-            Ok(TokenLookup::Expired(token))
-        } else {
-            Ok(TokenLookup::Found(token))
-        }
+        Ok(match state.by_hash.get(hash).cloned() {
+            Some(token) => TokenLookup::Found(token),
+            None => TokenLookup::NotFound,
+        })
     }
 
     async fn delete_token(&self, id: i64) -> std::result::Result<(), BoxError> {

@@ -122,9 +122,9 @@ impl OverlayResizer for QemuImgResizer {
     async fn resize_overlay(
         &self,
         overlay_path: &Path,
-        disk_gib: i64,
+        disk_gib: u64,
     ) -> std::result::Result<(), DynError> {
-        if disk_gib <= 0 {
+        if disk_gib == 0 {
             return Err(format!(
                 "lifecycle: resize overlay {}: disk size {disk_gib} GiB is not positive",
                 overlay_path.display()
@@ -140,7 +140,8 @@ impl OverlayResizer for QemuImgResizer {
             return Err(format!(
                 "lifecycle: qemu-img resize {} to {disk_gib} GiB: {error}: {}",
                 overlay_path.display(),
-                String::from_utf8_lossy(error.output())
+                String::from_utf8_lossy(error.output()),
+                error = bento_types::error_chain(&error)
             )
             .into());
         }

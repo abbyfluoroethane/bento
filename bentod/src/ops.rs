@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use bento_config::ImageSource;
 use bento_types::{Image, ImageKind};
 use time::macros::format_description;
 use tokio::sync::watch;
@@ -22,15 +23,10 @@ pub(crate) async fn sync_image_allowlist(app: &App) -> Result<()> {
         app.store
             .upsert_image(Image {
                 name: image.name.clone(),
-                url: if image.oci.is_empty() {
-                    image.url.clone()
-                } else {
-                    image.oci.clone()
-                },
-                kind: if image.oci.is_empty() {
-                    ImageKind::Qcow2
-                } else {
-                    ImageKind::Oci
+                url: image.source.reference().to_owned(),
+                kind: match image.source {
+                    ImageSource::Url(_) => ImageKind::Qcow2,
+                    ImageSource::Oci(_) => ImageKind::Oci,
                 },
                 pinned_checksum: image.pinned_checksum.clone(),
                 current_checksum: None,
@@ -368,7 +364,7 @@ async fn slots_inner(app: &App, args: &[OsString]) -> Result<()> {
             let [slot, machine] = rest else {
                 anyhow::bail!("usage: bentod slots give <slot> <machine>");
             };
-            let slot: i64 = slot
+            let slot: u64 = slot
                 .parse()
                 .map_err(|_| anyhow::anyhow!("{slot:?} is not a slot number"))?;
             give_slot(app, slot, machine).await
@@ -434,8 +430,8 @@ async fn show_plan(app: &App, machine: Option<&str>) -> Result<()> {
     };
 
     let high_ports = bento_network::PortRange {
-        from: i32::from(app.cfg.listen.proxy_port_min),
-        to: i32::from(app.cfg.listen.proxy_port_max),
+        from: app.cfg.listen.proxy_port_min,
+        to: app.cfg.listen.proxy_port_max,
     };
     let network =
         crate::netstate::machine_network(&app.store, app.plan, high_ports, target.id, here.id)
@@ -509,7 +505,7 @@ async fn set_prefix(app: &App, prefix: u8) -> Result<()> {
     Ok(())
 }
 
-async fn give_slot(app: &App, slot: i64, machine: &str) -> Result<()> {
+async fn give_slot(app: &App, slot: u64, machine: &str) -> Result<()> {
     let host = app
         .store
         .hosts()

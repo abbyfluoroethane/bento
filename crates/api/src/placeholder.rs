@@ -14,9 +14,9 @@ use async_trait::async_trait;
 use crate::{BoxError, HostMetrics, InstanceMetrics, Metrics, Point, UserMetrics};
 
 /// Placeholder host sizes. A small home server.
-const HOST_MEMORY_MIB: i64 = 16 * 1024;
-const HOST_STORAGE_GIB: i64 = 128;
-const HOST_CPUS: i64 = 8;
+const HOST_MEMORY_MIB: u64 = 16 * 1024;
+const HOST_STORAGE_GIB: u64 = 128;
+const HOST_CPUS: u64 = 8;
 /// Spacing between generated samples.
 const STEP_SECONDS: i64 = 30;
 
@@ -95,7 +95,7 @@ impl Metrics for PlaceholderMetrics {
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         Ok(UserMetrics {
             cpu_pct: signal(seed, now, 2.0, 60.0),
-            memory_used_mib: signal(seed ^ 0xa5a5, now, 500.0, 9_000.0) as i64,
+            memory_used_mib: signal(seed ^ 0xa5a5, now, 500.0, 9_000.0) as u64,
             storage_used_gib: signal(seed ^ 0x5a5a, now, 4.0, 40.0),
             placeholder: true,
         })
