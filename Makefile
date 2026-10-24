@@ -6,7 +6,7 @@ CARGO ?= cargo
 # miss in a tree that had one for a long time.
 BINARIES = bentod bento-monitor
 
-.PHONY: build monitor test unit e2e clippy fmt check clean
+.PHONY: build monitor test unit e2e clippy fmt fmt-check check clean
 
 build:
 	$(CARGO) build --release
@@ -39,7 +39,12 @@ clippy:
 fmt:
 	$(CARGO) fmt --all
 
-check: clippy test
+# Fails on unformatted code instead of rewriting it, matching CI. Run
+# `make fmt` to fix what it reports.
+fmt-check:
+	$(CARGO) fmt --all --check
+
+check: fmt-check clippy test
 
 clean:
 	$(CARGO) clean
