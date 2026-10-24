@@ -12,9 +12,23 @@ table inet bento {
 		oifname "bento2" ip daddr 10.77.2.2 tcp dport { 22, 3000 } accept
 		oifname "bento2" drop
 	}
+	chain input {
+		type filter hook input priority filter; policy accept;
+		ct state established,related accept
+		# rule 8: a guest cannot reach the host's own addresses
+		iifname "bento1" icmp type { echo-request, destination-unreachable, time-exceeded } accept
+		iifname "bento1" tcp dport { 80, 443 } accept
+		iifname "bento1" drop
+		iifname "bento2" icmp type { echo-request, destination-unreachable, time-exceeded } accept
+		iifname "bento2" tcp dport { 80, 443 } accept
+		iifname "bento2" drop
+	}
 	chain forward {
 		type filter hook forward priority filter; policy drop;
 		ct state established,related accept
+		# rule 9: a guest uses only its own source address
+		iifname "bento1" ip saddr != 10.77.1.0/24 drop
+		iifname "bento2" ip saddr != 10.77.2.0/24 drop
 		# rule 3: drop traffic between the bridges of two different users
 		iifname "bento1" oifname "bento2" drop
 		iifname "bento2" oifname "bento1" drop
@@ -22,8 +36,8 @@ table inet bento {
 		iifname "bento1" oifname "bento1" accept
 		iifname "bento2" oifname "bento2" accept
 		# rule 2: permit instance egress to the internet
-		iifname "bento1" accept
-		iifname "bento2" accept
+		iifname "bento1" ip daddr != 10.77.0.0/16 accept
+		iifname "bento2" ip daddr != 10.77.0.0/16 accept
 	}
 	chain postrouting {
 		type nat hook postrouting priority srcnat; policy accept;

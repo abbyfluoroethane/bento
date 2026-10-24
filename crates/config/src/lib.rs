@@ -230,7 +230,7 @@ impl RunnerEntry {
 /// Extracts the host part of `http://10.0.0.97:10443`. It does not parse
 /// a full URL: the endpoint is operator-written and only ever names a
 /// scheme, a host, and a port.
-fn endpoint_host(endpoint: &str) -> Option<&str> {
+pub fn endpoint_host(endpoint: &str) -> Option<&str> {
     let rest = endpoint
         .split_once("://")
         .map(|(_, rest)| rest)

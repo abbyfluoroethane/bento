@@ -47,6 +47,11 @@ pub struct MachineNetwork {
     /// Frontend addresses on other machines that may reach an instance
     /// here. Empty on the machine that runs the frontend itself.
     pub frontends: Vec<Ipv4Addr>,
+    /// Addresses a guest must never reach: every machine's endpoint and
+    /// underlay address (MULTI-NODE 11.1). An older description without
+    /// the field deserializes empty.
+    #[serde(default)]
+    pub management: Vec<Ipv4Addr>,
 }
 
 /// One user's network as one machine sees it.
@@ -160,6 +165,9 @@ impl MachineNetwork {
             // exactly when this machine holds a route to a remote slot.
             underlay_peers: !self.remote_slots.is_empty(),
             frontends: self.frontends.clone(),
+            runner_prefix: self.runner_prefix,
+            remote_slots: self.remote_slots.iter().map(|remote| remote.slot).collect(),
+            management: self.management.clone(),
         })
     }
 
@@ -259,6 +267,7 @@ mod tests {
                 next_hop: Ipv4Addr::new(10, 0, 0, 97),
             }],
             frontends: Vec::new(),
+            management: Vec::new(),
         }
     }
 
