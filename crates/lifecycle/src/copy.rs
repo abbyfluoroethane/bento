@@ -39,6 +39,20 @@ impl Manager {
         if request.nested {
             self.check_nested()?;
         }
+        // A copy stays on its source's machine, because copying an
+        // overlay is a file copy there (MULTI-NODE 13.3). The runner has
+        // no operation for it, so a source on a runner is refused rather
+        // than copied and resized through this machine's paths. A
+        // placement on a different machine is refused for the same
+        // reason: it is a transfer, which is the slot-move workflow of
+        // section 17. This check comes first, because every later step
+        // asks this machine's libvirt and disk.
+        if source.host_id != self.host_id || request.host_id != source.host_id {
+            return Err(Error::CopyAcrossMachines(format!(
+                "{} runs on machine {}, and the copy is for machine {}",
+                source.name, source.host_id, request.host_id
+            )));
+        }
         match self.hyp.state(&source.name).await {
             Ok(State::Stopped) | Err(HypervisorError::DomainNotFound(_)) => {}
             Ok(state) => {
@@ -53,17 +67,6 @@ impl Manager {
                     source.name
                 )));
             }
-        }
-        // A copy stays on its source's machine, because copying an
-        // overlay is a local file copy (MULTI-NODE 13.3). Copying one
-        // between machines is a transfer with its own verification, which
-        // is the slot-move workflow of section 17 and not this.
-        if source.host_id != self.host_id {
-            return Err(Error::operation(format!(
-                "lifecycle: cp {}: it runs on another machine, and copying \
-                 between machines is not implemented",
-                source.name
-            )));
         }
         let subnet = parse_prefix(&request.owner.subnet).map_err(|error| {
             Error::operation(format!(

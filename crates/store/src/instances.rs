@@ -144,6 +144,25 @@ impl Store {
         .await
     }
 
+    /// Runs the capacity check of [`Store::resize`] and writes nothing.
+    /// A disk resize cannot be undone, so the caller asks here before it
+    /// grows a file, and writes the row only after the file has grown
+    /// (SPEC 6.1, 11.1).
+    pub async fn check_resize(
+        &self,
+        uuid: impl Into<String>,
+        memory_mib: i64,
+        disk_gib: i64,
+        capacity: Capacity,
+    ) -> Result<()> {
+        let uuid = uuid.into();
+        self.with_tx(move |tx| {
+            let existing = get_instance_tx(tx, "uuid", &uuid)?;
+            check_capacity_tx(tx, existing.host_id, &uuid, memory_mib, disk_gib, capacity)
+        })
+        .await
+    }
+
     /// Returns one instance by UUID, its identifier (SPEC 7.2).
     pub async fn instance(&self, uuid: impl Into<String>) -> Result<Instance> {
         self.get_instance("uuid", uuid.into()).await

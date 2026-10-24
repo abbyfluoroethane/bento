@@ -36,6 +36,8 @@ struct LocalHost {
     overlays: Arc<bento_images::Store>,
     /// Writes the cloud-init seed image (SPEC 5.2).
     seeds: Arc<bento_cloudinit::Builder>,
+    /// Grows an overlay with `qemu-img` (SPEC 11.1).
+    resizer: Arc<dyn bento_lifecycle::OverlayResizer>,
 }
 
 impl LocalHost {
@@ -474,6 +476,16 @@ impl Host for LocalHost {
         );
         self.observed(&request.instance).await
     }
+
+    async fn resize_disk(&self, instance: &InstanceRef, disk_gib: i64) -> Result<State, HostError> {
+        // The overlay is a file on this machine, so the grow runs here
+        // and not on the controller (SPEC 11.1, MULTI-NODE 11.5).
+        self.resizer
+            .resize_overlay(&self.overlay_path(&instance.uuid), disk_gib)
+            .await
+            .map_err(|error| HostError::new(format!("resize disk {}: {error}", instance.uuid)))?;
+        self.observed(instance).await
+    }
 }
 
 impl LocalHost {
@@ -657,6 +669,7 @@ async fn runner_inner(app: &App) -> Result<()> {
         image_dir: PathBuf::from(&app.cfg.image_dir),
         overlays: Arc::new(bento_images::Store::for_overlays(&app.cfg.image_dir)),
         seeds: Arc::new(bento_cloudinit::Builder::default()),
+        resizer: Arc::new(bento_lifecycle::QemuImgResizer::default()),
         firewall: Arc::new(bento_network::NftApplier::default()),
         routes: Arc::new(bento_network::IpRouteApplier {
             path: String::new(),

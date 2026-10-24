@@ -55,6 +55,11 @@ pub enum Error {
     /// Copying a live overlay could produce a torn disk image (SPEC 15).
     #[error("lifecycle: the cp source must be stopped: {0}")]
     CopySourceRunning(String),
+    /// A copy stays on the machine of its source. Moving an overlay
+    /// between machines needs a runner transfer that does not exist yet
+    /// (MULTI-NODE 13.3).
+    #[error("lifecycle: cp cannot copy between machines: {0}")]
+    CopyAcrossMachines(String),
     /// A domain name can only be changed while it is stopped (SPEC 7.3).
     #[error("lifecycle: stop the instance before renaming it: {0}")]
     RenameNeedsStop(String),

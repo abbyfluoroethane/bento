@@ -487,6 +487,18 @@ impl InstanceSync {
         }
     }
 
+    /// Grows the overlay of an instance on its own machine (SPEC 11.1,
+    /// MULTI-NODE 11.5).
+    pub(crate) async fn resize_disk(
+        &self,
+        host: &Host,
+        instance: bento_runner::InstanceRef,
+        disk_gib: i64,
+    ) -> Result<bento_types::State> {
+        self.change(host, Operation::ResizeDisk { instance, disk_gib })
+            .await
+    }
+
     /// Sends a read, which needs no object and records no generation.
     pub(crate) async fn read(&self, host: &Host, op: Operation) -> Result<Reply> {
         let endpoint = host
@@ -517,7 +529,8 @@ impl InstanceSync {
             Operation::StartInstance { instance }
             | Operation::StopInstance { instance }
             | Operation::RebootInstance { instance }
-            | Operation::RemoveInstance { instance } => instance.uuid.clone(),
+            | Operation::RemoveInstance { instance }
+            | Operation::ResizeDisk { instance, .. } => instance.uuid.clone(),
             other => anyhow::bail!("{other:?} is not an instance change"),
         };
         let current = self.lease.lease().await?;

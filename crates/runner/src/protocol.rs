@@ -161,6 +161,13 @@ pub enum Operation {
     RedefineInstance {
         redefine: Box<RedefineRequest>,
     },
+    /// Grow the overlay of an instance to `disk_gib` (SPEC 11.1). The
+    /// overlay is a file on the machine that runs the instance, so only
+    /// that machine can grow it (MULTI-NODE 11.5).
+    ResizeDisk {
+        instance: InstanceRef,
+        disk_gib: i64,
+    },
 }
 
 /// The facts a machine needs to define an existing instance again.
@@ -270,7 +277,8 @@ impl Operation {
             | Operation::StopInstance { .. }
             | Operation::RebootInstance { .. }
             | Operation::RemoveInstance { .. }
-            | Operation::RedefineInstance { .. } => true,
+            | Operation::RedefineInstance { .. }
+            | Operation::ResizeDisk { .. } => true,
         }
     }
 }

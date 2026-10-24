@@ -239,14 +239,33 @@ impl bento_lifecycle::Store for LifecycleStore {
         // same overcommit ratio applies, because it is a deployment
         // setting rather than a property of one machine.
         let seen = self.0.host_observation(host_id).await?;
+        // A zero in `Capacity` means "no ceiling", so a machine that has
+        // not reported a figure must be refused here and never read as
+        // zero: that would let a create or resize past the machine
+        // (SPEC 6.1, MULTI-NODE 12). 503 tells the client to retry once
+        // the runner reports.
+        let unavailable = |reason: String| -> LifecycleError {
+            Box::new(bento_api::StatusError::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                reason,
+            ))
+        };
         let Some(seen) = seen else {
-            return Err(Box::new(SimpleError(format!(
+            return Err(unavailable(format!(
                 "machine {host_id} has not reported its capacity yet"
-            ))));
+            )));
+        };
+        let (Some(memory_mib), Some(disk_gib)) = (
+            seen.memory_total_mib.filter(|figure| *figure > 0),
+            seen.storage_total_gib.filter(|figure| *figure > 0),
+        ) else {
+            return Err(unavailable(format!(
+                "machine {host_id} reported no memory or storage figure, so its capacity is unknown"
+            )));
         };
         Ok(Capacity::from_host(
-            seen.memory_total_mib.unwrap_or(0),
-            seen.storage_total_gib.unwrap_or(0),
+            memory_mib,
+            disk_gib,
             self.1.overcommit_ratio,
         ))
     }
@@ -292,6 +311,18 @@ impl bento_lifecycle::Store for LifecycleStore {
         cooldown: Duration,
     ) -> Result<(), LifecycleError> {
         Ok(self.0.rename_instance(uuid, new_name, cooldown).await?)
+    }
+    async fn check_resize(
+        &self,
+        uuid: &str,
+        memory_mib: i64,
+        disk_gib: i64,
+        capacity: Capacity,
+    ) -> Result<(), LifecycleError> {
+        Ok(self
+            .0
+            .check_resize(uuid, memory_mib, disk_gib, capacity)
+            .await?)
     }
     async fn resize(
         &self,
@@ -520,6 +551,45 @@ impl bento_lifecycle::Fleet for RunnerFleet {
             .map_err(|error| Box::new(SimpleError(error.to_string())) as LifecycleError)
     }
 
+    async fn resize_disk(
+        &self,
+        host_id: i64,
+        instance: &bento_types::Instance,
+        disk_gib: i64,
+    ) -> Result<(), LifecycleError> {
+        if host_id == self.host_id {
+            // The manager grows this machine's overlays with its local
+            // resizer and sends only other machines here.
+            return Err(Box::new(SimpleError(
+                "this machine resizes its own disks locally, not through the fleet".to_owned(),
+            )));
+        }
+        let runners = self.runners.as_ref().ok_or_else(|| {
+            Box::new(SimpleError(
+                "this deployment has no runner endpoints, so it cannot resize a \
+                 disk on another machine"
+                    .to_owned(),
+            )) as LifecycleError
+        })?;
+        let host = self
+            .store
+            .host(host_id)
+            .await
+            .map_err(|error| Box::new(SimpleError(error.to_string())) as LifecycleError)?;
+        runners
+            .resize_disk(
+                &host,
+                bento_runner::InstanceRef {
+                    uuid: instance.uuid.clone(),
+                    name: instance.name.clone(),
+                },
+                disk_gib,
+            )
+            .await
+            .map(|_| ())
+            .map_err(|error| Box::new(SimpleError(error.to_string())) as LifecycleError)
+    }
+
     async fn deprovision(
         &self,
         host_id: i64,
@@ -745,6 +815,7 @@ pub(crate) fn api_lifecycle_error(error: bento_lifecycle::Error) -> ApiError {
         E::FleetImageNotReady { .. }
         | E::RenameNeedsStop(_)
         | E::CopySourceRunning(_)
+        | E::CopyAcrossMachines(_)
         | E::NestedUnavailable(_)
         | E::NoImageVersion(_) => Some(StatusCode::CONFLICT),
         E::DiskShrink(_) => Some(StatusCode::BAD_REQUEST),
@@ -1173,12 +1244,15 @@ impl bento_proxy::SessionChecker for RemoteSession {
 
 // ---- SSH frontend ----
 
-pub(crate) struct Starter(pub(crate) Arc<dyn Hypervisor>);
+/// Starts through the lifecycle manager, which routes by host: the
+/// domain of an instance on a runner is not on this machine's libvirt
+/// (MULTI-NODE 11.5). It keeps the desired state (SPEC 10 step 7).
+pub(crate) struct Starter(pub(crate) Arc<bento_lifecycle::Manager>);
 
 #[async_trait]
 impl bento_sshfront::Starter for Starter {
     async fn start_instance(&self, instance: Instance) -> Result<(), SshError> {
-        Ok(self.0.start(&instance.name).await?)
+        Ok(self.0.start_for_connection(&instance.uuid).await?)
     }
 }
 

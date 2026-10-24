@@ -753,6 +753,15 @@ A rename and a resize of an instance on a runner use redefine. The runner
 renders the new XML with its own paths. For a rename, it undefines the old
 name first and refuses a running domain.
 
+A disk resize of an instance on a runner is the resize overlay operation.
+The runner grows its own overlay. The controller never runs `qemu-img` for
+a disk on another machine, and it writes the new size to the instance row
+only after the runner reports success.
+
+A runner whose report lacks a memory or storage figure has an unknown
+capacity. The controller refuses to place or resize an instance there until
+the runner reports both figures.
+
 Protocol compatibility is negotiated. A controller does not schedule onto a
 runner whose protocol version or capabilities cannot satisfy the request.
 
@@ -890,6 +899,14 @@ operation holds the image-store lock.
 The first multi-node release keeps `cp` on the source runner unless the user or
 placement policy explicitly requests a destination. A same-runner copy remains
 a local stopped-overlay copy.
+
+The runner protocol has no copy operation yet, so the controller refuses
+a `cp` whose source is on a runner, and a `cp` placed on a machine other than
+its source's. The refusal answers 409 and changes nothing: the controller never
+copies or resizes an overlay through its own paths for an instance that lives on
+another machine. Same-runner copy needs a runner operation that copies the
+overlay, grows it, builds the seed, and defines the domain, in the way
+`ResizeDisk` and `RedefineInstance` act (section 11.5).
 
 A cross-runner copy requires the source to be stopped, streams a consistent
 overlay to the destination, verifies its digest and virtual size, builds a new

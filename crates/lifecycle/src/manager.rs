@@ -88,6 +88,16 @@ pub trait Store: Send + Sync {
         new_name: &str,
         cooldown: Duration,
     ) -> std::result::Result<(), DynError>;
+    /// Runs the capacity check of [`Store::resize`] and writes nothing.
+    /// The disk grows between the two calls, and a grown disk cannot
+    /// shrink again, so the check comes first (SPEC 11.1).
+    async fn check_resize(
+        &self,
+        uuid: &str,
+        memory_mib: i64,
+        disk_gib: i64,
+        capacity: Capacity,
+    ) -> std::result::Result<(), DynError>;
     /// Reruns the capacity check with this instance's current figures
     /// excluded from the host sums.
     async fn resize(
@@ -157,6 +167,15 @@ pub trait Fleet: Send + Sync {
     /// machine that `remove` also deletes the disk. Returns the state the
     /// machine observed afterwards.
     async fn redefine(&self, spec: &RedefineSpec) -> std::result::Result<State, DynError>;
+    /// Grows the overlay of an instance on the machine that runs it
+    /// (MULTI-NODE 11.5). The overlay is a file on that machine, so the
+    /// controller must not run `qemu-img` for it.
+    async fn resize_disk(
+        &self,
+        host_id: i64,
+        instance: &Instance,
+        disk_gib: i64,
+    ) -> std::result::Result<(), DynError>;
 }
 
 /// What one machine needs to define one existing instance again.
