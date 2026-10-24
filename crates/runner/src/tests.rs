@@ -64,6 +64,7 @@ impl Host for FakeHost {
             machine_id: MACHINE.into(),
             hostname: "tsukasa.example.org".into(),
             accepted_epoch: 0,
+            boot_id: "boot-1".into(),
         })
     }
     async fn capabilities(&self) -> Result<Capabilities, HostError> {

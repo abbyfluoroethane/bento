@@ -101,6 +101,7 @@ impl Host for LocalHost {
             machine_id: self.machine_id.clone(),
             hostname: self.hostname.clone(),
             accepted_epoch,
+            boot_id: bento_hostinfo::read_boot_id(),
         })
     }
 

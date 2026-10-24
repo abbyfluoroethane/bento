@@ -81,6 +81,7 @@ mod tests {
                 machine_id: "167eeb6836c44115aa084e7780e4328c".into(),
                 hostname: "runner-a.example.org".into(),
                 accepted_epoch: 0,
+                boot_id: "boot-1".into(),
             })
         }
 

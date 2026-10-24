@@ -42,13 +42,22 @@ impl Store {
         .await
     }
 
-    /// Persists the runner prefix (MULTI-NODE 19).
+    /// Persists the runner prefix (MULTI-NODE 19) and re-expresses the
+    /// slots in the new numbering (MULTI-NODE 17.1).
     ///
     /// Setup calls this once. A later change is the whole workflow of
-    /// section 17, so the one thing refused here is a prefix that would
-    /// leave an existing slot with no number: dropping from `/26` to
-    /// `/25` while slot 3 is owned would strand slot 3 and the addresses
-    /// it supplied.
+    /// section 17. A prefix that would leave an existing slot with no
+    /// number is refused: dropping from `/26` to `/25` while slot 3 is
+    /// owned would strand slot 3 and the addresses it supplied.
+    ///
+    /// Slot numbers mean different address ranges under different
+    /// prefixes, so changing the prefix without renumbering would leave
+    /// each row and each `instances.slot` naming the wrong range.
+    /// Subdivision splits every old slot into children that keep the old
+    /// owner, and each instance moves to the child whose prefix holds its
+    /// address, which does not change. A merge is allowed only when the
+    /// merged slots already share one owner and state, because Bento
+    /// never gives one prefix two owners (MULTI-NODE 17.2).
     pub async fn set_runner_prefix(&self, prefix: u8) -> Result<Deployment> {
         if !(24..=27).contains(&prefix) {
             return Err(Error::RunnerPrefix(prefix));
@@ -57,6 +66,11 @@ impl Store {
             let deployment = Deployment {
                 runner_prefix: prefix,
             };
+            let old: i64 = tx.query_row(
+                "SELECT runner_prefix FROM deployment WHERE id = 1",
+                [],
+                |row| row.get(0),
+            )?;
             let highest: Option<i64> =
                 tx.query_row("SELECT MAX(slot) FROM runner_slots", [], |row| row.get(0))?;
             if let Some(highest) = highest
@@ -66,6 +80,9 @@ impl Store {
                     prefix,
                     slot: highest,
                 });
+            }
+            if old != i64::from(prefix) {
+                renumber_slots(tx, old as u8, prefix)?;
             }
             tx.execute(
                 "UPDATE deployment SET runner_prefix = ? WHERE id = 1",
@@ -316,12 +333,25 @@ impl Store {
 
             // Refuse a claim that would take the slot away from a host
             // whose instances still hold addresses in it. Section 17 is
-            // the way to move a slot that is in use.
-            let occupied: i64 = tx.query_row(
-                "SELECT COUNT(*) FROM instances WHERE slot = ? AND host_id <> ?",
-                params![slot, host_id],
-                |row| row.get(0),
-            )?;
+            // the way to move a slot that is in use. The address decides,
+            // not the stored slot number, so a stale number cannot hide a
+            // live guest (MULTI-NODE 7.1).
+            let shift = 8 - (prefix as u32 - 24);
+            // An instance with no slot holds no range yet (`bentod reconcile`
+            // places it), so it does not count.
+            let mut statement =
+                tx.prepare("SELECT address, host_id FROM instances WHERE slot IS NOT NULL")?;
+            let occupied = statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .filter(|(address, owner)| {
+                    *owner != host_id && slot_of_address(address, shift) == Some(slot)
+                })
+                .count() as i64;
+            drop(statement);
             if occupied > 0 {
                 return Err(Error::SlotInUse { slot, occupied });
             }
@@ -541,6 +571,103 @@ fn bare_checksum(checksum: &str) -> String {
         .to_ascii_lowercase()
 }
 
+/// The slot whose prefix holds an address, from its host octet
+/// (MULTI-NODE 7.1). `shift` is how far the octet moves right.
+fn slot_of_address(address: &str, shift: u32) -> Option<i64> {
+    let octet: u32 = address.rsplit('.').next()?.parse().ok()?;
+    (octet <= 255).then(|| i64::from(octet >> shift))
+}
+
+#[derive(Clone)]
+struct SlotRow {
+    slot: i64,
+    state: String,
+    owner: i64,
+    epoch: i64,
+    source: Option<i64>,
+    destination: Option<i64>,
+    operation: Option<String>,
+}
+
+/// Rewrites slot rows and instance slot numbers from one prefix to
+/// another (MULTI-NODE 17.1, 17.2). Runs inside the caller's transaction.
+fn renumber_slots(tx: &Transaction<'_>, old: u8, new: u8) -> Result<()> {
+    let rows: Vec<SlotRow> = {
+        let mut statement = tx.prepare(&format!(
+            "SELECT {SLOT_COLUMNS} FROM runner_slots ORDER BY slot"
+        ))?;
+        statement
+            .query_map([], |row| {
+                Ok(SlotRow {
+                    slot: row.get(0)?,
+                    state: row.get(1)?,
+                    owner: row.get(2)?,
+                    epoch: row.get(3)?,
+                    source: row.get(4)?,
+                    destination: row.get(5)?,
+                    operation: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<_>>()?
+    };
+
+    let mut next: Vec<SlotRow> = Vec::new();
+    for row in rows {
+        let children: Vec<i64> = if new > old {
+            let ratio = 1i64 << (new - old);
+            (0..ratio).map(|k| row.slot * ratio + k).collect()
+        } else {
+            vec![row.slot >> (old - new)]
+        };
+        for slot in children {
+            match next.iter().find(|existing| existing.slot == slot) {
+                None => next.push(SlotRow {
+                    slot,
+                    ..row.clone()
+                }),
+                Some(existing) if existing.owner == row.owner && existing.state == row.state => {}
+                Some(_) => return Err(Error::RunnerPrefixSplitsOwners { prefix: new, slot }),
+            }
+        }
+    }
+
+    // Unlink first: the foreign key forbids deleting a referenced row,
+    // and old and new numbers overlap.
+    tx.execute("UPDATE instances SET slot = NULL", [])?;
+    tx.execute("DELETE FROM runner_slots", [])?;
+    for row in &next {
+        tx.execute(
+            &format!("INSERT INTO runner_slots ({SLOT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)"),
+            params![
+                row.slot,
+                row.state,
+                row.owner,
+                row.epoch,
+                row.source,
+                row.destination,
+                row.operation
+            ],
+        )?;
+    }
+
+    let shift = 8 - (new as u32 - 24);
+    let held: Vec<(String, String)> = {
+        let mut statement = tx.prepare("SELECT uuid, address FROM instances")?;
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+    for (uuid, address) in held {
+        if let Some(slot) = slot_of_address(&address, shift) {
+            tx.execute(
+                "UPDATE instances SET slot = ? WHERE uuid = ?",
+                params![slot, uuid],
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn scan_slot(row: &rusqlite::Row<'_>) -> rusqlite::Result<Slot> {
     let state: String = row.get(1)?;
     Ok(Slot {
@@ -685,14 +812,16 @@ mod tests {
         assert_eq!(slots.len(), 2);
         assert_eq!(slots[1].owner_host_id, tsukasa.id);
 
-        // Handing a slot on raises its ownership epoch.
+        // Handing a slot on raises its ownership epoch. Slot 1 began as
+        // a child of konata's old slot 0 (MULTI-NODE 17.1), so tsukasa
+        // took it at epoch 1 and konata takes it back at epoch 2.
         let moved = store.claim_slot(1, konata.id).await.unwrap();
         assert_eq!(moved.owner_host_id, konata.id);
-        assert_eq!(moved.ownership_epoch, 1);
+        assert_eq!(moved.ownership_epoch, 2);
 
         // Claiming it again for the same host changes nothing.
         let again = store.claim_slot(1, konata.id).await.unwrap();
-        assert_eq!(again.ownership_epoch, 1);
+        assert_eq!(again.ownership_epoch, 2);
     }
 
     #[tokio::test]
@@ -730,6 +859,91 @@ mod tests {
             konata.id,
             "the refused claim left the slot alone"
         );
+    }
+
+    #[tokio::test]
+    async fn subdividing_splits_each_slot_and_renumbers_its_instances() {
+        // MULTI-NODE 17.1: each old slot splits into children that stay
+        // with the old owner, and an instance moves to the child whose
+        // prefix holds its address.
+        let store = new_test_store().await;
+        let (owner, konata) = crate::tests::seed_store(&store).await;
+        let tsukasa = store
+            .ensure_host(TSUKASA, "tsukasa", "qemu:///system")
+            .await
+            .unwrap();
+        store.claim_slot(0, konata.id).await.unwrap();
+
+        // Host octet 200 is in the upper half of the /24.
+        let mut instance = crate::tests::test_instance(1, "web", &owner, &konata);
+        instance.address = "10.100.0.200".into();
+        instance.slot = Some(0);
+        store
+            .create_instance(instance, Duration::ZERO, bento_types::Capacity::unbounded())
+            .await
+            .unwrap();
+
+        store.set_runner_prefix(25).await.unwrap();
+        let slots = store.slots().await.unwrap();
+        assert_eq!(slots.len(), 2, "slot 0 splits into slots 0 and 1");
+        assert!(slots.iter().all(|slot| slot.owner_host_id == konata.id));
+        let held = store.instances().await.unwrap();
+        assert_eq!(held[0].slot, Some(1), "octet 200 is in the second half");
+
+        // The child that holds a live guest may not go to another machine.
+        let error = store.claim_slot(1, tsukasa.id).await.unwrap_err();
+        assert!(matches!(error, Error::SlotInUse { slot: 1, .. }), "{error}");
+        // The empty child may.
+        store.claim_slot(0, tsukasa.id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_merge_of_slots_with_different_owners_is_refused() {
+        // MULTI-NODE 17.2: one prefix never has two owners.
+        let store = new_test_store().await;
+        let konata = store
+            .register_runner("konata", "https://10.0.0.96:10443", "10.0.0.96")
+            .await
+            .unwrap();
+        let tsukasa = store
+            .register_runner("tsukasa", "https://10.0.0.97:10443", "10.0.0.97")
+            .await
+            .unwrap();
+        store.set_runner_prefix(26).await.unwrap();
+        store.claim_slot(0, konata.id).await.unwrap();
+        store.claim_slot(1, tsukasa.id).await.unwrap();
+
+        // At /25, old slots 0 and 1 (/26) would both become slot 0.
+        let error = store.set_runner_prefix(25).await.unwrap_err();
+        assert!(
+            matches!(error, Error::RunnerPrefixSplitsOwners { slot: 0, .. }),
+            "{error}"
+        );
+        assert_eq!(store.deployment().await.unwrap().runner_prefix, 26);
+        assert_eq!(store.slots().await.unwrap().len(), 2, "nothing changed");
+    }
+
+    #[tokio::test]
+    async fn a_slot_claim_checks_the_address_not_the_stored_slot_number() {
+        // A database written before the split fix holds a stale slot
+        // number. The address is the truth (MULTI-NODE 7.1).
+        let store = new_test_store().await;
+        let (owner, konata) = crate::tests::seed_store(&store).await;
+        let tsukasa = store
+            .ensure_host(TSUKASA, "tsukasa", "qemu:///system")
+            .await
+            .unwrap();
+        store.claim_slot(0, konata.id).await.unwrap();
+        store.set_runner_prefix(25).await.unwrap();
+        let mut instance = crate::tests::test_instance(1, "web", &owner, &konata);
+        instance.address = "10.100.0.200".into();
+        instance.slot = Some(0); // stale: the address is in slot 1
+        store
+            .create_instance(instance, Duration::ZERO, bento_types::Capacity::unbounded())
+            .await
+            .unwrap();
+        let error = store.claim_slot(1, tsukasa.id).await.unwrap_err();
+        assert!(matches!(error, Error::SlotInUse { slot: 1, .. }), "{error}");
     }
 }
 

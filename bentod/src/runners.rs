@@ -220,6 +220,8 @@ pub(crate) struct NetworkSync {
     /// call and a log line when nothing changed; it is not correctness,
     /// because applying the same state again is harmless.
     applied: Arc<Mutex<HashMap<i64, String>>>,
+    /// The last kernel boot ID each machine reported (MULTI-NODE 8.2).
+    boots: Arc<Mutex<HashMap<i64, String>>>,
     request_timeout: Duration,
 }
 
@@ -239,8 +241,39 @@ impl NetworkSync {
             high_ports,
             controller_host_id,
             applied: Arc::new(Mutex::new(HashMap::new())),
+            boots: Arc::new(Mutex::new(HashMap::new())),
             request_timeout: REQUEST_TIMEOUT,
         }
+    }
+
+    /// Records the boot ID a machine just reported, and forgets what was
+    /// sent it when the ID changed.
+    ///
+    /// A reboot erases the routes, proxy ARP, and masquerade that the last
+    /// `ApplyNetwork` installed, while the database still describes the
+    /// same state. The digest cache would then skip every later send. A
+    /// new boot ID is the evidence of the restart, so it drops the cached
+    /// digest and the next sync resends (MULTI-NODE 8.2). An empty ID
+    /// means the runner does not report one, so nothing is inferred.
+    pub(crate) async fn note_boot(&self, host_id: i64, boot_id: &str) {
+        if boot_id.is_empty() {
+            return;
+        }
+        let previous = self
+            .boots
+            .lock()
+            .await
+            .insert(host_id, boot_id.to_owned());
+        if previous.is_some_and(|previous| previous != boot_id) {
+            self.applied.lock().await.remove(&host_id);
+            tracing::info!(runner_id = host_id, "runner rebooted, so its network is resent");
+        }
+    }
+
+    #[cfg(test)]
+    fn with_client(mut self, client: Arc<dyn Client>) -> Self {
+        self.client = client;
+        self
     }
 
     /// Brings one machine's network to what the database says it is.
@@ -318,6 +351,10 @@ impl NetworkSync {
         })
     }
 }
+
+#[cfg(test)]
+#[path = "runners_network_tests.rs"]
+mod network_sync_tests;
 
 fn digest_of(body: &str) -> String {
     let mut hasher = Sha256::new();
@@ -795,12 +832,18 @@ impl PollTask {
                 _ = ticker.tick() => {
                     match self.tick().await {
                         Ok(hosts) => {
-                            for host in hosts {
+                            for (host, boot_id) in hosts {
                                 // The network is converged before the
                                 // image sync is started, because a slow
                                 // image fetch must not hold back a route
                                 // an existing guest needs
                                 // (MULTI-NODE 8.2).
+                                if let Some(network) = &self.network {
+                                    // A new boot ID drops the cached send
+                                    // so a rebooted runner gets its routes
+                                    // back (MULTI-NODE 8.2).
+                                    network.note_boot(host.id, &boot_id).await;
+                                }
                                 if let Some(network) = &self.network
                                     && let Err(error) = network.sync_host(&host).await
                                 {
@@ -827,7 +870,7 @@ impl PollTask {
         }
     }
 
-    async fn tick(&self) -> Result<Vec<Host>> {
+    async fn tick(&self) -> Result<Vec<(Host, String)>> {
         let mut polls = JoinSet::new();
         for host in self.store.hosts().await? {
             let Some(endpoint) = host.endpoint.clone() else {
@@ -843,7 +886,7 @@ impl PollTask {
                     .host_observation(host.id)
                     .await?
                     .map_or(HostHealth::Unknown, |seen| seen.health);
-                let seen =
+                let (seen, boot_id) =
                     poll_host(client.as_ref(), &endpoint, &host, &lease, request_timeout).await;
                 let healthy = seen.error.is_none();
                 let after = store.observe_host(host.id, seen).await?;
@@ -889,7 +932,7 @@ impl PollTask {
                     }
                 }
                 if healthy {
-                    Ok::<_, bento_store::Error>(Some(store.host(host.id).await?))
+                    Ok::<_, bento_store::Error>(Some((store.host(host.id).await?, boot_id)))
                 } else {
                     Ok(None)
                 }
@@ -899,7 +942,7 @@ impl PollTask {
         let mut healthy = Vec::new();
         while let Some(result) = polls.join_next().await {
             match result {
-                Ok(Ok(Some(host))) => healthy.push(host),
+                Ok(Ok(Some(polled))) => healthy.push(polled),
                 Ok(Ok(None)) => {}
                 Ok(Err(error)) => tracing::warn!(%error, "runner observation failed"),
                 Err(error) => tracing::warn!(%error, "runner poll task failed"),
@@ -974,7 +1017,7 @@ async fn poll_host(
     host: &Host,
     lease: &watch::Receiver<Lease>,
     request_timeout: Duration,
-) -> HostSeen {
+) -> (HostSeen, String) {
     let current = lease.borrow().clone();
     let health = match send(
         client,
@@ -988,8 +1031,13 @@ async fn poll_host(
     .await
     {
         Ok(Reply::Health(health)) => health,
-        Ok(reply) => return failed(format!("runner answered {reply:?} to a health request")),
-        Err(error) => return failed(error),
+        Ok(reply) => {
+            return (
+                failed(format!("runner answered {reply:?} to a health request")),
+                String::new(),
+            );
+        }
+        Err(error) => return (failed(error), String::new()),
     };
 
     let current = lease.borrow().clone();
@@ -1006,14 +1054,17 @@ async fn poll_host(
     {
         Ok(Reply::Capabilities(capabilities)) => capabilities,
         Ok(reply) => {
-            return failed(format!(
-                "runner answered {reply:?} to a capabilities request"
-            ));
+            return (
+                failed(format!(
+                    "runner answered {reply:?} to a capabilities request"
+                )),
+                String::new(),
+            );
         }
-        Err(error) => return failed(error),
+        Err(error) => return (failed(error), String::new()),
     };
 
-    HostSeen {
+    let seen = HostSeen {
         machine_id: Some(health.machine_id),
         accepted_epoch: health.accepted_epoch,
         arch: Some(capabilities.arch),
@@ -1023,7 +1074,8 @@ async fn poll_host(
         storage_available_gib: Some(capabilities.storage_available_gib),
         hypervisor_version: Some(capabilities.hypervisor_version),
         error: None,
-    }
+    };
+    (seen, health.boot_id)
 }
 
 async fn send(
@@ -1111,6 +1163,7 @@ mod tests {
             machine_id: MACHINE_ID.into(),
             hostname: "runner-a.example.org".into(),
             accepted_epoch: 6,
+            boot_id: "boot-1".into(),
         })
     }
 
