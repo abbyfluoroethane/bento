@@ -159,6 +159,10 @@ pub(crate) fn error_parts(error: &BoxError) -> (StatusCode, String) {
         return match store_error {
             StoreError::NotFound => (StatusCode::NOT_FOUND, "not found".to_string()),
             StoreError::NameTaken => (StatusCode::CONFLICT, "that name is taken".to_string()),
+            StoreError::SshKeyTaken => (
+                StatusCode::CONFLICT,
+                "that SSH key is already registered".to_string(),
+            ),
             StoreError::Capacity { .. } | StoreError::NoPlacement { .. } => {
                 (StatusCode::CONFLICT, store_error.to_string())
             }

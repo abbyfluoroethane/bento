@@ -584,6 +584,15 @@ async fn account_page_and_keys() {
         "{}",
         text(&response)
     );
+    // The same key again is refused, and the page says why.
+    let response = post(
+        &fx.pages,
+        "/settings/account/keys",
+        &format!("public_key={}&comment=", key.replace(' ', "+")),
+    )
+    .await;
+    assert_eq!(response.status, StatusCode::CONFLICT);
+    assert!(text(&response).contains("already registered"));
     let body = text(&get(&fx.pages, "/settings/account").await);
     assert!(body.contains("laptop"));
     assert!(body.contains("/settings/account/keys/1/remove"));

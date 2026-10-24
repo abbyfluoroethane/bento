@@ -340,6 +340,10 @@ impl Env<'_> {
                     );
                     return 1;
                 }
+                StoreError::SshKeyTaken => {
+                    let _ = writeln!(self.err, "bento: that SSH key is already registered");
+                    return 1;
+                }
                 StoreError::NameTaken => {
                     let _ = writeln!(
                         self.err,

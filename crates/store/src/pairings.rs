@@ -127,16 +127,13 @@ impl Store {
                     ))
                 },
             )?;
-            tx.execute(
-                "INSERT INTO ssh_keys \
-                 (user_id, public_key, fingerprint, comment, created_at) VALUES (?, ?, ?, ?, ?)",
-                params![
-                    user_id,
-                    public_key,
-                    fingerprint,
-                    comment,
-                    format_time(now())?
-                ],
+            crate::sshkeys::insert_ssh_key(
+                tx,
+                user_id,
+                &public_key,
+                &fingerprint,
+                &comment,
+                now(),
             )?;
             Ok(tx.last_insert_rowid())
         })

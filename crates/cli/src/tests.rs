@@ -152,6 +152,10 @@ impl Store for FakeStore {
         comment: &str,
     ) -> Result<i64, BoxError> {
         let mut data = self.0.lock().unwrap();
+        // Like the store: a fingerprint is registered once (SPEC 13).
+        if data.added_keys.iter().any(|key| key.fingerprint == fingerprint) {
+            return Err(Box::new(StoreError::SshKeyTaken));
+        }
         data.added_keys.push(SshKey {
             id: 0,
             user_id,
@@ -978,6 +982,12 @@ async fn ssh_key_add_list_remove() {
         );
     }
     assert!(output.contains(&expected));
+
+    // A second registration of the same key is refused with a clear line.
+    let (code, _, error) = run(&cli, user(2, "bob"), "", &["ssh-key", "add", line]).await;
+    assert_eq!(code, 1);
+    assert!(error.contains("already registered"), "{error}");
+    assert_eq!(store.0.lock().unwrap().added_keys.len(), 1);
 
     let (store2, _, cli2) = fixture();
     assert_eq!(

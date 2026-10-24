@@ -32,6 +32,9 @@ pub enum StoreError {
     NotFound,
     #[error("store: name is taken by an existing instance")]
     NameTaken,
+    /// The fingerprint is already registered (SPEC 13).
+    #[error("store: that SSH key is already registered")]
+    SshKeyTaken,
     /// Every runner refused the request (MULTI-NODE 12).
     #[error("store: no runner can take this instance: {reasons}")]
     NoPlacement { reasons: String },

@@ -868,6 +868,7 @@ fn api_store_error_ref(error: &StoreError) -> Option<ApiError> {
     Some(match error {
         StoreError::NotFound => Box::new(ApiStoreError::NotFound),
         StoreError::NameTaken => Box::new(ApiStoreError::NameTaken),
+        StoreError::SshKeyTaken => Box::new(ApiStoreError::SshKeyTaken),
         StoreError::NoPlacement { reasons } => Box::new(ApiStoreError::NoPlacement {
             reasons: reasons.clone(),
         }),
