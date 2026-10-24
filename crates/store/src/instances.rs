@@ -2,12 +2,12 @@ use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
 
-use bento_types::{Capacity, DesiredState, Instance, State, Visibility};
+use bento_types::{Capacity, Ceiling, DesiredState, Instance, State, Visibility};
 use rusqlite::types::Value;
 use rusqlite::{OptionalExtension, Transaction, params, params_from_iter};
 
 use crate::names::{claim_name_tx, release_name_tx};
-use crate::{Error, Result, Store, format_time, parse_time};
+use crate::{Error, Result, Store, format_time, get_opt_u64, get_u64, parse_time, to_sql_int};
 
 const INSTANCE_COLUMNS: &str = "uuid, name, owner_id, host_id, image_name, base_checksum, \
      state, desired_state, address, mac, vcpu, memory, disk, nested, ksm, \
@@ -58,14 +58,14 @@ impl Store {
                     instance.address,
                     instance.mac,
                     instance.vcpu,
-                    instance.memory_mib,
-                    instance.disk_gib,
+                    to_sql_int(instance.memory_mib)?,
+                    to_sql_int(instance.disk_gib)?,
                     instance.nested,
                     instance.ksm,
                     instance.http_port,
                     instance.visibility.as_str(),
                     format_time(created_at)?,
-                    instance.slot
+                    instance.slot.map(to_sql_int).transpose()?
                 ],
             )?;
             Ok(())
@@ -80,7 +80,7 @@ impl Store {
         let uuid = uuid.into();
         let now = self.clock();
         self.with_tx(move |tx| {
-            let instance = get_instance_tx(tx, "uuid", &uuid)?;
+            let instance = get_instance_tx(tx, Key::Uuid, &uuid)?;
             tx.execute("DELETE FROM instances WHERE uuid = ?", [&uuid])?;
             release_name_tx(tx, &instance.name, instance.owner_id, now())?;
             Ok(instance)
@@ -101,7 +101,7 @@ impl Store {
         let new_name = new_name.into();
         let now = self.clock();
         self.with_tx(move |tx| {
-            let instance = get_instance_tx(tx, "uuid", &uuid)?;
+            let instance = get_instance_tx(tx, Key::Uuid, &uuid)?;
             if instance.name == new_name {
                 return Ok(());
             }
@@ -122,8 +122,8 @@ impl Store {
         &self,
         uuid: impl Into<String>,
         vcpu: u32,
-        memory_mib: i64,
-        disk_gib: i64,
+        memory_mib: u64,
+        disk_gib: u64,
         nested: bool,
         capacity: Capacity,
     ) -> Result<()> {
@@ -133,11 +133,17 @@ impl Store {
             // which machine the instance is on: a resize is weighed
             // against that machine's ceiling, not the controller's
             // (MULTI-NODE 12).
-            let existing = get_instance_tx(tx, "uuid", &uuid)?;
+            let existing = get_instance_tx(tx, Key::Uuid, &uuid)?;
             check_capacity_tx(tx, existing.host_id, &uuid, memory_mib, disk_gib, capacity)?;
             tx.execute(
                 "UPDATE instances SET vcpu = ?, memory = ?, disk = ?, nested = ? WHERE uuid = ?",
-                params![vcpu, memory_mib, disk_gib, nested, uuid],
+                params![
+                    vcpu,
+                    to_sql_int(memory_mib)?,
+                    to_sql_int(disk_gib)?,
+                    nested,
+                    uuid
+                ],
             )?;
             Ok(())
         })
@@ -151,13 +157,13 @@ impl Store {
     pub async fn check_resize(
         &self,
         uuid: impl Into<String>,
-        memory_mib: i64,
-        disk_gib: i64,
+        memory_mib: u64,
+        disk_gib: u64,
         capacity: Capacity,
     ) -> Result<()> {
         let uuid = uuid.into();
         self.with_tx(move |tx| {
-            let existing = get_instance_tx(tx, "uuid", &uuid)?;
+            let existing = get_instance_tx(tx, Key::Uuid, &uuid)?;
             check_capacity_tx(tx, existing.host_id, &uuid, memory_mib, disk_gib, capacity)
         })
         .await
@@ -315,8 +321,26 @@ impl Store {
     }
 }
 
-fn get_instance_tx(tx: &Transaction<'_>, column: &str, value: &str) -> Result<Instance> {
-    let sql = format!("SELECT {INSTANCE_COLUMNS} FROM instances WHERE {column} = ?");
+/// The column a lookup matches on. A closed set, so that no caller-supplied
+/// text reaches the SQL.
+#[derive(Debug, Clone, Copy)]
+enum Key {
+    Uuid,
+}
+
+impl Key {
+    fn column(self) -> &'static str {
+        match self {
+            Self::Uuid => "uuid",
+        }
+    }
+}
+
+fn get_instance_tx(tx: &Transaction<'_>, key: Key, value: &str) -> Result<Instance> {
+    let sql = format!(
+        "SELECT {INSTANCE_COLUMNS} FROM instances WHERE {} = ?",
+        key.column()
+    );
     tx.query_row(&sql, [value], scan_instance)
         .optional()?
         .ok_or(Error::NotFound)
@@ -331,8 +355,8 @@ fn get_instance_tx(tx: &Transaction<'_>, column: &str, value: &str) -> Result<In
 /// figures rather than against its old ones twice. A create passes an
 /// empty string, which matches no row.
 ///
-/// A ceiling of zero bounds nothing, so that check is skipped. See
-/// [`Capacity::unbounded`].
+/// An unbounded ceiling skips its check. A limit of zero allows nothing.
+/// See [`Capacity::unbounded`].
 /// Refuses work that would take one machine past its ceiling
 /// (SPEC 6.1).
 ///
@@ -346,21 +370,24 @@ fn check_capacity_tx(
     tx: &Transaction<'_>,
     host_id: i64,
     exclude_uuid: &str,
-    add_memory: i64,
-    add_disk: i64,
+    add_memory: u64,
+    add_disk: u64,
     capacity: Capacity,
 ) -> Result<()> {
     let (memory, disk) = tx.query_row(
         "SELECT COALESCE(SUM(memory), 0), COALESCE(SUM(disk), 0) \
          FROM instances WHERE host_id = ? AND uuid != ?",
         params![host_id, exclude_uuid],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((get_u64(row, 0)?, get_u64(row, 1)?)),
     )?;
     for (resource, used, requested, limit) in [
         ("memory", memory, add_memory, capacity.memory_mib),
         ("disk", disk, add_disk, capacity.disk_gib),
     ] {
-        if limit > 0 && used + requested > limit {
+        if limit.exceeded_by(used.saturating_add(requested)) {
+            let Ceiling::Limit(limit) = limit else {
+                unreachable!("an unbounded ceiling is never exceeded");
+            };
             return Err(Error::Capacity {
                 resource,
                 used,
@@ -390,13 +417,13 @@ pub(crate) fn scan_instance(row: &rusqlite::Row<'_>) -> rusqlite::Result<Instanc
         address: row.get(8)?,
         mac: row.get(9)?,
         vcpu: row.get(10)?,
-        memory_mib: row.get(11)?,
-        disk_gib: row.get(12)?,
+        memory_mib: get_u64(row, 11)?,
+        disk_gib: get_u64(row, 12)?,
         nested: row.get(13)?,
         ksm: row.get(14)?,
         http_port: row.get(15)?,
         visibility: parse_enum(16, &visibility_text)?,
-        slot: row.get(19)?,
+        slot: get_opt_u64(row, 19)?,
         created_at: parse_time(17, &created_text)?,
         last_seen_at: last_seen_text
             .as_deref()
@@ -424,7 +451,7 @@ mod tests {
     use std::collections::HashMap;
     use std::time::Duration;
 
-    use bento_types::{Capacity, DesiredState, State, Visibility};
+    use bento_types::{Capacity, Ceiling, DesiredState, State, Visibility};
     use time::Duration as TimeDuration;
 
     use crate::Error;
@@ -444,10 +471,7 @@ mod tests {
         ] {
             let store = new_test_store().await;
             let (owner, host) = seed_store(&store).await;
-            let capacity = Capacity {
-                memory_mib: 4096,
-                disk_gib: 50,
-            };
+            let capacity = Capacity::limited(4096, 50);
             let mut first = test_instance(1, "first", &owner, &host);
             first.memory_mib = 1024;
             first.disk_gib = 10;
@@ -478,6 +502,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_zero_limit_allows_nothing_and_only_unbounded_skips_the_check() {
+        let store = new_test_store().await;
+        let (owner, host) = seed_store(&store).await;
+        let mut first = test_instance(1, "first", &owner, &host);
+        first.memory_mib = 1;
+        first.disk_gib = 1;
+        // A limit of zero is no room, not "no ceiling".
+        assert!(matches!(
+            store
+                .create_instance(first.clone(), Duration::ZERO, Capacity::limited(0, 0))
+                .await,
+            Err(Error::Capacity { limit: 0, .. })
+        ));
+        // One unbounded resource skips its own check only.
+        let memory_unbounded = Capacity {
+            memory_mib: Ceiling::Unbounded,
+            disk_gib: Ceiling::Limit(0),
+        };
+        assert!(matches!(
+            store
+                .create_instance(first.clone(), Duration::ZERO, memory_unbounded)
+                .await,
+            Err(Error::Capacity {
+                resource: "disk",
+                ..
+            })
+        ));
+        store
+            .create_instance(first, Duration::ZERO, Capacity::unbounded())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn capacity_counts_every_owner_not_one() {
         // The ceiling is the host, so another user's instance takes room
         // from this one. This is the whole difference from the per-user
@@ -488,10 +546,7 @@ mod tests {
             .register_user("bob", "bob@example.org", None, test_range())
             .await
             .unwrap();
-        let capacity = Capacity {
-            memory_mib: 2048,
-            disk_gib: 100,
-        };
+        let capacity = Capacity::limited(2048, 100);
         let mut theirs = test_instance(1, "theirs", &other, &host);
         theirs.memory_mib = 1536;
         store
@@ -524,10 +579,7 @@ mod tests {
             .await
             .unwrap();
         store.claim_slot(0, second.id).await.unwrap();
-        let capacity = Capacity {
-            memory_mib: 2048,
-            disk_gib: 100,
-        };
+        let capacity = Capacity::limited(2048, 100);
 
         // Fill the second machine.
         let mut theirs = test_instance(1, "theirs", &owner, &second);
@@ -561,10 +613,7 @@ mod tests {
         let store = new_test_store().await;
         let (owner, host) = seed_store(&store).await;
         // Room for exactly one of the eight racers below.
-        let capacity = Capacity {
-            memory_mib: 1024,
-            disk_gib: 1 << 20,
-        };
+        let capacity = Capacity::limited(1024, 1 << 20);
         let mut tasks = Vec::new();
         for number in 0..8 {
             let store = store.store.clone();
@@ -786,10 +835,7 @@ mod tests {
         // Exactly enough for the instance below at its larger size. A
         // check that counted the old figures as well as the new ones
         // would refuse the growth that fills the host precisely.
-        let capacity = Capacity {
-            memory_mib: 4096,
-            disk_gib: 40,
-        };
+        let capacity = Capacity::limited(4096, 40);
         let mut instance = test_instance(1, "web", &owner, &host);
         instance.vcpu = 2;
         instance.memory_mib = 2048;

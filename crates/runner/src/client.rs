@@ -46,7 +46,7 @@ fn decode_response(status: reqwest::StatusCode, body: &[u8]) -> Result<Reply, Cl
 /// A failure to reach a runner is different from a refusal by that runner.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
-    #[error("runner transport: {0}")]
+    #[error("runner transport")]
     Transport(#[from] reqwest::Error),
     #[error("runner refused the request: {0}")]
     Refused(Refusal),
@@ -55,7 +55,7 @@ pub enum ClientError {
         status: reqwest::StatusCode,
         body: String,
     },
-    #[error("runner answered invalid JSON with HTTP {status}: {source}")]
+    #[error("runner answered invalid JSON with HTTP {status}")]
     InvalidBody {
         status: reqwest::StatusCode,
         #[source]

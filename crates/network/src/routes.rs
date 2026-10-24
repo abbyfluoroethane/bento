@@ -165,7 +165,7 @@ fn is_sysctl_component(value: &str) -> bool {
 }
 
 fn format_destination(prefix: Ipv4Prefix) -> String {
-    format!("{}/{}", prefix.addr, prefix.bits)
+    prefix.to_string()
 }
 
 /// Reads `ip -4 route show` and keeps only Bento's guest routes.
@@ -194,13 +194,8 @@ fn parse_routes(text: &str, private_range: Ipv4Prefix) -> Vec<Route> {
 }
 
 fn parse_destination(text: &str) -> Option<Ipv4Prefix> {
-    let (addr, bits) = text.split_once('/')?;
-    let addr = addr.parse().ok()?;
-    let bits = bits.parse().ok()?;
-    if !(24..=27).contains(&bits) {
-        return None;
-    }
-    Some(Ipv4Prefix { addr, bits })
+    let prefix: Ipv4Prefix = text.parse().ok()?;
+    (24..=27).contains(&prefix.bits).then_some(prefix)
 }
 
 /// The changes made while converging guest routes (MULTI-NODE 8.2).

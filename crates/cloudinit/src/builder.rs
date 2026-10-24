@@ -60,21 +60,21 @@ impl std::error::Error for CommandError {
 pub enum Error {
     #[error("cloudinit: {0}")]
     Invalid(String),
-    #[error("cloudinit: create staging directory: {0}")]
+    #[error("cloudinit: create staging directory")]
     CreateStaging(#[source] io::Error),
-    #[error("cloudinit: write {name}: {source}")]
+    #[error("cloudinit: write {name}")]
     Write {
         name: &'static str,
         #[source]
         source: io::Error,
     },
-    #[error("cloudinit: xorriso: {source}: {output}")]
+    #[error("cloudinit: xorriso: {output}")]
     Xorriso {
         #[source]
         source: CommandError,
         output: String,
     },
-    #[error("cloudinit: delete seed ISO: {0}")]
+    #[error("cloudinit: delete seed ISO")]
     Delete(#[source] io::Error),
 }
 

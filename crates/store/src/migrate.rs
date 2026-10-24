@@ -80,6 +80,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "unique_ssh_key_fingerprints",
         run: unique_ssh_key_fingerprints,
     },
+    Migration {
+        version: 9,
+        name: "nullable_token_expiry",
+        run: nullable_token_expiry,
+    },
 ];
 
 /// Records which migrations a database has. Created before any of them
@@ -409,6 +414,47 @@ fn unique_ssh_key_fingerprints(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     )
 }
 
+/// Lets `tokens.expires_at` be NULL, and stores NULL for a token that never
+/// expires (SPEC 13). Earlier versions wrote the Unix epoch for such a
+/// token, because the column was NOT NULL. SQLite cannot drop NOT NULL in
+/// place, so the table is rebuilt. A database whose column is already
+/// nullable skips the rebuild; the epoch rows are still converted, which
+/// is safe to repeat.
+fn nullable_token_expiry(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    let not_null = {
+        let mut statement = tx.prepare("PRAGMA table_info(tokens)")?;
+        // Columns: cid, name, type, notnull, dflt_value, pk.
+        let rows = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(1)?, row.get::<_, i64>(3)?))
+        })?;
+        let mut found = false;
+        for row in rows {
+            let (name, not_null) = row?;
+            found |= name == "expires_at" && not_null == 1;
+        }
+        found
+    };
+    if not_null {
+        tx.execute_batch(
+            "CREATE TABLE tokens_new (
+                 id         INTEGER PRIMARY KEY,
+                 user_id    INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                 hash       TEXT    NOT NULL UNIQUE,
+                 expires_at TEXT
+             );
+             INSERT INTO tokens_new (id, user_id, hash, expires_at)
+                 SELECT id, user_id, hash, expires_at FROM tokens;
+             DROP TABLE tokens;
+             ALTER TABLE tokens_new RENAME TO tokens;",
+        )?;
+    }
+    tx.execute(
+        "UPDATE tokens SET expires_at = NULL WHERE expires_at = '1970-01-01T00:00:00Z'",
+        [],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -691,5 +737,42 @@ mod tests {
             current_version(&conn).unwrap(),
             MIGRATIONS.last().unwrap().version
         );
+    }
+
+    #[test]
+    fn token_expiry_becomes_nullable_and_epoch_rows_become_null() {
+        let mut conn = baseline();
+        conn.execute_batch(MIGRATIONS_TABLE).unwrap();
+        for migration in MIGRATIONS.iter().filter(|m| m.version <= 8) {
+            conn.execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, 'x')",
+                rusqlite::params![migration.version, migration.name],
+            )
+            .unwrap();
+        }
+        conn.execute_batch(
+            "INSERT INTO users (id, name, email, subnet, created_at)
+                 VALUES (1, 'alice', 'alice@example.org', '10.0.1.0/24', 'x');
+             INSERT INTO tokens (id, user_id, hash, expires_at) VALUES
+                 (1, 1, 'forever', '1970-01-01T00:00:00Z'),
+                 (2, 1, 'later', '2030-01-01T00:00:00Z');",
+        )
+        .unwrap();
+        apply(&mut conn, clock()).unwrap();
+        let expiry = |hash: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT expires_at FROM tokens WHERE hash = ?",
+                [hash],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(expiry("forever"), None);
+        assert_eq!(expiry("later").as_deref(), Some("2030-01-01T00:00:00Z"));
+        conn.execute(
+            "INSERT INTO tokens (user_id, hash, expires_at) VALUES (1, 'new', NULL)",
+            [],
+        )
+        .unwrap();
     }
 }

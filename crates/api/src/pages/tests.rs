@@ -13,13 +13,13 @@ use crate::tests::{TestResponse, fixture, fixture_with_metrics};
 #[derive(Debug)]
 struct TwoHostMetrics;
 
-fn host_metrics(host_id: i64, host_name: &str, memory_total_mib: i64) -> crate::HostMetrics {
+fn host_metrics(host_id: i64, host_name: &str, memory_total_mib: u64) -> crate::HostMetrics {
     crate::HostMetrics {
         host_id,
         host_name: host_name.to_string(),
         memory_total_mib,
-        storage_total_gib: host_id,
-        cpu_count: host_id,
+        storage_total_gib: u64::try_from(host_id).unwrap(),
+        cpu_count: u64::try_from(host_id).unwrap(),
         ..crate::HostMetrics::default()
     }
 }

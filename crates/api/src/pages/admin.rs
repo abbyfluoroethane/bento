@@ -9,18 +9,18 @@ use bento_types::User;
 use serde::{Deserialize, Serialize};
 
 use super::{Page, Params, Viewer, done, error_page, failed, render, shell, urlencode};
-use crate::{AppState, error_parts, is_operator};
+use crate::{AppState, HandlerError, error_parts, is_operator};
 
 #[derive(Debug, Serialize)]
 struct UserRow {
     name: String,
     email: String,
-    instances: i64,
-    vcpu: i64,
-    memory_mib: i64,
-    disk_gib: i64,
+    instances: u64,
+    vcpu: u64,
+    memory_mib: u64,
+    disk_gib: u64,
     cpu_pct: f64,
-    memory_used_mib: i64,
+    memory_used_mib: u64,
     storage_used_gib: f64,
     placeholder: bool,
 }
@@ -32,28 +32,24 @@ struct UsersData {
     users: Vec<UserRow>,
     /// The ceiling to compare against, when there is exactly one
     /// machine to name. `None` in a deployment with more than one.
-    host_cpu_count: Option<i64>,
-    host_memory_mib: Option<i64>,
-    host_storage_gib: Option<i64>,
+    host_cpu_count: Option<u64>,
+    host_memory_mib: Option<u64>,
+    host_storage_gib: Option<u64>,
 }
 
 async fn operator_only(
     state: &AppState,
     user: &User,
     path: &str,
-) -> Result<super::Shell, Box<Response>> {
+) -> Result<super::Shell, HandlerError> {
     let shell = match shell(state, user, path, &Default::default()).await {
         Ok(shell) => shell,
-        Err(error) => return Err(Box::new(failed(state, user, path, error).await)),
+        Err(error) => return Err(failed(state, user, path, error).await.into()),
     };
     if is_operator(state, user) {
         Ok(shell)
     } else {
-        Err(Box::new(error_page(
-            shell,
-            StatusCode::FORBIDDEN,
-            "Operators only.",
-        )))
+        Err(error_page(shell, StatusCode::FORBIDDEN, "Operators only.").into())
     }
 }
 
@@ -62,17 +58,14 @@ pub(crate) async fn users(
     State(state): State<AppState>,
     Extension(user): Viewer,
     axum::extract::Query(params): Params,
-) -> Response {
+) -> Result<Response, HandlerError> {
     let path = "/settings";
     if !is_operator(&state, &user) {
         // Settings for a non-operator is the account tab alone.
         use axum::response::IntoResponse;
-        return axum::response::Redirect::to("/settings/account").into_response();
+        return Ok(axum::response::Redirect::to("/settings/account").into_response());
     }
-    let mut shell = match operator_only(&state, &user, path).await {
-        Ok(shell) => shell,
-        Err(response) => return *response,
-    };
+    let mut shell = operator_only(&state, &user, path).await?;
     shell.toast = super::toast_from(&params);
     let result = async {
         let accounts = state.0.store.users().await?;
@@ -110,7 +103,7 @@ pub(crate) async fn users(
         Ok::<_, crate::BoxError>((rows, host))
     }
     .await;
-    match result {
+    Ok(match result {
         Ok((users, host)) => render(
             StatusCode::OK,
             "settings_users.html",
@@ -127,7 +120,7 @@ pub(crate) async fn users(
             },
         ),
         Err(error) => failed(&state, &user, path, error).await,
-    }
+    })
 }
 
 #[derive(Debug, Serialize)]
@@ -154,8 +147,8 @@ struct ConfigurationData {
 #[derive(Debug, Serialize)]
 struct DefaultsView {
     vcpu: u32,
-    memory_mib: i64,
-    disk_gib: i64,
+    memory_mib: u64,
+    disk_gib: u64,
 }
 
 async fn render_configuration(
@@ -164,12 +157,9 @@ async fn render_configuration(
     params: &std::collections::HashMap<String, String>,
     status: StatusCode,
     error: Option<String>,
-) -> Response {
+) -> Result<Response, HandlerError> {
     let path = "/settings/configuration";
-    let mut shell = match operator_only(state, user, path).await {
-        Ok(shell) => shell,
-        Err(response) => return *response,
-    };
+    let mut shell = operator_only(state, user, path).await?;
     shell.toast = super::toast_from(params);
     let images = match crate::images_with_counts(state).await {
         Ok(images) => images
@@ -183,10 +173,10 @@ async fn render_configuration(
                 instances_on_older_versions: image.instances_on_older_versions,
             })
             .collect(),
-        Err(error) => return failed(state, user, path, error).await,
+        Err(error) => return Err(failed(state, user, path, error).await.into()),
     };
     let defaults = state.0.defaults;
-    render(
+    Ok(render(
         status,
         "settings_configuration.html",
         &Page {
@@ -205,14 +195,14 @@ async fn render_configuration(
                 error,
             },
         },
-    )
+    ))
 }
 
 pub(crate) async fn configuration(
     State(state): State<AppState>,
     Extension(user): Viewer,
     axum::extract::Query(params): Params,
-) -> Response {
+) -> Result<Response, HandlerError> {
     render_configuration(&state, &user, &params, StatusCode::OK, None).await
 }
 
@@ -228,7 +218,7 @@ pub(crate) async fn add_image(
     State(state): State<AppState>,
     Extension(user): Viewer,
     Form(form): Form<ImageForm>,
-) -> Response {
+) -> Result<Response, HandlerError> {
     if !is_operator(&state, &user) {
         return render_configuration(
             &state,
@@ -262,7 +252,7 @@ pub(crate) async fn add_image(
         .await;
     }
     match admin.add_oci_image(name, reference).await {
-        Ok(()) => done("/settings/configuration", &format!("Added {name}")),
+        Ok(()) => Ok(done("/settings/configuration", &format!("Added {name}"))),
         Err(error) => {
             let (status, message) = error_parts(&error);
             let _ = urlencode;

@@ -76,8 +76,8 @@ pub(crate) async fn build_ruleset(
 ) -> Result<Ruleset> {
     if high_ports.from == 0 && high_ports.to == 0 {
         high_ports = PortRange {
-            from: i32::from(bento_proxy::HIGH_PORT_MIN),
-            to: i32::from(bento_proxy::HIGH_PORT_MAX),
+            from: bento_proxy::HIGH_PORT_MIN,
+            to: bento_proxy::HIGH_PORT_MAX,
         };
     }
     let network =

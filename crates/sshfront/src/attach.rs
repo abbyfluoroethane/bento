@@ -16,7 +16,7 @@ use bento_types::{Instance, State};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::server::{CLIRunner, InstanceStore, KeyStore, Server, Starter};
+use crate::server::{CliRunner, InstanceStore, KeyStore, Server, Starter};
 use crate::session::{self, PtyRequest, SessionExit, SessionOutput, SessionParts, Window};
 
 /// The terminal type the guest PTY gets. ghostty-web answers as xterm does.
@@ -208,7 +208,7 @@ impl KeyStore for NoKeys {
 struct NoCli;
 
 #[async_trait]
-impl CLIRunner for NoCli {
+impl CliRunner for NoCli {
     async fn run(
         &self,
         _user: bento_types::User,

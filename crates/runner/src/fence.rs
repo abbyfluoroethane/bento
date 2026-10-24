@@ -45,7 +45,7 @@ pub trait FenceStore: Send + Sync {
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("runner fence: {0}")]
+    #[error("runner fence: sqlite")]
     Sqlite(#[from] rusqlite::Error),
     #[error("runner fence: {0}")]
     Time(String),

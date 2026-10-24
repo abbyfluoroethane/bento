@@ -74,7 +74,7 @@ impl Store for FakeStore {
             .filter(|instance| instance.owner_id == user_id)
         {
             usage.instances += 1;
-            usage.vcpu += i64::from(instance.vcpu);
+            usage.vcpu += u64::from(instance.vcpu);
             usage.memory_mib += instance.memory_mib;
             usage.disk_gib += instance.disk_gib;
         }
@@ -448,7 +448,7 @@ pub(crate) fn instance(
     owner_id: i64,
     state: InstanceState,
     desired_state: DesiredState,
-    resources: (u32, i64, i64),
+    resources: (u32, u64, u64),
 ) -> Instance {
     Instance {
         uuid: uuid.to_string(),
@@ -790,6 +790,17 @@ async fn create_validates_input_defaults_ksm_and_maps_typed_errors() {
         (r#"{"name":"api"}"#, StatusCode::BAD_REQUEST, false),
         (
             r#"{"name":"api","image":"debian-13","memory_mib":-1}"#,
+            StatusCode::BAD_REQUEST,
+            false,
+        ),
+        // The sizes are unsigned: a negative number fails to decode.
+        (
+            r#"{"name":"api","image":"debian-13","vcpu":-1}"#,
+            StatusCode::BAD_REQUEST,
+            false,
+        ),
+        (
+            r#"{"name":"api","image":"debian-13","disk_gib":-5}"#,
             StatusCode::BAD_REQUEST,
             false,
         ),
@@ -1316,4 +1327,34 @@ async fn database_download_is_a_consistent_operator_only_snapshot() {
     *fixture.auth.0.lock().unwrap() = Some(fixture.alice.clone());
     let response = request(&app, Method::GET, "/api/db.sqlite", "").await;
     assert_eq!(response.status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn handler_error_maps_through_error_parts() {
+    let teapot: HandlerError = StatusError::new(StatusCode::IM_A_TEAPOT, "short and stout").into();
+    assert_eq!(teapot.into_response().status(), StatusCode::IM_A_TEAPOT);
+
+    let missing: HandlerError = BoxError::from(StoreError::NotFound).into();
+    assert_eq!(missing.into_response().status(), StatusCode::NOT_FOUND);
+
+    let plain: HandlerError = BoxError::from("disk on fire").into();
+    assert_eq!(
+        plain.into_response().status(),
+        StatusCode::INTERNAL_SERVER_ERROR
+    );
+
+    // A rendered page passes through untouched.
+    let page: HandlerError = error_response(StatusCode::FORBIDDEN, "no").into();
+    assert_eq!(page.into_response().status(), StatusCode::FORBIDDEN);
+}
+
+#[test]
+fn action_names_serialize_in_lowercase() {
+    for (action, name) in [
+        (Action::Start, "start"),
+        (Action::Stop, "stop"),
+        (Action::Restart, "restart"),
+    ] {
+        assert_eq!(serde_json::to_value(action).unwrap(), name);
+    }
 }

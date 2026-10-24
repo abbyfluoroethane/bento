@@ -163,8 +163,8 @@ impl ReportSource for ImageReport {
         &self,
         image_name: &str,
         checksum: &str,
-    ) -> Result<i64, ImagesError> {
-        Ok(self
+    ) -> Result<u64, ImagesError> {
+        let count = self
             .0
             .instances()
             .await?
@@ -172,7 +172,8 @@ impl ReportSource for ImageReport {
             .filter(|instance| {
                 instance.image_name == image_name && instance.base_checksum != checksum
             })
-            .count() as i64)
+            .count();
+        Ok(u64::try_from(count).unwrap_or(u64::MAX))
     }
 }
 
@@ -239,9 +240,8 @@ impl bento_lifecycle::Store for LifecycleStore {
         // same overcommit ratio applies, because it is a deployment
         // setting rather than a property of one machine.
         let seen = self.0.host_observation(host_id).await?;
-        // A zero in `Capacity` means "no ceiling", so a machine that has
-        // not reported a figure must be refused here and never read as
-        // zero: that would let a create or resize past the machine
+        // A machine that has not reported a figure is refused here, so
+        // that a missing figure never reads as a ceiling
         // (SPEC 6.1, MULTI-NODE 12). 503 tells the client to retry once
         // the runner reports.
         let unavailable = |reason: String| -> LifecycleError {
@@ -315,8 +315,8 @@ impl bento_lifecycle::Store for LifecycleStore {
     async fn check_resize(
         &self,
         uuid: &str,
-        memory_mib: i64,
-        disk_gib: i64,
+        memory_mib: u64,
+        disk_gib: u64,
         capacity: Capacity,
     ) -> Result<(), LifecycleError> {
         Ok(self
@@ -328,8 +328,8 @@ impl bento_lifecycle::Store for LifecycleStore {
         &self,
         uuid: &str,
         vcpu: u32,
-        memory_mib: i64,
-        disk_gib: i64,
+        memory_mib: u64,
+        disk_gib: u64,
         nested: bool,
         capacity: Capacity,
     ) -> Result<(), LifecycleError> {
@@ -474,24 +474,20 @@ impl bento_lifecycle::Fleet for RunnerFleet {
             return self
                 .provision_here(spec)
                 .await
-                .map_err(|error| Box::new(SimpleError(error.to_string())) as LifecycleError);
+                .map_err(LifecycleError::from);
         }
         let runners = self.runners.as_ref().ok_or_else(|| {
-            Box::new(SimpleError(
-                "this deployment has no runner endpoints, so it cannot build an \
-                 instance on another machine"
-                    .to_owned(),
-            )) as LifecycleError
+            Box::new(FleetError::NoRunnerEndpoints("build an instance")) as LifecycleError
         })?;
         let host = self
             .store
             .host(spec.host_id)
             .await
-            .map_err(|error| Box::new(SimpleError(error.to_string())) as LifecycleError)?;
+            .map_err(|error| Box::new(error) as LifecycleError)?;
         runners
             .provision(&host, spec)
             .await
-            .map_err(|error| Box::new(SimpleError(error.to_string())) as LifecycleError)
+            .map_err(LifecycleError::from)
     }
 
     async fn hypervisor(&self, host_id: i64) -> Option<Arc<dyn bento_hypervisor::Hypervisor>> {
@@ -515,22 +511,16 @@ impl bento_lifecycle::Fleet for RunnerFleet {
         if spec.host_id == self.host_id {
             // The manager defines this machine's domains with its local
             // definer and sends only other machines here.
-            return Err(Box::new(SimpleError(
-                "this machine redefines its own domains locally, not through the fleet".to_owned(),
-            )));
+            return Err(Box::new(FleetError::LocalRedefine));
         }
         let runners = self.runners.as_ref().ok_or_else(|| {
-            Box::new(SimpleError(
-                "this deployment has no runner endpoints, so it cannot redefine an \
-                 instance on another machine"
-                    .to_owned(),
-            )) as LifecycleError
+            Box::new(FleetError::NoRunnerEndpoints("redefine an instance")) as LifecycleError
         })?;
         let host = self
             .store
             .host(spec.host_id)
             .await
-            .map_err(|error| Box::new(SimpleError(error.to_string())) as LifecycleError)?;
+            .map_err(|error| Box::new(error) as LifecycleError)?;
         let instance = &spec.instance;
         let request = bento_runner::RedefineRequest {
             instance: bento_runner::InstanceRef {
@@ -548,34 +538,28 @@ impl bento_lifecycle::Fleet for RunnerFleet {
         runners
             .redefine(&host, request)
             .await
-            .map_err(|error| Box::new(SimpleError(error.to_string())) as LifecycleError)
+            .map_err(LifecycleError::from)
     }
 
     async fn resize_disk(
         &self,
         host_id: i64,
         instance: &bento_types::Instance,
-        disk_gib: i64,
+        disk_gib: u64,
     ) -> Result<(), LifecycleError> {
         if host_id == self.host_id {
             // The manager grows this machine's overlays with its local
             // resizer and sends only other machines here.
-            return Err(Box::new(SimpleError(
-                "this machine resizes its own disks locally, not through the fleet".to_owned(),
-            )));
+            return Err(Box::new(FleetError::LocalResize));
         }
         let runners = self.runners.as_ref().ok_or_else(|| {
-            Box::new(SimpleError(
-                "this deployment has no runner endpoints, so it cannot resize a \
-                 disk on another machine"
-                    .to_owned(),
-            )) as LifecycleError
+            Box::new(FleetError::NoRunnerEndpoints("resize a disk")) as LifecycleError
         })?;
         let host = self
             .store
             .host(host_id)
             .await
-            .map_err(|error| Box::new(SimpleError(error.to_string())) as LifecycleError)?;
+            .map_err(|error| Box::new(error) as LifecycleError)?;
         runners
             .resize_disk(
                 &host,
@@ -587,7 +571,7 @@ impl bento_lifecycle::Fleet for RunnerFleet {
             )
             .await
             .map(|_| ())
-            .map_err(|error| Box::new(SimpleError(error.to_string())) as LifecycleError)
+            .map_err(LifecycleError::from)
     }
 
     async fn deprovision(
@@ -605,18 +589,18 @@ impl bento_lifecycle::Fleet for RunnerFleet {
     }
 }
 
-/// An error with nothing but a sentence, for a seam whose caller only
-/// prints it.
-#[derive(Debug)]
-struct SimpleError(String);
-
-impl std::fmt::Display for SimpleError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
+/// A refusal raised by the fleet adapter itself. Failures from the store
+/// and the runners pass through with their own types, so the API layer
+/// can still read a missing host as 404 (SPEC 6.1, 7.2).
+#[derive(Debug, thiserror::Error)]
+enum FleetError {
+    #[error("this deployment has no runner endpoints, so it cannot {0} on another machine")]
+    NoRunnerEndpoints(&'static str),
+    #[error("this machine redefines its own domains locally, not through the fleet")]
+    LocalRedefine,
+    #[error("this machine resizes its own disks locally, not through the fleet")]
+    LocalResize,
 }
-
-impl std::error::Error for SimpleError {}
 
 pub(crate) struct Backend {
     pub(crate) manager: Arc<Manager>,
@@ -634,18 +618,20 @@ impl Backend {
         Ok(())
     }
 
-    #[allow(clippy::too_many_arguments)]
     async fn new_request(
         &self,
         owner_id: i64,
-        name: String,
-        image: String,
-        vcpu: u32,
-        memory_mib: i64,
-        disk_gib: i64,
-        nested: bool,
-        ksm: bool,
+        spec: bento_api::CreateSpec,
     ) -> anyhow::Result<NewRequest> {
+        let bento_api::CreateSpec {
+            name,
+            image,
+            vcpu,
+            memory_mib,
+            disk_gib,
+            nested,
+            ksm,
+        } = spec;
         let owner = self.store.user_by_id(owner_id).await?;
         let keys = self.store.ssh_keys_for_user(owner_id).await?;
         let mut ssh_keys = keys
@@ -680,13 +666,15 @@ impl bento_cli::Lifecycle for CliBackend {
             .0
             .new_request(
                 request.owner_id,
-                request.name,
-                request.image,
-                request.vcpu,
-                request.memory_mib,
-                request.disk_gib,
-                request.nested,
-                request.ksm,
+                bento_api::CreateSpec {
+                    name: request.name,
+                    image: request.image,
+                    vcpu: request.vcpu,
+                    memory_mib: request.memory_mib,
+                    disk_gib: request.disk_gib,
+                    nested: request.nested,
+                    ksm: request.ksm,
+                },
             )
             .await?;
         let instance = self.0.manager.create(request).await?;
@@ -729,13 +717,15 @@ impl bento_cli::Lifecycle for CliBackend {
             .0
             .new_request(
                 request.owner_id,
-                request.name,
-                request.image,
-                request.vcpu,
-                request.memory_mib,
-                request.disk_gib,
-                request.nested,
-                request.ksm,
+                bento_api::CreateSpec {
+                    name: request.name,
+                    image: request.image,
+                    vcpu: request.vcpu,
+                    memory_mib: request.memory_mib,
+                    disk_gib: request.disk_gib,
+                    nested: request.nested,
+                    ksm: request.ksm,
+                },
             )
             .await?;
         let instance = self.0.manager.copy(&source.uuid, request).await?;
@@ -839,19 +829,7 @@ pub(crate) fn api_lifecycle_error(error: bento_lifecycle::Error) -> ApiError {
 #[async_trait]
 impl bento_api::Lifecycle for ApiBackend {
     async fn create(&self, owner: User, spec: bento_api::CreateSpec) -> Result<Instance, ApiError> {
-        let request = self
-            .0
-            .new_request(
-                owner.id,
-                spec.name,
-                spec.image,
-                spec.vcpu,
-                spec.memory_mib,
-                spec.disk_gib,
-                spec.nested,
-                spec.ksm,
-            )
-            .await?;
+        let request = self.0.new_request(owner.id, spec).await?;
         let instance = self
             .0
             .manager
@@ -1128,7 +1106,7 @@ impl bento_auth::TokenStore for AuthTokens {
         &self,
         user_id: i64,
         hash: &str,
-        expires_at: OffsetDateTime,
+        expires_at: Option<OffsetDateTime>,
     ) -> Result<Token, AuthError> {
         let id = self.0.create_token(user_id, hash, expires_at).await?;
         Ok(Token {
@@ -1142,7 +1120,6 @@ impl bento_auth::TokenStore for AuthTokens {
         match self.0.token_by_hash(hash).await {
             Ok(token) => Ok(TokenLookup::Found(token)),
             Err(StoreError::NotFound) => Ok(TokenLookup::NotFound),
-            Err(StoreError::TokenExpired(token)) => Ok(TokenLookup::Expired(*token)),
             Err(error) => Err(Box::new(error)),
         }
     }
@@ -1454,7 +1431,8 @@ impl bento_sshfront::KeyLinker for Linker {
 }
 
 pub(crate) fn user_network(plan: Plan, subnet: &str) -> anyhow::Result<UserNetwork> {
-    let prefix = bento_config::parse_prefix(subnet)
+    let prefix = subnet
+        .parse::<bento_config::Ipv4Prefix>()
         .map_err(|error| anyhow::anyhow!("user subnet {subnet:?}: {error}"))?;
     let index = plan.index(prefix)?;
     Ok(UserNetwork::new(plan, index as isize)?)
@@ -1531,7 +1509,7 @@ impl io::Read for ChannelReader {
 }
 
 #[async_trait]
-impl bento_sshfront::CLIRunner for CliRunner {
+impl bento_sshfront::CliRunner for CliRunner {
     async fn run(
         &self,
         user: User,

@@ -308,8 +308,8 @@ impl Store for TestStore {
     async fn check_resize(
         &self,
         uuid: &str,
-        _memory: i64,
-        _disk: i64,
+        _memory: u64,
+        _disk: u64,
         _capacity: Capacity,
     ) -> std::result::Result<(), DynError> {
         let data = self.data();
@@ -326,8 +326,8 @@ impl Store for TestStore {
         &self,
         uuid: &str,
         vcpu: u32,
-        memory: i64,
-        disk: i64,
+        memory: u64,
+        disk: u64,
         nested: bool,
         capacity: Capacity,
     ) -> std::result::Result<(), DynError> {
@@ -527,7 +527,7 @@ impl Fleet for TestImages {
         &self,
         host_id: i64,
         instance: &Instance,
-        disk_gib: i64,
+        disk_gib: u64,
     ) -> std::result::Result<(), DynError> {
         self.disk_resized
             .lock()
@@ -628,7 +628,7 @@ struct TestIso {
     error: Mutex<Option<String>>,
 }
 #[async_trait]
-impl ISOBuilder for TestIso {
+impl IsoBuilder for TestIso {
     async fn build(&self, seed: &Seed, path: &Path) -> std::result::Result<(), DynError> {
         if let Some(error) = self.error.lock().unwrap().clone() {
             return Err(boxed(&error));
@@ -643,12 +643,12 @@ impl ISOBuilder for TestIso {
 
 #[derive(Default)]
 struct TestResizer {
-    calls: Mutex<Vec<(PathBuf, i64)>>,
+    calls: Mutex<Vec<(PathBuf, u64)>>,
     error: Mutex<Option<String>>,
 }
 #[async_trait]
 impl OverlayResizer for TestResizer {
-    async fn resize_overlay(&self, path: &Path, disk: i64) -> std::result::Result<(), DynError> {
+    async fn resize_overlay(&self, path: &Path, disk: u64) -> std::result::Result<(), DynError> {
         self.calls.lock().unwrap().push((path.to_path_buf(), disk));
         if let Some(error) = self.error.lock().unwrap().clone() {
             Err(boxed(&error))
@@ -710,10 +710,7 @@ impl Sleep for TestSleep {
 
 /// A capacity no test instance comes near, so that only a test that
 /// looks for it notices it.
-const TEST_CAPACITY: Capacity = Capacity {
-    memory_mib: 262_144,
-    disk_gib: 4096,
-};
+const TEST_CAPACITY: Capacity = Capacity::limited(262_144, 4096);
 
 struct Fixture {
     manager: Manager,
@@ -747,16 +744,10 @@ fn fixture(with_definer: bool, with_clearer: bool) -> Fixture {
     let iso_for_exists = iso.clone();
     let iso_for_delete = iso.clone();
     let manager = Manager::new(Config {
-        hypervisor: Some(fake.clone()),
         definer: with_definer.then(|| definer.clone() as Arc<dyn Definer>),
         autostart_clearer: with_clearer.then(|| clearer.clone() as Arc<dyn AutostartClearer>),
-        store: Some(store.clone()),
         host_id: 1,
-        fleet: Some(images.clone()),
-        iso: Some(iso.clone()),
         resizer: Some(resizer.clone()),
-        plan: Some(Plan::new("10.77.0.0/16").unwrap()),
-        storage_dir: temp.path().to_path_buf(),
         logger: Some(log.clone()),
         nested_enabled: Some(Arc::new(|| (false, "kvm_intel nested is N".into()))),
         sleep: Some(sleep.clone()),
@@ -779,7 +770,14 @@ fn fixture(with_definer: bool, with_clearer: bool) -> Fixture {
                 Ok(())
             })
         })),
-        ..Config::default()
+        ..Config::new(
+            fake.clone(),
+            store.clone(),
+            images.clone(),
+            iso.clone(),
+            Plan::new("10.77.0.0/16").unwrap(),
+            temp.path().to_path_buf(),
+        )
     })
     .unwrap();
     Fixture {
@@ -961,20 +959,8 @@ async fn a_full_machine_does_not_refuse_a_create_bound_for_an_empty_one() {
         data.chosen_host = Some(2);
         data.slots[0].owner_host_id = 2;
         // Host 1 is nearly full; host 2 is empty and large.
-        data.capacities.insert(
-            1,
-            Capacity {
-                memory_mib: 1024,
-                disk_gib: 4,
-            },
-        );
-        data.capacities.insert(
-            2,
-            Capacity {
-                memory_mib: 65_536,
-                disk_gib: 512,
-            },
-        );
+        data.capacities.insert(1, Capacity::limited(1024, 4));
+        data.capacities.insert(2, Capacity::limited(65_536, 512));
     }
     let owner = f.store.add_user(1, "amber", "10.77.0.0/24");
     f.store.add_image(Some("aa11"));
@@ -989,10 +975,7 @@ async fn a_full_machine_does_not_refuse_a_create_bound_for_an_empty_one() {
     // that will run it.
     assert_eq!(
         f.store.data().seen_capacity,
-        Some(Capacity {
-            memory_mib: 65_536,
-            disk_gib: 512,
-        }),
+        Some(Capacity::limited(65_536, 512)),
         "the create was weighed against the wrong machine"
     );
 }
@@ -1001,13 +984,10 @@ async fn a_full_machine_does_not_refuse_a_create_bound_for_an_empty_one() {
 async fn a_create_is_still_refused_when_its_own_machine_is_full() {
     // The check is not weakened, only moved to the right machine.
     let f = fixture(false, false);
-    f.store.data().capacities.insert(
-        1,
-        Capacity {
-            memory_mib: 1024,
-            disk_gib: 4,
-        },
-    );
+    f.store
+        .data()
+        .capacities
+        .insert(1, Capacity::limited(1024, 4));
     f.store.data().create_error = Some("the host has no room".into());
     let owner = f.store.add_user(1, "amber", "10.77.0.0/24");
     f.store.add_image(Some("aa11"));
@@ -1016,13 +996,11 @@ async fn a_create_is_still_refused_when_its_own_machine_is_full() {
     request.disk_gib = 40;
     let error = f.manager.create(request).await.unwrap_err();
 
-    assert!(error.to_string().contains("no room"), "{error}");
+    let message = bento_types::error_chain(&error);
+    assert!(message.contains("no room"), "{message}");
     assert_eq!(
         f.store.data().seen_capacity,
-        Some(Capacity {
-            memory_mib: 1024,
-            disk_gib: 4,
-        })
+        Some(Capacity::limited(1024, 4))
     );
 }
 
@@ -1041,7 +1019,8 @@ async fn a_create_that_no_machine_can_take_is_refused() {
 
     let error = f.manager.create(request(owner, "web")).await.unwrap_err();
 
-    assert!(error.to_string().contains("no machine"), "{error}");
+    let message = bento_types::error_chain(&error);
+    assert!(message.contains("no machine"), "{message}");
     assert!(f.store.data().instances.is_empty());
     assert!(f.images.placed_on.lock().unwrap().is_empty());
 }
@@ -2389,39 +2368,59 @@ async fn qemu_img_resizer_rejects_non_positive() {
 }
 
 #[test]
-fn new_manager_validation() {
-    let valid = || {
-        let temp = tempfile::tempdir().unwrap();
-        let store = Arc::new(TestStore::default());
-        (
-            temp,
-            Config {
-                hypervisor: Some(Arc::new(Fake::default())),
-                store: Some(store),
-                fleet: Some(Arc::new(TestImages::new(
-                    Arc::new(Fake::default()),
-                    Arc::new(TestIso::default()),
-                    PathBuf::new(),
-                ))),
-                iso: Some(Arc::new(TestIso::default())),
-                plan: Some(Plan::new("10.77.0.0/16").unwrap()),
-                ..Config::default()
-            },
+fn new_manager_requires_a_storage_dir() {
+    // Every dependency is a `Config::new` argument, so the type system
+    // enforces it. A path is a value, and an empty one is refused.
+    let config = |storage_dir: PathBuf| {
+        Config::new(
+            Arc::new(Fake::default()),
+            Arc::new(TestStore::default()),
+            Arc::new(TestImages::new(
+                Arc::new(Fake::default()),
+                Arc::new(TestIso::default()),
+                PathBuf::new(),
+            )),
+            Arc::new(TestIso::default()),
+            Plan::new("10.77.0.0/16").unwrap(),
+            storage_dir,
         )
     };
-    for missing in 0..6 {
-        let (temp, mut config) = valid();
-        config.storage_dir = temp.path().into();
-        match missing {
-            0 => config.hypervisor = None,
-            1 => config.store = None,
-            2 => config.fleet = None,
-            3 => config.iso = None,
-            4 => config.plan = None,
-            _ => config.storage_dir = PathBuf::new(),
-        }
-        assert!(Manager::new(config).is_err());
-    }
+    let temp = tempfile::tempdir().unwrap();
+    assert!(Manager::new(config(temp.path().into())).is_ok());
+    assert!(matches!(
+        Manager::new(config(PathBuf::new())),
+        Err(Error::Config(_))
+    ));
+}
+
+/// Zero keeps its meaning (SPEC 7.2): a zero cooldown is no cooldown, not
+/// a request for the default. A zero that has no meaning is refused.
+#[test]
+fn manager_takes_values_as_given() {
+    let build = |edit: fn(&mut Config)| {
+        let temp = tempfile::tempdir().unwrap();
+        let mut config = Config::new(
+            Arc::new(Fake::default()),
+            Arc::new(TestStore::default()),
+            Arc::new(TestImages::new(
+                Arc::new(Fake::default()),
+                Arc::new(TestIso::default()),
+                PathBuf::new(),
+            )),
+            Arc::new(TestIso::default()),
+            Plan::new("10.77.0.0/16").unwrap(),
+            temp.path().into(),
+        );
+        edit(&mut config);
+        Manager::new(config)
+    };
+    let manager = build(|config| config.name_cooldown = Duration::ZERO).unwrap();
+    assert_eq!(manager.cooldown, Duration::ZERO);
+    assert!(build(|config| config.batch_size = 0).is_err());
+    assert!(build(|config| config.dns.clear()).is_err());
+    assert!(build(|config| config.poll_interval = Duration::ZERO).is_err());
+    assert!(build(|config| config.start_poll_interval = Duration::ZERO).is_err());
+    assert!(build(|config| config.start_timeout = Duration::ZERO).is_err());
 }
 
 #[test]

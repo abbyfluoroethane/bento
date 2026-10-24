@@ -15,7 +15,7 @@ pub trait ReportSource: Send + Sync {
         &self,
         image_name: &str,
         checksum: &str,
-    ) -> std::result::Result<i64, DynError>;
+    ) -> std::result::Result<u64, DynError>;
 }
 
 /// One row of the images command: the image name, its current checksum,
@@ -24,7 +24,7 @@ pub trait ReportSource: Send + Sync {
 pub struct Status {
     pub name: String,
     pub current_checksum: Option<String>,
-    pub older_instances: i64,
+    pub older_instances: u64,
 }
 
 /// Builds the data for the images command, sorted by image name.
@@ -62,7 +62,7 @@ mod tests {
 
     struct FakeReportSource {
         images: std::result::Result<Vec<Image>, &'static str>,
-        older: HashMap<String, i64>,
+        older: HashMap<String, u64>,
     }
 
     #[async_trait]
@@ -77,7 +77,7 @@ mod tests {
             &self,
             image_name: &str,
             _checksum: &str,
-        ) -> std::result::Result<i64, DynError> {
+        ) -> std::result::Result<u64, DynError> {
             Ok(*self.older.get(image_name).unwrap_or(&0))
         }
     }

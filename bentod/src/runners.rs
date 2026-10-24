@@ -529,7 +529,7 @@ impl InstanceSync {
         &self,
         host: &Host,
         instance: bento_runner::InstanceRef,
-        disk_gib: i64,
+        disk_gib: u64,
     ) -> Result<bento_types::State> {
         self.change(host, Operation::ResizeDisk { instance, disk_gib })
             .await
@@ -885,7 +885,7 @@ impl PollTask {
                     .host_observation(host.id)
                     .await?
                     .map_or(HostHealth::Unknown, |seen| seen.health);
-                let (seen, boot_id) =
+                let PolledHost { seen, boot_id } =
                     poll_host(client.as_ref(), &endpoint, &host, &lease, request_timeout).await;
                 let healthy = seen.error.is_none();
                 let after = store.observe_host(host.id, seen).await?;
@@ -1010,13 +1010,29 @@ async fn observe_instances(
     Ok(changed)
 }
 
+/// What one health and capability poll of a machine found.
+struct PolledHost {
+    seen: HostSeen,
+    /// Empty when the runner did not answer or reports none.
+    boot_id: String,
+}
+
+impl PolledHost {
+    fn failed(error: impl std::fmt::Display) -> Self {
+        Self {
+            seen: failed(error.to_string()),
+            boot_id: String::new(),
+        }
+    }
+}
+
 async fn poll_host(
     client: &dyn Client,
     endpoint: &str,
     host: &Host,
     lease: &watch::Receiver<Lease>,
     request_timeout: Duration,
-) -> (HostSeen, String) {
+) -> PolledHost {
     let current = lease.borrow().clone();
     let health = match send(
         client,
@@ -1031,12 +1047,9 @@ async fn poll_host(
     {
         Ok(Reply::Health(health)) => health,
         Ok(reply) => {
-            return (
-                failed(format!("runner answered {reply:?} to a health request")),
-                String::new(),
-            );
+            return PolledHost::failed(format!("runner answered {reply:?} to a health request"));
         }
-        Err(error) => return (failed(error), String::new()),
+        Err(error) => return PolledHost::failed(error),
     };
 
     let current = lease.borrow().clone();
@@ -1053,14 +1066,11 @@ async fn poll_host(
     {
         Ok(Reply::Capabilities(capabilities)) => capabilities,
         Ok(reply) => {
-            return (
-                failed(format!(
-                    "runner answered {reply:?} to a capabilities request"
-                )),
-                String::new(),
-            );
+            return PolledHost::failed(format!(
+                "runner answered {reply:?} to a capabilities request"
+            ));
         }
-        Err(error) => return (failed(error), String::new()),
+        Err(error) => return PolledHost::failed(error),
     };
 
     let seen = HostSeen {
@@ -1074,7 +1084,10 @@ async fn poll_host(
         hypervisor_version: Some(capabilities.hypervisor_version),
         error: None,
     };
-    (seen, health.boot_id)
+    PolledHost {
+        seen,
+        boot_id: health.boot_id,
+    }
 }
 
 async fn send(

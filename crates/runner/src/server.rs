@@ -152,7 +152,7 @@ mod tests {
         async fn resize_disk(
             &self,
             _: &InstanceRef,
-            _: i64,
+            _: u64,
         ) -> Result<bento_types::State, HostError> {
             Ok(bento_types::State::Stopped)
         }

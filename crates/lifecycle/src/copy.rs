@@ -3,9 +3,9 @@ use bento_network::GuestNetwork;
 use bento_types::{DesiredState, ImageKind, Instance, State, Visibility};
 
 use crate::fs::copy_file;
-use crate::manager::parse_prefix;
 use crate::new::seed;
 use crate::{Error, Manager, NewRequest, Result};
+use bento_network::Ipv4Prefix;
 
 impl Manager {
     /// Clones a stopped instance (SPEC 15). The clone retains the exact
@@ -25,7 +25,7 @@ impl Manager {
         if request.name.is_empty() {
             return Err(Error::operation("lifecycle: cp needs a target name"));
         }
-        if request.vcpu == 0 || request.memory_mib <= 0 || request.disk_gib <= 0 {
+        if request.vcpu == 0 || request.memory_mib == 0 || request.disk_gib == 0 {
             return Err(Error::operation(
                 "lifecycle: cp needs positive vcpu, memory, and disk",
             ));
@@ -64,16 +64,21 @@ impl Manager {
             Err(error) => {
                 return Err(Error::operation(format!(
                     "lifecycle: cp {}: {error}",
-                    source.name
+                    source.name,
+                    error = bento_types::error_chain(&error)
                 )));
             }
         }
-        let subnet = parse_prefix(&request.owner.subnet).map_err(|error| {
-            Error::operation(format!(
-                "lifecycle: user {} has a bad subnet {:?}: {error}",
-                request.owner.name, request.owner.subnet
-            ))
-        })?;
+        let subnet = request
+            .owner
+            .subnet
+            .parse::<Ipv4Prefix>()
+            .map_err(|error| {
+                Error::operation(format!(
+                    "lifecycle: user {} has a bad subnet {:?}: {error}",
+                    request.owner.name, request.owner.subnet
+                ))
+            })?;
         let (address, slot) =
             crate::manager::allocate_in_owned_slot(&self.store, request.host_id, subnet).await?;
         // A copy stays on its source's machine, so it is weighed against
@@ -158,7 +163,8 @@ impl Manager {
         instance.state = State::Running;
         if let Err(error) = self.store.set_observed_state(&uuid, State::Running).await {
             self.log.warn(&format!(
-                "cp: observed state not recorded; poller will catch up: {error}"
+                "cp: observed state not recorded; poller will catch up: {error}",
+                error = bento_types::error_chain(&*error)
             ));
         }
         Ok(instance)

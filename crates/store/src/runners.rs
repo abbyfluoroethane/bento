@@ -16,7 +16,7 @@ use std::time::Duration;
 use bento_types::{Deployment, Host, Lease, Placing, Slot};
 use rusqlite::{OptionalExtension, Transaction, params};
 
-use crate::{Error, Result, Store, format_time, parse_time};
+use crate::{Error, Result, Store, format_time, get_opt_u64, get_u64, parse_time, to_sql_int};
 
 /// Every column of `hosts`, in the order [`crate::hosts::scan_host`] reads.
 pub(crate) const HOST_COLUMNS: &str = "id, machine_id, name, libvirt_uri, endpoint, underlay, \
@@ -30,14 +30,12 @@ impl Store {
     /// writes it when the database is created.
     pub async fn deployment(&self) -> Result<Deployment> {
         self.with_conn(move |conn| {
-            let prefix: i64 = conn.query_row(
+            let runner_prefix: u8 = conn.query_row(
                 "SELECT runner_prefix FROM deployment WHERE id = 1",
                 [],
                 |row| row.get(0),
             )?;
-            Ok(Deployment {
-                runner_prefix: prefix as u8,
-            })
+            Ok(Deployment { runner_prefix })
         })
         .await
     }
@@ -66,13 +64,15 @@ impl Store {
             let deployment = Deployment {
                 runner_prefix: prefix,
             };
-            let old: i64 = tx.query_row(
+            let old: u8 = tx.query_row(
                 "SELECT runner_prefix FROM deployment WHERE id = 1",
                 [],
                 |row| row.get(0),
             )?;
-            let highest: Option<i64> =
-                tx.query_row("SELECT MAX(slot) FROM runner_slots", [], |row| row.get(0))?;
+            let highest: Option<u64> =
+                tx.query_row("SELECT MAX(slot) FROM runner_slots", [], |row| {
+                    get_opt_u64(row, 0)
+                })?;
             if let Some(highest) = highest
                 && highest >= deployment.slot_count()
             {
@@ -81,8 +81,8 @@ impl Store {
                     slot: highest,
                 });
             }
-            if old != i64::from(prefix) {
-                renumber_slots(tx, old as u8, prefix)?;
+            if old != prefix {
+                renumber_slots(tx, old, prefix)?;
             }
             tx.execute(
                 "UPDATE deployment SET runner_prefix = ? WHERE id = 1",
@@ -316,18 +316,18 @@ impl Store {
     /// This is the plain assignment, used by setup and by an operator
     /// adding a runner to an empty slot. Moving a slot that already holds
     /// instances is the fenced workflow of section 17, not this.
-    pub async fn claim_slot(&self, slot: i64, host_id: i64) -> Result<Slot> {
+    pub async fn claim_slot(&self, slot: u64, host_id: i64) -> Result<Slot> {
         self.with_tx(move |tx| {
-            let prefix: i64 = tx.query_row(
+            let prefix: u8 = tx.query_row(
                 "SELECT runner_prefix FROM deployment WHERE id = 1",
                 [],
                 |row| row.get(0),
             )?;
             let count = Deployment {
-                runner_prefix: prefix as u8,
+                runner_prefix: prefix,
             }
             .slot_count();
-            if slot < 0 || slot >= count {
+            if slot >= count {
                 return Err(Error::NoSuchSlot { slot, count });
             }
 
@@ -336,7 +336,7 @@ impl Store {
             // the way to move a slot that is in use. The address decides,
             // not the stored slot number, so a stale number cannot hide a
             // live guest (MULTI-NODE 7.1).
-            let shift = 8 - (prefix as u32 - 24);
+            let shift = 8 - u32::from(prefix.saturating_sub(24));
             // An instance with no slot holds no range yet (`bentod reconcile`
             // places it), so it does not count.
             let mut statement =
@@ -350,7 +350,8 @@ impl Store {
                 .filter(|(address, owner)| {
                     *owner != host_id && slot_of_address(address, shift) == Some(slot)
                 })
-                .count() as i64;
+                .count();
+            let occupied = u64::try_from(occupied).unwrap_or(u64::MAX);
             drop(statement);
             if occupied > 0 {
                 return Err(Error::SlotInUse { slot, occupied });
@@ -366,11 +367,11 @@ impl Store {
                    destination_host_id = NULL, \
                    operation_id = NULL \
                  WHERE owner_host_id <> excluded.owner_host_id",
-                params![slot, host_id],
+                params![to_sql_int(slot)?, host_id],
             )?;
             Ok(tx.query_row(
                 &format!("SELECT {SLOT_COLUMNS} FROM runner_slots WHERE slot = ?"),
-                [slot],
+                [to_sql_int(slot)?],
                 scan_slot,
             )?)
         })
@@ -445,10 +446,10 @@ impl Store {
                     contact,
                     seen.accepted_epoch,
                     seen.arch,
-                    seen.cpu_count,
-                    seen.memory_total_mib,
-                    seen.storage_total_gib,
-                    seen.storage_available_gib,
+                    seen.cpu_count.map(to_sql_int).transpose()?,
+                    seen.memory_total_mib.map(to_sql_int).transpose()?,
+                    seen.storage_total_gib.map(to_sql_int).transpose()?,
+                    seen.storage_available_gib.map(to_sql_int).transpose()?,
                     seen.hypervisor_version,
                     seen.error,
                 ],
@@ -483,10 +484,10 @@ pub struct HostSeen {
     pub machine_id: Option<String>,
     pub accepted_epoch: i64,
     pub arch: Option<String>,
-    pub cpu_count: Option<i64>,
-    pub memory_total_mib: Option<i64>,
-    pub storage_total_gib: Option<i64>,
-    pub storage_available_gib: Option<i64>,
+    pub cpu_count: Option<u64>,
+    pub memory_total_mib: Option<u64>,
+    pub storage_total_gib: Option<u64>,
+    pub storage_available_gib: Option<u64>,
     pub hypervisor_version: Option<String>,
     pub error: Option<String>,
 }
@@ -527,10 +528,10 @@ pub struct Observation {
     pub last_contact_at: Option<time::OffsetDateTime>,
     pub accepted_epoch: i64,
     pub arch: Option<String>,
-    pub cpu_count: Option<i64>,
-    pub memory_total_mib: Option<i64>,
-    pub storage_total_gib: Option<i64>,
-    pub storage_available_gib: Option<i64>,
+    pub cpu_count: Option<u64>,
+    pub memory_total_mib: Option<u64>,
+    pub storage_total_gib: Option<u64>,
+    pub storage_available_gib: Option<u64>,
     pub hypervisor_version: Option<String>,
     pub last_error: Option<String>,
 }
@@ -548,10 +549,10 @@ fn scan_observation(row: &rusqlite::Row<'_>) -> rusqlite::Result<Observation> {
         last_contact_at: contact.as_deref().map(|t| parse_time(1, t)).transpose()?,
         accepted_epoch: row.get(2)?,
         arch: row.get(3)?,
-        cpu_count: row.get(4)?,
-        memory_total_mib: row.get(5)?,
-        storage_total_gib: row.get(6)?,
-        storage_available_gib: row.get(7)?,
+        cpu_count: get_opt_u64(row, 4)?,
+        memory_total_mib: get_opt_u64(row, 5)?,
+        storage_total_gib: get_opt_u64(row, 6)?,
+        storage_available_gib: get_opt_u64(row, 7)?,
         hypervisor_version: row.get(8)?,
         last_error: row.get(9)?,
     })
@@ -573,14 +574,14 @@ fn bare_checksum(checksum: &str) -> String {
 
 /// The slot whose prefix holds an address, from its host octet
 /// (MULTI-NODE 7.1). `shift` is how far the octet moves right.
-fn slot_of_address(address: &str, shift: u32) -> Option<i64> {
-    let octet: u32 = address.rsplit('.').next()?.parse().ok()?;
-    (octet <= 255).then(|| i64::from(octet >> shift))
+fn slot_of_address(address: &str, shift: u32) -> Option<u64> {
+    let octet: u8 = address.rsplit('.').next()?.parse().ok()?;
+    Some(u64::from(u32::from(octet) >> shift))
 }
 
 #[derive(Clone)]
 struct SlotRow {
-    slot: i64,
+    slot: u64,
     state: String,
     owner: i64,
     epoch: i64,
@@ -599,7 +600,7 @@ fn renumber_slots(tx: &Transaction<'_>, old: u8, new: u8) -> Result<()> {
         statement
             .query_map([], |row| {
                 Ok(SlotRow {
-                    slot: row.get(0)?,
+                    slot: get_u64(row, 0)?,
                     state: row.get(1)?,
                     owner: row.get(2)?,
                     epoch: row.get(3)?,
@@ -613,8 +614,8 @@ fn renumber_slots(tx: &Transaction<'_>, old: u8, new: u8) -> Result<()> {
 
     let mut next: Vec<SlotRow> = Vec::new();
     for row in rows {
-        let children: Vec<i64> = if new > old {
-            let ratio = 1i64 << (new - old);
+        let children: Vec<u64> = if new > old {
+            let ratio = 1u64 << (new - old);
             (0..ratio).map(|k| row.slot * ratio + k).collect()
         } else {
             vec![row.slot >> (old - new)]
@@ -639,7 +640,7 @@ fn renumber_slots(tx: &Transaction<'_>, old: u8, new: u8) -> Result<()> {
         tx.execute(
             &format!("INSERT INTO runner_slots ({SLOT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?)"),
             params![
-                row.slot,
+                to_sql_int(row.slot)?,
                 row.state,
                 row.owner,
                 row.epoch,
@@ -650,7 +651,7 @@ fn renumber_slots(tx: &Transaction<'_>, old: u8, new: u8) -> Result<()> {
         )?;
     }
 
-    let shift = 8 - (new as u32 - 24);
+    let shift = 8 - u32::from(new.saturating_sub(24));
     let held: Vec<(String, String)> = {
         let mut statement = tx.prepare("SELECT uuid, address FROM instances")?;
         statement
@@ -661,7 +662,7 @@ fn renumber_slots(tx: &Transaction<'_>, old: u8, new: u8) -> Result<()> {
         if let Some(slot) = slot_of_address(&address, shift) {
             tx.execute(
                 "UPDATE instances SET slot = ? WHERE uuid = ?",
-                params![slot, uuid],
+                params![to_sql_int(slot)?, uuid],
             )?;
         }
     }
@@ -671,7 +672,7 @@ fn renumber_slots(tx: &Transaction<'_>, old: u8, new: u8) -> Result<()> {
 fn scan_slot(row: &rusqlite::Row<'_>) -> rusqlite::Result<Slot> {
     let state: String = row.get(1)?;
     Ok(Slot {
-        slot: row.get(0)?,
+        slot: get_u64(row, 0)?,
         state: crate::instances::parse_enum(1, &state)?,
         owner_host_id: row.get(2)?,
         ownership_epoch: row.get(3)?,
@@ -1124,9 +1125,9 @@ struct Weight {
 /// The columns [`weigh_host`] reads from the last observation.
 struct Weighed {
     health: String,
-    cpu_count: Option<i64>,
-    memory_total: Option<i64>,
-    storage_available: Option<i64>,
+    cpu_count: Option<u64>,
+    memory_total: Option<u64>,
+    storage_available: Option<u64>,
     arch: Option<String>,
 }
 
@@ -1145,9 +1146,9 @@ fn weigh_host(
             |row| {
                 Ok(Weighed {
                     health: row.get(0)?,
-                    cpu_count: row.get(1)?,
-                    memory_total: row.get(2)?,
-                    storage_available: row.get(3)?,
+                    cpu_count: get_opt_u64(row, 1)?,
+                    memory_total: get_opt_u64(row, 2)?,
+                    storage_available: get_opt_u64(row, 3)?,
                     arch: row.get(4)?,
                 })
             },
@@ -1169,10 +1170,10 @@ fn weigh_host(
 
     // A runner with no slot has no address to give the instance
     // (MULTI-NODE 12).
-    let slots: i64 = tx.query_row(
+    let slots: u64 = tx.query_row(
         "SELECT COUNT(*) FROM runner_slots WHERE owner_host_id = ? AND state = 'active'",
         [host.id],
-        |row| row.get(0),
+        |row| get_u64(row, 0),
     )?;
     if slots == 0 {
         return Ok(Err("owns no active slot".to_string()));
@@ -1184,22 +1185,22 @@ fn weigh_host(
         return Ok(Err(format!("is {host_arch}, the image is {want_arch}")));
     }
 
-    let (reserved_memory, reserved_vcpu): (i64, i64) = tx.query_row(
+    let (reserved_memory, reserved_vcpu): (u64, u64) = tx.query_row(
         "SELECT COALESCE(SUM(memory), 0), COALESCE(SUM(vcpu), 0) FROM instances WHERE host_id = ?",
         [host.id],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((get_u64(row, 0)?, get_u64(row, 1)?)),
     )?;
 
     let memory_total = memory_total.unwrap_or(0);
-    if memory_total <= 0 {
+    if memory_total == 0 {
         return Ok(Err("reported no memory".to_string()));
     }
-    let memory_limit =
-        bento_types::Capacity::from_host(memory_total, 0, overcommit_ratio).memory_mib;
-    if reserved_memory + want.memory_mib > memory_limit {
+    let memory_limit = bento_types::overcommitted_memory_mib(memory_total, overcommit_ratio);
+    let memory_after = reserved_memory.saturating_add(want.memory_mib);
+    if memory_after > memory_limit {
         return Ok(Err(format!(
             "has {} MiB left of {memory_limit}, the instance wants {}",
-            memory_limit - reserved_memory,
+            memory_limit.saturating_sub(reserved_memory),
             want.memory_mib
         )));
     }
@@ -1213,9 +1214,11 @@ fn weigh_host(
     }
 
     let cpu_count = cpu_count.unwrap_or(0).max(1);
+    let vcpu_after = reserved_vcpu.saturating_add(u64::from(want.vcpu));
+    // Ratios are for ordering hosts only, so f64 rounding does not matter.
     Ok(Ok(Weight {
-        memory_ratio: (reserved_memory + want.memory_mib) as f64 / memory_limit as f64,
-        vcpu_ratio: (reserved_vcpu + want.vcpu) as f64 / cpu_count as f64,
+        memory_ratio: memory_after as f64 / memory_limit as f64,
+        vcpu_ratio: vcpu_after as f64 / cpu_count as f64,
     }))
 }
 
@@ -1230,7 +1233,7 @@ mod placement_tests {
     const KONATA: &str = "ebb80f403ef641deaa486417f2b6992a";
     const TSUKASA: &str = "167eeb6836c44115aa084e7780e4328c";
 
-    fn seen(machine_id: &str, memory_total_mib: i64, storage_available_gib: i64) -> HostSeen {
+    fn seen(machine_id: &str, memory_total_mib: u64, storage_available_gib: u64) -> HostSeen {
         HostSeen {
             machine_id: Some(machine_id.to_string()),
             accepted_epoch: 1,
@@ -1244,7 +1247,7 @@ mod placement_tests {
         }
     }
 
-    fn want(memory_mib: i64, disk_gib: i64) -> Placing {
+    fn want(memory_mib: u64, disk_gib: u64) -> Placing {
         Placing {
             vcpu: 2,
             memory_mib,

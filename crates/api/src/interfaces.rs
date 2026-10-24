@@ -45,9 +45,9 @@ pub enum StoreError {
     )]
     Capacity {
         resource: String,
-        used: i64,
-        requested: i64,
-        limit: i64,
+        used: u64,
+        requested: u64,
+        limit: u64,
     },
     #[error(
         "store: name {name:?} was released by another user and is in cooldown for another {remaining:?}"
@@ -122,8 +122,8 @@ pub struct CreateSpec {
     pub name: String,
     pub image: String,
     pub vcpu: u32,
-    pub memory_mib: i64,
-    pub disk_gib: i64,
+    pub memory_mib: u64,
+    pub disk_gib: u64,
     pub nested: bool,
     pub ksm: bool,
 }
@@ -133,8 +133,8 @@ pub struct CreateSpec {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ResizeSpec {
     pub vcpu: u32,
-    pub memory_mib: i64,
-    pub disk_gib: i64,
+    pub memory_mib: u64,
+    pub disk_gib: u64,
     pub nested: bool,
 }
 
@@ -186,12 +186,12 @@ pub struct HostMetrics {
     pub cpu_pct: Vec<Point>,
     /// Memory in use on the host, oldest first.
     pub memory_used_mib: Vec<Point>,
-    pub memory_total_mib: i64,
+    pub memory_total_mib: u64,
     /// Real bytes on the storage volume, not virtual disk size.
     pub storage_used_gib: f64,
-    pub storage_total_gib: i64,
+    pub storage_total_gib: u64,
     /// Logical CPUs on the host, the ceiling for provisioned vCPUs.
-    pub cpu_count: i64,
+    pub cpu_count: u64,
     /// `true` while the figures are generated rather than measured.
     pub placeholder: bool,
 }
@@ -212,7 +212,7 @@ pub struct InstanceMetrics {
 #[derive(Debug, Clone, Copy, Default, serde::Serialize)]
 pub struct UserMetrics {
     pub cpu_pct: f64,
-    pub memory_used_mib: i64,
+    pub memory_used_mib: u64,
     pub storage_used_gib: f64,
     pub placeholder: bool,
 }
@@ -239,8 +239,8 @@ pub trait Metrics: Send + Sync + 'static {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CreateDefaults {
     pub vcpu: u32,
-    pub memory_mib: i64,
-    pub disk_gib: i64,
+    pub memory_mib: u64,
+    pub disk_gib: u64,
 }
 
 /// A terminal size in character cells.

@@ -80,8 +80,8 @@ impl Cli {
         let Some(instance) = self.resolve_owned(env, &name).await else {
             return 1;
         };
-        let port = match port_text.parse::<i64>() {
-            Ok(port @ 1..=65535) => port as u16,
+        let port = match port_text.parse::<u16>() {
+            Ok(port @ 1..) => port,
             _ => {
                 return env.fail_message(format!(
                     "port: {port_text:?} is not a port between 1 and 65535"

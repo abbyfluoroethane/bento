@@ -32,7 +32,8 @@ pub mod defaults {
     pub const RUNNER_MAX_CLOCK_SKEW: Duration = Duration::from_secs(60);
     /// SPEC 5.3: no overcommit.
     pub const OVERCOMMIT_RATIO: f64 = 1.0;
-    /// SPEC 7.2.
+    /// SPEC 7.2. An operator may set `0s` for no cooldown; only an omitted
+    /// key selects this value.
     pub const NAME_COOLDOWN: Duration = Duration::from_secs(24 * 3600);
     /// Names an instance may not take (SPEC 7.4). `bento` and `www` are the
     /// names a visitor assumes belong to the deployment itself.
@@ -40,7 +41,10 @@ pub mod defaults {
     /// SPEC 11.2.
     pub const RESTORE_BATCH_SIZE: u32 = 4;
     /// Carved into user `/24`s, SPEC 6.2.
-    pub const PRIVATE_RANGE: &str = "10.100.0.0/16";
+    pub const PRIVATE_RANGE: super::Ipv4Prefix = super::Ipv4Prefix {
+        addr: std::net::Ipv4Addr::new(10, 100, 0, 0),
+        bits: 16,
+    };
     /// The control plane behind the proxy. It sits outside
     /// [`PROXY_PORT_MIN`]..[`PROXY_PORT_MAX`] on purpose: the proxy binds
     /// every port of that range, on all interfaces by default, so a
@@ -60,14 +64,15 @@ pub mod defaults {
     /// `new` without `--cpu`.
     pub const VCPU: u32 = 2;
     /// `new` without `--memory`.
-    pub const MEMORY_MIB: i64 = 2048;
+    pub const MEMORY_MIB: u64 = 2048;
     /// `new` without `--disk`.
-    pub const DISK_GIB: i64 = 20;
+    pub const DISK_GIB: u64 = 20;
     /// Written into an instance's network configuration when `dns` is
     /// unset (SPEC 6.2).
-    pub const DNS: [&str; 2] = ["1.1.1.1", "9.9.9.9"];
-    /// Containerized image-builder used to turn bootc images into qcow2.
-    pub const BOOTC_BUILDER_IMAGE: &str = "";
+    pub const DNS: [std::net::IpAddr; 2] = [
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1)),
+        std::net::IpAddr::V4(std::net::Ipv4Addr::new(9, 9, 9, 9)),
+    ];
     /// Root filesystem used when a bootc image does not declare one.
     pub const BOOTC_ROOTFS: &str = "ext4";
     /// Rootful Podman storage shared with the image-builder container.
@@ -79,13 +84,13 @@ pub mod defaults {
 /// Anything that stops `bentod` from reading its configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    #[error("config: read {path}: {source}")]
+    #[error("config: read {path}")]
     Read {
         path: String,
         #[source]
         source: std::io::Error,
     },
-    #[error("config: {0}")]
+    #[error("config: invalid TOML")]
     Toml(#[from] toml::de::Error),
     #[error("config: {0}")]
     Invalid(String),
@@ -118,15 +123,19 @@ impl TlsMode {
     }
 }
 
-/// The full operator configuration.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+/// The full operator configuration, with every default resolved.
+///
+/// [`Config::parse`] is the only place that turns an omitted key into a
+/// default. A consumer reads a field and applies no fallback of its own.
+/// Zero keeps its literal meaning where zero is meaningful (a `0s`
+/// `name_cooldown` is no cooldown); `validate` rejects it where it is not.
+#[derive(Debug, Clone)]
 pub struct Config {
     /// The control plane's domain, e.g. `bento.foid.space`. The dashboard,
     /// the SSH frontend, and the OIDC callback all answer here (SPEC 1).
     pub base_domain: String,
-    /// The domain an instance publishes under, e.g. `foid.space`. Empty
-    /// means "the same as `base_domain`", which `parse` fills in (SPEC 7.1).
+    /// The domain an instance publishes under, e.g. `foid.space`. When the
+    /// file omits it, `parse` copies `base_domain` here (SPEC 7.1).
     pub instance_domain: String,
     /// Names an instance may not take (SPEC 7.4). The computed reservation
     /// in `reserved` is applied on top of this list.
@@ -146,13 +155,14 @@ pub struct Config {
     /// The reboot-restore batch size (SPEC 11.2).
     pub restore_batch_size: u32,
     /// The private range carved into user `/24`s (SPEC 6.2).
-    pub private_range: String,
+    pub private_range: Ipv4Prefix,
     /// Holds the SSH frontend host key and the key the frontend uses
     /// toward the guests (SPEC 10). Both are created on first use.
     pub key_dir: String,
     /// The resolvers written into every instance's cloud-init network
-    /// configuration (SPEC 6.2). Empty selects [`defaults::DNS`].
-    pub dns: Vec<String>,
+    /// configuration (SPEC 6.2). Omitting the key selects
+    /// [`defaults::DNS`]; an explicit empty list is rejected.
+    pub dns: Vec<IpAddr>,
     /// The user names allowed to use the operator-only dashboard
     /// controls, such as the database download (SPEC 12.1).
     pub operators: Vec<String>,
@@ -193,13 +203,13 @@ pub struct RunnerEntry {
     /// The next hop other machines use to reach this machine's guest
     /// slots (MULTI-NODE 8.5).
     ///
-    /// It defaults to the host part of `endpoint`, which on a LAN is the
+    /// When absent it is the host part of `endpoint`, which on a LAN is the
     /// machine's LAN address and is what a two-machine deployment wants.
     /// Setting it separately moves guest traffic onto a tunnel, such as
     /// a WireGuard or Tailscale address, while management traffic stays
     /// where it is. Management and guest data do not have to share a
     /// path, so they are two settings.
-    pub underlay: String,
+    pub underlay: Option<std::net::Ipv4Addr>,
 }
 
 impl RunnerEntry {
@@ -210,11 +220,8 @@ impl RunnerEntry {
     /// black hole that looks exactly like a healthy runner
     /// (MULTI-NODE 8.3), so it must fail at startup instead.
     pub fn underlay_address(&self) -> Result<std::net::Ipv4Addr, String> {
-        if !self.underlay.is_empty() {
-            return self
-                .underlay
-                .parse()
-                .map_err(|_| format!("underlay {:?} is not an IPv4 address", self.underlay));
+        if let Some(underlay) = self.underlay {
+            return Ok(underlay);
         }
         let host = endpoint_host(&self.endpoint)
             .ok_or_else(|| format!("endpoint {:?} has no host part", self.endpoint))?;
@@ -261,23 +268,24 @@ pub struct Listen {
     pub tls: TlsMode,
 }
 
-/// The shape of a `new` without flags (SPEC 15). An empty `image`
+/// The shape of a `new` without flags (SPEC 15). An absent `image`
 /// selects the first allowlist entry.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Defaults {
-    pub image: String,
+    pub image: Option<String>,
     pub vcpu: u32,
-    pub memory_mib: i64,
-    pub disk_gib: i64,
+    pub memory_mib: u64,
+    pub disk_gib: u64,
 }
 
 /// Host-side bootc conversion settings.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Bootc {
-    /// Required for OCI support and always pinned by digest.
-    pub builder_image: String,
+    /// Required for OCI support and always pinned by digest. Absent means
+    /// OCI images are off.
+    pub builder_image: Option<String>,
     /// Passed to image-builder for images that do not declare a rootfs.
     pub rootfs: String,
     /// Rootful Podman storage containing pulled bootc images.
@@ -289,7 +297,7 @@ pub struct Bootc {
 impl Default for Bootc {
     fn default() -> Self {
         Self {
-            builder_image: defaults::BOOTC_BUILDER_IMAGE.to_owned(),
+            builder_image: None,
             rootfs: defaults::BOOTC_ROOTFS.to_owned(),
             container_storage: defaults::CONTAINER_STORAGE.to_owned(),
             build_timeout: GoDuration(defaults::BOOTC_BUILD_TIMEOUT),
@@ -316,7 +324,8 @@ pub struct Acme {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct Oidc {
-    pub issuer: String,
+    /// Absent means dashboard login is off.
+    pub issuer: Option<String>,
     pub client_id: String,
     pub client_secret: String,
     /// Whether a verified login for an identity Bento has never seen
@@ -329,7 +338,7 @@ pub struct Oidc {
 impl Default for Oidc {
     fn default() -> Self {
         Self {
-            issuer: String::new(),
+            issuer: None,
             client_id: String::new(),
             client_secret: String::new(),
             // The provider is already the gate on who can authenticate, so
@@ -339,20 +348,80 @@ impl Default for Oidc {
     }
 }
 
+/// Where an allowlisted image comes from (SPEC 5.1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ImageSource {
+    /// A qcow2 download URL.
+    Url(String),
+    /// A bootc-compatible OCI operating-system image reference.
+    Oci(String),
+}
+
+impl ImageSource {
+    /// The URL or the OCI reference, whichever the entry names.
+    pub fn reference(&self) -> &str {
+        match self {
+            ImageSource::Url(value) | ImageSource::Oci(value) => value,
+        }
+    }
+
+    pub fn is_oci(&self) -> bool {
+        matches!(self, ImageSource::Oci(_))
+    }
+}
+
 /// One row of the operator image allowlist (SPEC 5.1).
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+///
+/// The TOML form is unchanged: a table with `name`, exactly one of `url`
+/// or `oci`, and an optional `pinned_checksum`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "RawImageEntry")]
 pub struct ImageEntry {
     pub name: String,
-    #[serde(default)]
-    pub url: String,
-    /// A bootc-compatible OCI operating-system image reference.
-    #[serde(default)]
-    pub oci: String,
+    pub source: ImageSource,
     /// When set, a download whose checksum differs is rejected. Absent
-    /// means trust on first use.
-    #[serde(default)]
+    /// means trust on first use. An OCI entry never sets it.
     pub pinned_checksum: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawImageEntry {
+    name: String,
+    url: Option<String>,
+    oci: Option<String>,
+    pinned_checksum: Option<String>,
+}
+
+impl TryFrom<RawImageEntry> for ImageEntry {
+    type Error = String;
+
+    fn try_from(raw: RawImageEntry) -> Result<Self, String> {
+        if raw.name.is_empty() {
+            return Err("images: entry with empty name".into());
+        }
+        let source = match (raw.url, raw.oci) {
+            (Some(url), None) if !url.is_empty() => ImageSource::Url(url),
+            (None, Some(oci)) if !oci.is_empty() => ImageSource::Oci(oci),
+            _ => {
+                return Err(format!(
+                    "images: entry {:?} must set exactly one of url or oci, non-empty",
+                    raw.name
+                ));
+            }
+        };
+        if source.is_oci() && raw.pinned_checksum.is_some() {
+            return Err(format!(
+                "images: OCI entry {:?} cannot set pinned_checksum; pin the OCI reference digest instead",
+                raw.name
+            ));
+        }
+        Ok(ImageEntry {
+            name: raw.name,
+            source,
+            pinned_checksum: raw.pinned_checksum,
+        })
+    }
 }
 
 impl Default for Config {
@@ -373,9 +442,9 @@ impl Default for Config {
             overcommit_ratio: defaults::OVERCOMMIT_RATIO,
             name_cooldown: GoDuration(defaults::NAME_COOLDOWN),
             restore_batch_size: defaults::RESTORE_BATCH_SIZE,
-            private_range: defaults::PRIVATE_RANGE.to_string(),
+            private_range: defaults::PRIVATE_RANGE,
             key_dir: defaults::KEY_DIR.to_string(),
-            dns: Vec::new(),
+            dns: defaults::DNS.to_vec(),
             operators: Vec::new(),
             listen: Listen::default(),
             defaults: Defaults::default(),
@@ -415,7 +484,7 @@ impl Default for Listen {
 impl Default for Defaults {
     fn default() -> Self {
         Defaults {
-            image: String::new(),
+            image: None,
             vcpu: defaults::VCPU,
             memory_mib: defaults::MEMORY_MIB,
             disk_gib: defaults::DISK_GIB,
@@ -423,35 +492,73 @@ impl Default for Defaults {
     }
 }
 
-/// An IPv4 network in CIDR form, as `private_range` carries it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// An IPv4 network in CIDR form, as `private_range` and a user's subnet
+/// carry it. This is the one CIDR parser in the workspace (SPEC 6.2).
+/// An address with host bits set is allowed, because a guest address is
+/// written as `10.100.0.5/24`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Ipv4Prefix {
     pub addr: std::net::Ipv4Addr,
     pub bits: u8,
 }
 
-/// Parses `10.100.0.0/16`. Rejects an IPv6 range, which SPEC 7.1 leaves
-/// out of version 1, and a prefix with bits set below its length.
-pub fn parse_prefix(s: &str) -> Result<Ipv4Prefix, String> {
-    let (addr_part, bits_part) = s
-        .split_once('/')
-        .ok_or_else(|| format!("{s:?} is not a CIDR range"))?;
-    let addr: IpAddr = addr_part
-        .parse()
-        .map_err(|_| format!("{addr_part:?} is not an IP address"))?;
-    let bits: u8 = bits_part
-        .parse()
-        .map_err(|_| format!("{bits_part:?} is not a prefix length"))?;
-    let addr = match addr {
-        IpAddr::V4(v4) => v4,
-        IpAddr::V6(_) => {
-            return Err(format!("must be an IPv4 range, got {s:?}"));
-        }
-    };
-    if bits > 32 {
-        return Err(format!("prefix length /{bits} exceeds /32"));
+impl Ipv4Prefix {
+    /// Whether the prefix covers `address`.
+    pub fn contains(self, address: std::net::Ipv4Addr) -> bool {
+        let mask: u32 = match self.bits {
+            0 => 0,
+            bits @ 1..=32 => u32::MAX << (32 - bits),
+            _ => return false,
+        };
+        (u32::from(address) & mask) == (u32::from(self.addr) & mask)
     }
-    Ok(Ipv4Prefix { addr, bits })
+}
+
+impl std::fmt::Display for Ipv4Prefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.addr, self.bits)
+    }
+}
+
+/// Parses `10.100.0.0/16`. Rejects an IPv6 range, which SPEC 7.1 leaves
+/// out of version 1, and a prefix length above 32.
+impl std::str::FromStr for Ipv4Prefix {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, String> {
+        let (addr_part, bits_part) = s
+            .split_once('/')
+            .ok_or_else(|| format!("{s:?} is not a CIDR range"))?;
+        let addr: IpAddr = addr_part
+            .parse()
+            .map_err(|_| format!("{addr_part:?} is not an IP address"))?;
+        let bits: u8 = bits_part
+            .parse()
+            .map_err(|_| format!("{bits_part:?} is not a prefix length"))?;
+        let addr = match addr {
+            IpAddr::V4(v4) => v4,
+            IpAddr::V6(_) => {
+                return Err(format!("must be an IPv4 range, got {s:?}"));
+            }
+        };
+        if bits > 32 {
+            return Err(format!("prefix length /{bits} exceeds /32"));
+        }
+        Ok(Ipv4Prefix { addr, bits })
+    }
+}
+
+impl<'de> Deserialize<'de> for Ipv4Prefix {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let text = String::deserialize(deserializer)?;
+        text.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+impl Serialize for Ipv4Prefix {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
 }
 
 /// The port of a listen address, or `None` when it has none to read.
@@ -459,6 +566,76 @@ pub fn parse_prefix(s: &str) -> Result<Ipv4Prefix, String> {
 fn listen_port(addr: &str) -> Option<u16> {
     let (_, port) = addr.rsplit_once(':')?;
     port.parse().ok()
+}
+
+/// The file as written. Every top-level key is optional; `resolve` is the
+/// one place an omitted key becomes its default (SPEC 15).
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawConfig {
+    base_domain: Option<String>,
+    instance_domain: Option<String>,
+    reserved_names: Option<Vec<String>>,
+    libvirt_uri: Option<String>,
+    image_dir: Option<String>,
+    storage_dir: Option<String>,
+    db_path: Option<String>,
+    overcommit_ratio: Option<f64>,
+    name_cooldown: Option<GoDuration>,
+    restore_batch_size: Option<u32>,
+    private_range: Option<Ipv4Prefix>,
+    key_dir: Option<String>,
+    dns: Option<Vec<IpAddr>>,
+    operators: Option<Vec<String>>,
+    listen: Option<Listen>,
+    defaults: Option<Defaults>,
+    acme: Option<Acme>,
+    oidc: Option<Oidc>,
+    bootc: Option<Bootc>,
+    runner: Option<Runner>,
+    runners: Option<Vec<RunnerEntry>>,
+    images: Option<Vec<ImageEntry>>,
+}
+
+impl RawConfig {
+    fn resolve(self) -> Config {
+        let mut cfg = Config::default();
+        macro_rules! set {
+            ($($field:ident),* $(,)?) => {
+                $(if let Some(value) = self.$field { cfg.$field = value; })*
+            };
+        }
+        set!(
+            base_domain,
+            reserved_names,
+            libvirt_uri,
+            image_dir,
+            storage_dir,
+            db_path,
+            overcommit_ratio,
+            name_cooldown,
+            restore_batch_size,
+            private_range,
+            key_dir,
+            dns,
+            operators,
+            listen,
+            defaults,
+            acme,
+            oidc,
+            bootc,
+            runner,
+            runners,
+            images,
+        );
+        // An omitted instance domain means the deployment publishes
+        // instances under the control plane's own domain, which is what
+        // every single-domain deployment does (SPEC 7.1).
+        cfg.instance_domain = self
+            .instance_domain
+            .unwrap_or_else(|| cfg.base_domain.clone());
+        cfg
+    }
 }
 
 impl Config {
@@ -476,13 +653,7 @@ impl Config {
     /// Decodes TOML text, applies defaults for unset values, and
     /// validates the result.
     pub fn parse(data: &str) -> Result<Config, Error> {
-        let mut cfg: Config = toml::from_str(data)?;
-        // An unset instance domain means the deployment publishes instances
-        // under the control plane's own domain, which is what every
-        // single-domain deployment does (SPEC 7.1).
-        if cfg.instance_domain.is_empty() {
-            cfg.instance_domain.clone_from(&cfg.base_domain);
-        }
+        let cfg = toml::from_str::<RawConfig>(data)?.resolve();
         cfg.validate()?;
         Ok(cfg)
     }
@@ -507,16 +678,6 @@ impl Config {
         names
     }
 
-    /// The resolvers to write into an instance's network configuration,
-    /// falling back to the built-in pair (SPEC 6.2).
-    pub fn resolvers(&self) -> Vec<String> {
-        if self.dns.is_empty() {
-            defaults::DNS.iter().map(|s| s.to_string()).collect()
-        } else {
-            self.dns.clone()
-        }
-    }
-
     /// Whether `name` may use the operator-only controls (SPEC 12.1).
     pub fn is_operator(&self, name: &str) -> bool {
         self.operators.iter().any(|op| op == name)
@@ -530,8 +691,8 @@ impl Config {
     /// The image an unflagged `new` uses: the configured default, or the
     /// first allowlist entry (SPEC 15).
     pub fn default_image(&self) -> Option<&str> {
-        if !self.defaults.image.is_empty() {
-            return Some(&self.defaults.image);
+        if let Some(image) = &self.defaults.image {
+            return Some(image);
         }
         self.images.first().map(|i| i.name.as_str())
     }
@@ -541,7 +702,12 @@ impl Config {
             return Err(invalid("base_domain is required"));
         }
         if self.instance_domain.is_empty() {
-            return Err(invalid("instance_domain is required"));
+            return Err(invalid("instance_domain must not be empty"));
+        }
+        if self.dns.is_empty() {
+            return Err(invalid(
+                "dns must list at least one resolver; omit the key for the default pair",
+            ));
         }
         for (field, value) in [
             ("base_domain", &self.base_domain),
@@ -567,8 +733,7 @@ impl Config {
         if self.runner.max_clock_skew.std().is_zero() {
             return Err(invalid("runner: max_clock_skew must be positive"));
         }
-        let prefix = parse_prefix(&self.private_range)
-            .map_err(|e| invalid(format!("private_range: {e}")))?;
+        let prefix = self.private_range;
         if prefix.bits > 24 {
             return Err(invalid(format!(
                 "private_range must be /24 or wider to hold user /24s, got /{}",
@@ -588,7 +753,7 @@ impl Config {
                 .and_then(|host| host.parse::<std::net::Ipv4Addr>().ok());
             for (what, address) in [("underlay", Some(underlay)), ("endpoint", endpoint)] {
                 let Some(address) = address else { continue };
-                if prefix_contains(prefix, address) {
+                if prefix.contains(address) {
                     return Err(invalid(format!(
                         "runner {:?} {what} {address} is inside private_range {}; \
                          management and next-hop addresses must sit outside the guest \
@@ -597,6 +762,12 @@ impl Config {
                     )));
                 }
             }
+        }
+        if self.listen.proxy_port_min == 0 {
+            return Err(invalid("proxy_port_min must be at least 1"));
+        }
+        for (field, value) in [("http", &self.listen.http), ("ssh", &self.listen.ssh)] {
+            resolve_listen_addr(value).map_err(|e| invalid(format!("listen {field}: {e}")))?;
         }
         if self.listen.proxy_port_min > self.listen.proxy_port_max {
             return Err(invalid(format!(
@@ -615,11 +786,6 @@ impl Config {
                 self.listen.proxy_port_min, self.listen.proxy_port_max
             )));
         }
-        for d in &self.dns {
-            if d.parse::<IpAddr>().is_err() {
-                return Err(invalid(format!("dns: {d:?} is not an IP address")));
-            }
-        }
         if self.defaults.vcpu < 1 || self.defaults.memory_mib < 1 || self.defaults.disk_gib < 1 {
             return Err(invalid(
                 "defaults: vcpu, memory_mib, and disk_gib must be positive",
@@ -636,36 +802,23 @@ impl Config {
         }
         let mut seen = std::collections::HashSet::new();
         for img in &self.images {
-            if img.name.is_empty() {
-                return Err(invalid("images: entry with empty name"));
-            }
-            if img.url.is_empty() == img.oci.is_empty() {
-                return Err(invalid(format!(
-                    "images: entry {:?} must set exactly one of url or oci",
-                    img.name
-                )));
-            }
-            if !img.oci.is_empty() && img.pinned_checksum.is_some() {
-                return Err(invalid(format!(
-                    "images: OCI entry {:?} cannot set pinned_checksum; pin the OCI reference digest instead",
-                    img.name
-                )));
-            }
             if !seen.insert(img.name.as_str()) {
                 return Err(invalid(format!("images: duplicate entry {:?}", img.name)));
             }
         }
-        let has_oci = self.images.iter().any(|image| !image.oci.is_empty());
-        if has_oci && self.bootc.builder_image.is_empty() {
-            return Err(invalid(
-                "bootc: builder_image pinned by sha256 digest is required for OCI images",
-            ));
-        }
-        if !self.bootc.builder_image.is_empty() && !pinned_oci_reference(&self.bootc.builder_image)
-        {
-            return Err(invalid(
-                "bootc: builder_image must use an immutable @sha256:<64 hex> digest",
-            ));
+        let has_oci = self.images.iter().any(|image| image.source.is_oci());
+        match &self.bootc.builder_image {
+            None if has_oci => {
+                return Err(invalid(
+                    "bootc: builder_image pinned by sha256 digest is required for OCI images",
+                ));
+            }
+            Some(builder) if !pinned_oci_reference(builder) => {
+                return Err(invalid(
+                    "bootc: builder_image must use an immutable @sha256:<64 hex> digest",
+                ));
+            }
+            _ => {}
         }
         Ok(())
     }
@@ -722,16 +875,6 @@ pub fn resolve_listen_addr(addr: &str) -> Result<SocketAddr, String> {
         .map_err(|_| format!("{addr:?} is not a listen address"))
 }
 
-/// Whether an IPv4 prefix covers an address.
-fn prefix_contains(prefix: Ipv4Prefix, address: std::net::Ipv4Addr) -> bool {
-    let mask: u32 = match prefix.bits {
-        0 => 0,
-        bits @ 1..=32 => u32::MAX << (32 - bits),
-        _ => return false,
-    };
-    (u32::from(address) & mask) == (u32::from(prefix.addr) & mask)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -747,7 +890,7 @@ mod tests {
         assert_eq!(cfg.overcommit_ratio, 1.0);
         assert_eq!(cfg.cooldown(), Duration::from_secs(24 * 3600));
         assert_eq!(cfg.restore_batch_size, 4);
-        assert_eq!(cfg.private_range, "10.100.0.0/16");
+        assert_eq!(cfg.private_range.to_string(), "10.100.0.0/16");
         assert_eq!(cfg.runner.listen, "127.0.0.1:10443");
         assert_eq!(cfg.runner.fence_db, "/var/lib/bento/runner.db");
         assert_eq!(cfg.runner.max_clock_skew.std(), Duration::from_secs(60));
@@ -761,8 +904,21 @@ mod tests {
         assert_eq!(cfg.listen.tls, TlsMode::Acme);
         assert_eq!(cfg.bootc.rootfs, "ext4");
         assert_eq!(cfg.bootc.container_storage, "/var/lib/containers/storage");
-        assert!(cfg.bootc.builder_image.is_empty());
+        assert_eq!(cfg.bootc.builder_image, None);
+        assert_eq!(cfg.defaults.image, None);
+        assert_eq!(cfg.dns, defaults::DNS.to_vec());
+        assert_eq!(cfg.oidc.issuer, None);
         assert_eq!(cfg.bootc.build_timeout.std(), Duration::from_secs(30 * 60));
+    }
+
+    #[test]
+    fn a_negative_size_is_a_parse_error() {
+        for key in ["memory_mib", "disk_gib"] {
+            let src = format!("base_domain = \"bento.example.org\"\n[defaults]\n{key} = -1\n");
+            assert!(Config::parse(&src).is_err(), "{key} = -1 must not parse");
+        }
+        let ok = "base_domain = \"bento.example.org\"\n[defaults]\nmemory_mib = 512\n";
+        assert_eq!(Config::parse(ok).unwrap().defaults.memory_mib, 512);
     }
 
     #[test]
@@ -811,7 +967,7 @@ pinned_checksum = "sha256-deadbeef"
         assert_eq!(cfg.restore_batch_size, 8);
         assert_eq!(cfg.listen.ssh, ":2222");
         assert_eq!(cfg.acme.cloudflare_token, "cf-token");
-        assert_eq!(cfg.oidc.issuer, "https://id.foid.space");
+        assert_eq!(cfg.oidc.issuer.as_deref(), Some("https://id.foid.space"));
         assert_eq!(cfg.images.len(), 2);
         assert_eq!(
             cfg.images[1].pinned_checksum.as_deref(),
@@ -823,7 +979,15 @@ pinned_checksum = "sha256-deadbeef"
 
     #[track_caller]
     fn parse_err(src: &str, want: &str) {
-        let err = Config::parse(src).expect_err("parse succeeded").to_string();
+        let error = Config::parse(src).expect_err("parse succeeded");
+        // Display names one layer. The TOML detail is in the source chain.
+        let mut err = error.to_string();
+        let mut cause = std::error::Error::source(&error);
+        while let Some(layer) = cause {
+            err.push_str(": ");
+            err.push_str(&layer.to_string());
+            cause = layer.source();
+        }
         assert!(err.contains(want), "error {err:?} should contain {want:?}");
     }
 
@@ -1052,10 +1216,9 @@ endpoint = "http://10.0.0.97:10443"
         ))
         .unwrap();
         assert_eq!(cfg.bootc.build_timeout.std(), Duration::from_secs(45 * 60));
-        assert!(cfg.images[0].url.is_empty());
         assert_eq!(
-            cfg.images[0].oci,
-            format!("quay.io/x/os@sha256:{}", "34".repeat(32))
+            cfg.images[0].source,
+            ImageSource::Oci(format!("quay.io/x/os@sha256:{}", "34".repeat(32)))
         );
     }
 
@@ -1178,9 +1341,121 @@ endpoint = "http://10.0.0.97:10443"
     #[test]
     fn resolvers_fall_back_to_the_built_in_pair() {
         let cfg = Config::parse("base_domain = \"b.example\"").unwrap();
-        assert_eq!(cfg.resolvers(), vec!["1.1.1.1", "9.9.9.9"]);
+        assert_eq!(cfg.dns, defaults::DNS.to_vec());
         let cfg = Config::parse("base_domain = \"b.example\"\ndns = [\"10.0.0.1\"]").unwrap();
-        assert_eq!(cfg.resolvers(), vec!["10.0.0.1"]);
+        assert_eq!(cfg.dns, vec!["10.0.0.1".parse::<IpAddr>().unwrap()]);
+        // An explicit empty list is not "use the default".
+        parse_err("base_domain = \"b.example\"\ndns = []", "dns must list");
+        parse_err("base_domain = \"b.example\"\ndns = [\"nope\"]", "nope");
+    }
+
+    /// Zero means zero where zero is meaningful, and an omitted key means
+    /// the default. The two must not be confused.
+    #[test]
+    fn zero_cooldown_is_no_cooldown() {
+        let cfg = Config::parse("base_domain = \"b.example\"\nname_cooldown = \"0s\"").unwrap();
+        assert_eq!(cfg.cooldown(), Duration::ZERO);
+        let cfg = Config::parse("base_domain = \"b.example\"").unwrap();
+        assert_eq!(cfg.cooldown(), defaults::NAME_COOLDOWN);
+    }
+
+    #[test]
+    fn meaningless_zeros_are_rejected() {
+        for (body, want) in [
+            ("restore_batch_size = 0", "restore_batch_size"),
+            ("overcommit_ratio = 0.0", "overcommit_ratio"),
+            ("[listen]\nproxy_port_min = 0", "proxy_port_min"),
+            ("[runner]\nmax_clock_skew = \"0s\"", "max_clock_skew"),
+            ("[bootc]\nbuild_timeout = \"0s\"", "build_timeout"),
+            ("[defaults]\nvcpu = 0", "positive"),
+            ("[defaults]\nmemory_mib = 0", "positive"),
+            ("[defaults]\ndisk_gib = 0", "positive"),
+        ] {
+            parse_err(&format!("base_domain = \"b.example\"\n{body}"), want);
+        }
+    }
+
+    #[test]
+    fn omitted_keys_in_a_table_keep_their_defaults() {
+        let cfg = Config::parse("base_domain = \"b.example\"\n[defaults]\nvcpu = 4").unwrap();
+        assert_eq!(cfg.defaults.vcpu, 4);
+        assert_eq!(cfg.defaults.memory_mib, defaults::MEMORY_MIB);
+        assert_eq!(cfg.defaults.disk_gib, defaults::DISK_GIB);
+    }
+
+    #[test]
+    fn image_source_is_exactly_one_of_url_or_oci() {
+        let cfg = Config::parse(
+            "base_domain = \"b.example\"\n[[images]]\nname = \"a\"\nurl = \"https://x/a\"",
+        )
+        .unwrap();
+        assert_eq!(cfg.images[0].source, ImageSource::Url("https://x/a".into()));
+        for body in [
+            "name = \"a\"",
+            "name = \"a\"\nurl = \"\"",
+            "name = \"a\"\nurl = \"u\"\noci = \"o\"",
+            "name = \"\"\nurl = \"u\"",
+        ] {
+            parse_err(
+                &format!("base_domain = \"b.example\"\n[[images]]\n{body}"),
+                "images:",
+            );
+        }
+    }
+
+    #[test]
+    fn prefix_round_trips() {
+        let prefix: Ipv4Prefix = "10.100.0.0/16".parse().unwrap();
+        assert_eq!(prefix.to_string(), "10.100.0.0/16");
+        assert!(prefix.contains("10.100.4.9".parse().unwrap()));
+        assert!(!prefix.contains("10.101.0.1".parse().unwrap()));
+        for bad in ["10.0.0.0", "10.0.0.0/33", "x/8", "10.0.0.0/x", "fd00::/48"] {
+            assert!(bad.parse::<Ipv4Prefix>().is_err(), "{bad}");
+        }
+    }
+
+    /// Every config in the repository, including the TOML blocks in the
+    /// docs, must keep parsing.
+    #[test]
+    fn repository_configs_parse() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let example = std::fs::read_to_string(root.join("bento.example.toml")).unwrap();
+        Config::parse(&example).expect("bento.example.toml");
+        for doc in ["DEPLOYING.md", "README.md", "TESTING.md"] {
+            let Ok(text) = std::fs::read_to_string(root.join(doc)) else {
+                continue;
+            };
+            let mut blocks = Vec::new();
+            let mut current: Option<String> = None;
+            for line in text.lines() {
+                match (&mut current, line.trim_end()) {
+                    (None, "```toml") => current = Some(String::new()),
+                    (Some(block), "```") => {
+                        blocks.push(std::mem::take(block));
+                        current = None;
+                    }
+                    (Some(block), line) => {
+                        block.push_str(line);
+                        block.push('\n');
+                    }
+                    _ => {}
+                }
+            }
+            for block in blocks {
+                // A snippet that names no base_domain is a fragment of a
+                // larger file; give it the one required key.
+                let text = if block.contains("base_domain") {
+                    block
+                } else {
+                    format!("base_domain = \"b.example\"\n{block}")
+                };
+                // The docs show a placeholder where a real digest goes.
+                let text = text.replace("<digest>", &"0".repeat(64));
+                if let Err(error) = Config::parse(&text) {
+                    panic!("{doc} snippet does not parse: {error}\n{text}");
+                }
+            }
+        }
     }
 
     #[test]

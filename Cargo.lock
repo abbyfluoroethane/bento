@@ -315,6 +315,7 @@ name = "bento-cli"
 version = "0.9.0"
 dependencies = [
  "async-trait",
+ "bento-config",
  "bento-hypervisor",
  "bento-store",
  "bento-types",
@@ -378,6 +379,7 @@ name = "bento-images"
 version = "0.9.0"
 dependencies = [
  "async-trait",
+ "bento-config",
  "bento-types",
  "futures",
  "hex",
@@ -398,6 +400,7 @@ version = "0.9.0"
 dependencies = [
  "async-trait",
  "bento-cloudinit",
+ "bento-config",
  "bento-hypervisor",
  "bento-network",
  "bento-types",
@@ -535,6 +538,7 @@ name = "bento-types"
 version = "0.9.0"
 dependencies = [
  "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "time",
 ]
@@ -576,6 +580,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "tempfile",
+ "thiserror 2.0.20",
  "time",
  "tokio",
  "tokio-util",

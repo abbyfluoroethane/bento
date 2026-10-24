@@ -12,7 +12,7 @@ use super::{
     Page, Params, Shell, Viewer, VmView, checked, checked_name, done, error_page, failed, json,
     readable_instance, render, shell, urlencode, vm_view,
 };
-use crate::{AppState, ResizeSpec, error_parts};
+use crate::{Action, AppState, HandlerError, ResizeSpec, error_parts};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -50,19 +50,15 @@ async fn load(
     uuid: &str,
     path: &str,
     params: &std::collections::HashMap<String, String>,
-) -> Result<(Shell, Instance), Box<Response>> {
+) -> Result<(Shell, Instance), HandlerError> {
     let shell = match shell(state, user, path, params).await {
         Ok(shell) => shell,
-        Err(error) => return Err(Box::new(failed(state, user, path, error).await)),
+        Err(error) => return Err(failed(state, user, path, error).await.into()),
     };
     match readable_instance(state, uuid, user).await {
         Ok(Some(instance)) => Ok((shell, instance)),
-        Ok(None) => Err(Box::new(error_page(
-            shell,
-            StatusCode::NOT_FOUND,
-            "No such VM.",
-        ))),
-        Err(error) => Err(Box::new(failed(state, user, path, error).await)),
+        Ok(None) => Err(error_page(shell, StatusCode::NOT_FOUND, "No such VM.").into()),
+        Err(error) => Err(failed(state, user, path, error).await.into()),
     }
 }
 
@@ -74,7 +70,7 @@ async fn page(
     params: &std::collections::HashMap<String, String>,
     status: StatusCode,
     error: Option<String>,
-) -> Response {
+) -> Result<Response, HandlerError> {
     let path = match tab {
         Tab::Dashboard => format!("/vm/{uuid}"),
         Tab::Terminal => format!("/vm/{uuid}/terminal"),
@@ -82,10 +78,7 @@ async fn page(
         Tab::Sharing => format!("/vm/{uuid}/sharing"),
         Tab::Danger => format!("/vm/{uuid}/danger"),
     };
-    let (shell, instance) = match load(state, user, uuid, &path, params).await {
-        Ok(loaded) => loaded,
-        Err(response) => return *response,
-    };
+    let (shell, instance) = load(state, user, uuid, &path, params).await?;
     let shares = if tab == Tab::Sharing && instance.owner_id == user.id {
         match state.0.store.shares_for(&instance.uuid).await {
             Ok(shares) => {
@@ -102,7 +95,7 @@ async fn page(
                 }
                 views
             }
-            Err(error) => return failed(state, user, &path, error).await,
+            Err(error) => return Err(failed(state, user, &path, error).await.into()),
         }
     } else {
         Vec::new()
@@ -115,7 +108,7 @@ async fn page(
                 .filter(|account| !shares.iter().any(|share| share.user == account.name))
                 .map(|account| account.name)
                 .collect(),
-            Err(error) => return failed(state, user, &path, error).await,
+            Err(error) => return Err(failed(state, user, &path, error).await.into()),
         }
     } else {
         Vec::new()
@@ -152,7 +145,7 @@ async fn page(
         candidates,
         error,
     };
-    render(status, template, &Page { shell, data })
+    Ok(render(status, template, &Page { shell, data }))
 }
 
 pub(crate) async fn dashboard(
@@ -160,7 +153,7 @@ pub(crate) async fn dashboard(
     Extension(user): Viewer,
     AxumPath(uuid): AxumPath<String>,
     axum::extract::Query(params): Params,
-) -> Response {
+) -> Result<Response, HandlerError> {
     page(
         &state,
         &user,
@@ -178,7 +171,7 @@ pub(crate) async fn terminal(
     Extension(user): Viewer,
     AxumPath(uuid): AxumPath<String>,
     axum::extract::Query(params): Params,
-) -> Response {
+) -> Result<Response, HandlerError> {
     page(
         &state,
         &user,
@@ -196,7 +189,7 @@ pub(crate) async fn settings(
     Extension(user): Viewer,
     AxumPath(uuid): AxumPath<String>,
     axum::extract::Query(params): Params,
-) -> Response {
+) -> Result<Response, HandlerError> {
     page(
         &state,
         &user,
@@ -214,7 +207,7 @@ pub(crate) async fn sharing(
     Extension(user): Viewer,
     AxumPath(uuid): AxumPath<String>,
     axum::extract::Query(params): Params,
-) -> Response {
+) -> Result<Response, HandlerError> {
     page(
         &state,
         &user,
@@ -232,7 +225,7 @@ pub(crate) async fn danger(
     Extension(user): Viewer,
     AxumPath(uuid): AxumPath<String>,
     axum::extract::Query(params): Params,
-) -> Response {
+) -> Result<Response, HandlerError> {
     page(
         &state,
         &user,
@@ -256,7 +249,7 @@ struct InstanceMetricsJson {
     placeholder: bool,
     cpu_pct: SeriesJson,
     memory_used_mib: SeriesJson,
-    memory_total_mib: i64,
+    memory_total_mib: u64,
 }
 
 fn series(points: &[crate::Point]) -> SeriesJson {
@@ -325,23 +318,18 @@ async fn owned(
     user: &User,
     uuid: &str,
     path: &str,
-) -> Result<Instance, Box<Response>> {
-    match readable_instance(state, uuid, user).await {
-        Ok(Some(instance)) if instance.owner_id == user.id => Ok(instance),
-        Ok(Some(_)) => Err(Box::new(
-            match shell(state, user, path, &Default::default()).await {
-                Ok(shell) => error_page(shell, StatusCode::FORBIDDEN, "You cannot change this VM."),
-                Err(error) => failed(state, user, path, error).await,
-            },
-        )),
-        Ok(None) => Err(Box::new(
-            match shell(state, user, path, &Default::default()).await {
-                Ok(shell) => error_page(shell, StatusCode::NOT_FOUND, "No such VM."),
-                Err(error) => failed(state, user, path, error).await,
-            },
-        )),
-        Err(error) => Err(Box::new(failed(state, user, path, error).await)),
+) -> Result<Instance, HandlerError> {
+    let (status, message) = match readable_instance(state, uuid, user).await {
+        Ok(Some(instance)) if instance.owner_id == user.id => return Ok(instance),
+        Ok(Some(_)) => (StatusCode::FORBIDDEN, "You cannot change this VM."),
+        Ok(None) => (StatusCode::NOT_FOUND, "No such VM."),
+        Err(error) => return Err(failed(state, user, path, error).await.into()),
+    };
+    Err(match shell(state, user, path, &Default::default()).await {
+        Ok(shell) => error_page(shell, status, message),
+        Err(error) => failed(state, user, path, error).await,
     }
+    .into())
 }
 
 #[derive(Debug, Deserialize)]
@@ -353,13 +341,13 @@ pub(crate) struct SettingsForm {
     #[serde(default)]
     memory_gib: f64,
     #[serde(default)]
-    disk_gib: i64,
+    disk_gib: u64,
     #[serde(default)]
     nested: Option<String>,
     #[serde(default)]
     public: Option<String>,
     #[serde(default)]
-    http_port: i64,
+    http_port: u16,
 }
 
 /// Applies every changed field of the settings form, in an order that
@@ -370,12 +358,9 @@ pub(crate) async fn save_settings(
     Extension(user): Viewer,
     AxumPath(uuid): AxumPath<String>,
     Form(form): Form<SettingsForm>,
-) -> Response {
+) -> Result<Response, HandlerError> {
     let path = format!("/vm/{uuid}/settings");
-    let instance = match owned(&state, &user, &uuid, &path).await {
-        Ok(instance) => instance,
-        Err(response) => return *response,
-    };
+    let instance = owned(&state, &user, &uuid, &path).await?;
     let fail = |message: String, status: StatusCode| {
         let state = state.clone();
         let user = user.clone();
@@ -398,7 +383,7 @@ pub(crate) async fn save_settings(
         Ok(name) => name,
         Err(message) => return fail(message, StatusCode::BAD_REQUEST).await,
     };
-    let memory_mib = (form.memory_gib * 1024.0).round() as i64;
+    let memory_mib = bento_types::mib_from_gib(form.memory_gib);
     if form.vcpu < 1 || memory_mib < 128 {
         return fail(
             "vCPU and memory must be positive".to_string(),
@@ -423,16 +408,14 @@ pub(crate) async fn save_settings(
     } else {
         instance.visibility
     };
-    let port = match u16::try_from(form.http_port) {
-        Ok(port) if port > 0 => port,
-        _ => {
-            return fail(
-                "port must be between 1 and 65535".to_string(),
-                StatusCode::BAD_REQUEST,
-            )
-            .await;
-        }
-    };
+    let port = form.http_port;
+    if port == 0 {
+        return fail(
+            "port must be between 1 and 65535".to_string(),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
 
     let spec = ResizeSpec {
         vcpu: form.vcpu,
@@ -485,7 +468,7 @@ pub(crate) async fn save_settings(
     } else {
         format!("Saved {}", changed.join(", "))
     };
-    done(&path, &toast)
+    Ok(done(&path, &toast))
 }
 
 #[derive(Debug, Deserialize)]
@@ -503,63 +486,61 @@ pub(crate) async fn add_share(
     Extension(user): Viewer,
     AxumPath(uuid): AxumPath<String>,
     Form(form): Form<ShareForm>,
-) -> Response {
+) -> Result<Response, HandlerError> {
     let path = format!("/vm/{uuid}/sharing");
-    let instance = match owned(&state, &user, &uuid, &path).await {
-        Ok(instance) => instance,
-        Err(response) => return *response,
-    };
+    let instance = owned(&state, &user, &uuid, &path).await?;
     let name = if form.user.trim().is_empty() {
         form.user_text.trim()
     } else {
         form.user.trim()
     };
     if name.is_empty() {
-        return warn(&path, "Type a user name");
+        return Ok(warn(&path, "Type a user name"));
     }
     let target = match state.0.store.user_by_name(name).await {
         Ok(target) => target,
         Err(error) if crate::is_not_found(&error) => {
-            return warn(&path, &format!("no user named {name}"));
+            return Ok(warn(&path, &format!("no user named {name}")));
         }
-        Err(error) => return failed(&state, &user, &path, error).await,
+        Err(error) => return Err(failed(&state, &user, &path, error).await.into()),
     };
     if target.id == user.id {
-        return warn(&path, "You own this VM");
+        return Ok(warn(&path, "You own this VM"));
     }
-    match state.0.store.add_share(&instance.uuid, target.id).await {
-        Ok(()) => done(&path, &format!("Shared with {}", target.name)),
-        Err(error) => {
-            let (_, message) = error_parts(&error);
-            warn(&path, &message)
-        }
-    }
+    Ok(
+        match state.0.store.add_share(&instance.uuid, target.id).await {
+            Ok(()) => done(&path, &format!("Shared with {}", target.name)),
+            Err(error) => {
+                let (_, message) = error_parts(&error);
+                warn(&path, &message)
+            }
+        },
+    )
 }
 
 pub(crate) async fn remove_share(
     State(state): State<AppState>,
     Extension(user): Viewer,
     AxumPath((uuid, target_name)): AxumPath<(String, String)>,
-) -> Response {
+) -> Result<Response, HandlerError> {
     let path = format!("/vm/{uuid}/sharing");
-    let instance = match owned(&state, &user, &uuid, &path).await {
-        Ok(instance) => instance,
-        Err(response) => return *response,
-    };
+    let instance = owned(&state, &user, &uuid, &path).await?;
     let target = match state.0.store.user_by_name(&target_name).await {
         Ok(target) => target,
         Err(error) if crate::is_not_found(&error) => {
-            return warn(&path, &format!("no user named {target_name}"));
+            return Ok(warn(&path, &format!("no user named {target_name}")));
         }
-        Err(error) => return failed(&state, &user, &path, error).await,
+        Err(error) => return Err(failed(&state, &user, &path, error).await.into()),
     };
-    match state.0.store.remove_share(&instance.uuid, target.id).await {
-        Ok(()) => done(&path, &format!("Revoked {}", target.name)),
-        Err(error) => {
-            let (_, message) = error_parts(&error);
-            warn(&path, &message)
-        }
-    }
+    Ok(
+        match state.0.store.remove_share(&instance.uuid, target.id).await {
+            Ok(()) => done(&path, &format!("Revoked {}", target.name)),
+            Err(error) => {
+                let (_, message) = error_parts(&error);
+                warn(&path, &message)
+            }
+        },
+    )
 }
 
 fn warn(path: &str, message: &str) -> Response {
@@ -567,60 +548,58 @@ fn warn(path: &str, message: &str) -> Response {
     axum::response::Redirect::to(&format!("{path}?warn={}", urlencode(message))).into_response()
 }
 
-async fn action(state: AppState, user: User, uuid: String, action: &'static str) -> Response {
+async fn action(
+    state: AppState,
+    user: User,
+    uuid: String,
+    action: Action,
+) -> Result<Response, HandlerError> {
     let path = format!("/vm/{uuid}/danger");
-    let instance = match owned(&state, &user, &uuid, &path).await {
-        Ok(instance) => instance,
-        Err(response) => return *response,
-    };
-    let result = match action {
-        "start" => state.0.lifecycle.start(&instance.uuid).await,
-        "stop" => state.0.lifecycle.stop(&instance.uuid).await,
-        "restart" => state.0.lifecycle.restart(&instance.uuid).await,
-        _ => unreachable!(),
-    };
-    match result {
-        Ok(()) => done(
-            &path,
-            &format!(
-                "{} {}",
-                match action {
-                    "start" => "Starting",
-                    "stop" => "Stopping",
-                    _ => "Restarting",
-                },
-                instance.name
+    let instance = owned(&state, &user, &uuid, &path).await?;
+    Ok(
+        match action.run(&*state.0.lifecycle, &instance.uuid).await {
+            Ok(()) => done(
+                &path,
+                &format!(
+                    "{} {}",
+                    match action {
+                        Action::Start => "Starting",
+                        Action::Stop => "Stopping",
+                        Action::Restart => "Restarting",
+                    },
+                    instance.name
+                ),
             ),
-        ),
-        Err(error) => {
-            let (_, message) = error_parts(&error);
-            warn(&path, &message)
-        }
-    }
+            Err(error) => {
+                let (_, message) = error_parts(&error);
+                warn(&path, &message)
+            }
+        },
+    )
 }
 
 pub(crate) async fn start(
     State(state): State<AppState>,
     Extension(user): Viewer,
     AxumPath(uuid): AxumPath<String>,
-) -> Response {
-    action(state, user, uuid, "start").await
+) -> Result<Response, HandlerError> {
+    action(state, user, uuid, Action::Start).await
 }
 
 pub(crate) async fn stop(
     State(state): State<AppState>,
     Extension(user): Viewer,
     AxumPath(uuid): AxumPath<String>,
-) -> Response {
-    action(state, user, uuid, "stop").await
+) -> Result<Response, HandlerError> {
+    action(state, user, uuid, Action::Stop).await
 }
 
 pub(crate) async fn restart(
     State(state): State<AppState>,
     Extension(user): Viewer,
     AxumPath(uuid): AxumPath<String>,
-) -> Response {
-    action(state, user, uuid, "restart").await
+) -> Result<Response, HandlerError> {
+    action(state, user, uuid, Action::Restart).await
 }
 
 #[derive(Debug, Deserialize)]
@@ -635,20 +614,17 @@ pub(crate) async fn delete(
     Extension(user): Viewer,
     AxumPath(uuid): AxumPath<String>,
     Form(form): Form<DeleteForm>,
-) -> Response {
+) -> Result<Response, HandlerError> {
     let path = format!("/vm/{uuid}/danger");
-    let instance = match owned(&state, &user, &uuid, &path).await {
-        Ok(instance) => instance,
-        Err(response) => return *response,
-    };
+    let instance = owned(&state, &user, &uuid, &path).await?;
     if form.confirm.trim() != instance.name {
-        return warn(&path, "Name does not match");
+        return Ok(warn(&path, "Name does not match"));
     }
-    match state.0.lifecycle.delete(&instance.uuid).await {
+    Ok(match state.0.lifecycle.delete(&instance.uuid).await {
         Ok(()) => done("/", &format!("Deleted {}", instance.name)),
         Err(error) => {
             let (_, message) = error_parts(&error);
             warn(&path, &message)
         }
-    }
+    })
 }

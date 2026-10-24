@@ -7,6 +7,7 @@ repository.workspace = true
 
 [dependencies]
 async-trait = { workspace = true }
+bento-config = { workspace = true }
 bento-types = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }

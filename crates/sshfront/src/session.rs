@@ -15,7 +15,6 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::server::{GuestClient, KeyLinker, PairingRequest, PendingLink, Server};
-use crate::{DEFAULT_DIAL_INTERVAL, DEFAULT_START_TIMEOUT};
 
 pub(crate) type SessionInput = Pin<Box<dyn AsyncRead + Send>>;
 pub(crate) type SessionOutput = Pin<Box<dyn AsyncWrite + Send>>;
@@ -366,7 +365,11 @@ pub(crate) async fn proxy(server: &Server, instance: Instance, mut session: Sess
             .write_all(format!("bento: starting {}\r\n", instance.name).as_bytes())
             .await;
         if let Err(error) = server.starter.start_instance(instance.clone()).await {
-            let message = format!("bento: starting {} failed: {error}", instance.name);
+            let message = format!(
+                "bento: starting {} failed: {}",
+                instance.name,
+                bento_types::error_chain(error.as_ref())
+            );
             let _ = session
                 .stderr
                 .write_all(format!("{message}\r\n").as_bytes())
@@ -378,8 +381,8 @@ pub(crate) async fn proxy(server: &Server, instance: Instance, mut session: Sess
 
     // Step 8 waits for sshd in the guest, for 120 seconds by default.
     let address = guest_address(&instance.address);
-    let timeout = effective_timeout(server.start_timeout);
-    let interval = effective_interval(server.dial_interval);
+    let timeout = server.start_timeout;
+    let interval = server.dial_interval;
     let connection = match wait_ssh(server, &address, timeout, interval).await {
         Ok(connection) => connection,
         Err(error) => {
@@ -408,22 +411,6 @@ fn guest_address(address: &str) -> String {
     match address.parse::<std::net::IpAddr>() {
         Ok(std::net::IpAddr::V6(_)) => format!("[{address}]:22"),
         Ok(std::net::IpAddr::V4(_)) | Err(_) => format!("{address}:22"),
-    }
-}
-
-fn effective_timeout(value: Duration) -> Duration {
-    if value.is_zero() {
-        DEFAULT_START_TIMEOUT
-    } else {
-        value
-    }
-}
-
-fn effective_interval(value: Duration) -> Duration {
-    if value.is_zero() {
-        DEFAULT_DIAL_INTERVAL
-    } else {
-        value
     }
 }
 
@@ -887,7 +874,7 @@ mod tests {
         wait_ssh,
     };
     use crate::server::{
-        BoxError, BoxedIo, CLIRunner, Dialer, InstanceStore, KeyLinker, KeyStore, PairingRequest,
+        BoxError, BoxedIo, CliRunner, Dialer, InstanceStore, KeyLinker, KeyStore, PairingRequest,
         PendingLink, Server, Starter,
     };
 
@@ -963,7 +950,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl CLIRunner for FakeCli {
+    impl CliRunner for FakeCli {
         async fn run(
             &self,
             user: User,

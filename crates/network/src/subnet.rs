@@ -15,10 +15,7 @@ const GATEWAY_HOST: u32 = 1;
 /// The DNS servers written into cloud-init network configuration when
 /// the operator does not override them. No resolver runs on the user
 /// bridges, so instances use public resolvers.
-pub const DEFAULT_DNS: [IpAddr; 2] = [
-    IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
-    IpAddr::V4(Ipv4Addr::new(9, 9, 9, 9)),
-];
+pub const DEFAULT_DNS: [IpAddr; 2] = bento_config::defaults::DNS;
 
 /// Carves the operator-configured private range into per-user `/24`
 /// subnets (SPEC 6.2). The mapping from subnet index to CIDR is
@@ -33,11 +30,17 @@ impl Plan {
     /// Parses the private range, for example `10.77.0.0/16`, and returns
     /// its subnet plan.
     pub fn new(private_range: &str) -> Result<Self> {
-        let prefix = bento_config::parse_prefix(private_range)
+        let prefix = private_range
+            .parse::<Ipv4Prefix>()
             .map_err(|err| invalid(format!("private range: {err}")))?;
+        Self::from_prefix(prefix)
+    }
+
+    /// Returns the subnet plan for an already parsed private range.
+    pub fn from_prefix(prefix: Ipv4Prefix) -> Result<Self> {
         if prefix.bits > 24 {
             return Err(invalid(format!(
-                "private range {private_range:?} is narrower than /24"
+                "private range \"{prefix}\" is narrower than /24"
             )));
         }
         Ok(Self {
@@ -215,9 +218,7 @@ pub(crate) fn require_slash_24(prefix: Ipv4Prefix) -> Result<()> {
 }
 
 pub(crate) fn contains(prefix: Ipv4Prefix, address: Ipv4Addr) -> bool {
-    prefix.bits <= 32
-        && (addr_to_u32(address) & prefix_mask(prefix.bits))
-            == (addr_to_u32(prefix.addr) & prefix_mask(prefix.bits))
+    prefix.contains(address)
 }
 
 pub(crate) fn masked(prefix: Ipv4Prefix) -> Ipv4Prefix {
@@ -279,7 +280,7 @@ mod tests {
     }
 
     fn prefix(cidr: &str) -> Ipv4Prefix {
-        bento_config::parse_prefix(cidr).unwrap()
+        cidr.parse::<bento_config::Ipv4Prefix>().unwrap()
     }
 
     #[test]

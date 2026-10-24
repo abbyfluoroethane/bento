@@ -94,8 +94,8 @@ pub trait Store: Send + Sync {
     async fn check_resize(
         &self,
         uuid: &str,
-        memory_mib: i64,
-        disk_gib: i64,
+        memory_mib: u64,
+        disk_gib: u64,
         capacity: Capacity,
     ) -> std::result::Result<(), DynError>;
     /// Reruns the capacity check with this instance's current figures
@@ -104,8 +104,8 @@ pub trait Store: Send + Sync {
         &self,
         uuid: &str,
         vcpu: u32,
-        memory_mib: i64,
-        disk_gib: i64,
+        memory_mib: u64,
+        disk_gib: u64,
         nested: bool,
         capacity: Capacity,
     ) -> std::result::Result<(), DynError>;
@@ -174,7 +174,7 @@ pub trait Fleet: Send + Sync {
         &self,
         host_id: i64,
         instance: &Instance,
-        disk_gib: i64,
+        disk_gib: u64,
     ) -> std::result::Result<(), DynError>;
 }
 
@@ -209,12 +209,12 @@ pub struct ProvisionSpec {
 
 /// Builds the NoCloud seed ISO (SPEC 5.2).
 #[async_trait]
-pub trait ISOBuilder: Send + Sync {
+pub trait IsoBuilder: Send + Sync {
     async fn build(&self, seed: &Seed, iso_path: &Path) -> std::result::Result<(), DynError>;
 }
 
 #[async_trait]
-impl ISOBuilder for bento_cloudinit::Builder {
+impl IsoBuilder for bento_cloudinit::Builder {
     async fn build(&self, seed: &Seed, iso_path: &Path) -> std::result::Result<(), DynError> {
         self.build(seed, iso_path)
             .await
@@ -228,7 +228,7 @@ pub trait OverlayResizer: Send + Sync {
     async fn resize_overlay(
         &self,
         overlay_path: &Path,
-        disk_gib: i64,
+        disk_gib: u64,
     ) -> std::result::Result<(), DynError>;
 }
 
@@ -277,25 +277,29 @@ pub type DeleteIsoFuture = Pin<Box<dyn Future<Output = std::result::Result<(), D
 pub type DeleteIso = Arc<dyn Fn(PathBuf) -> DeleteIsoFuture + Send + Sync>;
 pub type IsoExists = Arc<dyn Fn(&Path) -> bool + Send + Sync>;
 
-/// Wires a [`Manager`]. Hypervisor, store, images, ISO builder, network
-/// plan, and storage directory are required; every other field defaults.
-#[derive(Default)]
+/// Wires a [`Manager`]. The hypervisor, store, fleet, ISO builder, network
+/// plan, and storage directory are required, so [`Config::new`] takes
+/// them and a `Config` cannot exist without them. The tunable values
+/// start at the documented defaults; `Manager::new` takes the values it is
+/// given as they are. A zero `name_cooldown` is no cooldown (SPEC 7.2). A
+/// zero batch size, interval, or timeout, and an empty resolver list, are
+/// refused.
 pub struct Config {
-    pub hypervisor: Option<Arc<dyn Hypervisor>>,
+    pub hypervisor: Arc<dyn Hypervisor>,
     /// Optional persistent XML replacement capability.
     pub definer: Option<Arc<dyn Definer>>,
     /// Optional libvirt autostart clearing capability.
     pub autostart_clearer: Option<Arc<dyn AutostartClearer>>,
-    pub store: Option<Arc<dyn Store>>,
+    pub store: Arc<dyn Store>,
     /// Selects rows for host-local work (MULTI-NODE 21).
     pub host_id: i64,
     /// The machines an instance can live on. `bentod` supplies one that
     /// acts locally or calls a runner, whichever machine an instance is
     /// on (MULTI-NODE 13.1).
-    pub fleet: Option<Arc<dyn Fleet>>,
-    pub iso: Option<Arc<dyn ISOBuilder>>,
+    pub fleet: Arc<dyn Fleet>,
+    pub iso: Arc<dyn IsoBuilder>,
     pub resizer: Option<Arc<dyn OverlayResizer>>,
-    pub plan: Option<Plan>,
+    pub plan: Plan,
     pub storage_dir: PathBuf,
     pub name_cooldown: Duration,
     pub batch_size: usize,
@@ -312,6 +316,52 @@ pub struct Config {
     pub iso_exists: Option<IsoExists>,
 }
 
+impl Config {
+    /// A configuration with the required parts and the documented defaults
+    /// for the rest. Set the other fields with struct update syntax.
+    pub fn new(
+        hypervisor: Arc<dyn Hypervisor>,
+        store: Arc<dyn Store>,
+        fleet: Arc<dyn Fleet>,
+        iso: Arc<dyn IsoBuilder>,
+        plan: Plan,
+        storage_dir: PathBuf,
+    ) -> Self {
+        Self {
+            hypervisor,
+            definer: None,
+            autostart_clearer: None,
+            store,
+            host_id: 0,
+            fleet,
+            iso,
+            resizer: None,
+            plan,
+            storage_dir,
+            name_cooldown: bento_config::defaults::NAME_COOLDOWN,
+            batch_size: bento_config::defaults::RESTORE_BATCH_SIZE as usize,
+            dns: bento_network::DEFAULT_DNS.to_vec(),
+            logger: None,
+            nested_enabled: None,
+            poll_interval: DEFAULT_POLL_INTERVAL,
+            start_poll_interval: DEFAULT_START_POLL_INTERVAL,
+            start_timeout: DEFAULT_START_TIMEOUT,
+            sleep: None,
+            new_uuid: None,
+            now: None,
+            delete_iso: None,
+            iso_exists: None,
+        }
+    }
+}
+
+/// How often the manager checks the hypervisor for drift.
+const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(30);
+/// How often a start waits and looks again.
+const DEFAULT_START_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// How long a start waits for the guest.
+const DEFAULT_START_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
 /// Orchestrates instance lifecycle operations.
 pub struct Manager {
     pub(crate) hyp: Arc<dyn Hypervisor>,
@@ -321,7 +371,7 @@ pub struct Manager {
     pub(crate) host_id: i64,
     /// The machines an instance can live on (MULTI-NODE 13.1).
     pub(crate) fleet: Arc<dyn Fleet>,
-    pub(crate) iso: Arc<dyn ISOBuilder>,
+    pub(crate) iso: Arc<dyn IsoBuilder>,
     pub(crate) resizer: Arc<dyn OverlayResizer>,
     pub(crate) plan: Plan,
     pub(crate) storage_dir: PathBuf,
@@ -343,23 +393,32 @@ pub struct Manager {
 impl Manager {
     /// Validates configuration and applies injectable defaults.
     pub fn new(config: Config) -> Result<Self> {
-        let hyp = config.hypervisor.ok_or(Error::Config("a Hypervisor"))?;
-        let store = config.store.ok_or(Error::Config("a Store"))?;
-        let fleet = config.fleet.ok_or(Error::Config("a Fleet"))?;
-        let iso = config.iso.ok_or(Error::Config("an ISOBuilder"))?;
-        let plan = config.plan.ok_or(Error::Config("a network Plan"))?;
         if config.storage_dir.as_os_str().is_empty() {
             return Err(Error::Config("a StorageDir"));
         }
+        if config.batch_size == 0 {
+            return Err(Error::Config("a batch size of at least 1"));
+        }
+        if config.dns.is_empty() {
+            return Err(Error::Config("at least one DNS resolver"));
+        }
+        if config.poll_interval.is_zero()
+            || config.start_poll_interval.is_zero()
+            || config.start_timeout.is_zero()
+        {
+            return Err(Error::Config("poll and start intervals above zero"));
+        }
         let nested = config.nested_enabled.unwrap_or_else(|| {
             Arc::new(|| {
-                let (enabled, path) = bento_hypervisor::nested_enabled(
+                let state = bento_hypervisor::nested_enabled(
                     bento_hypervisor::CheckConfig::default(),
                     &bento_hypervisor::default_check_deps(),
                 );
                 (
-                    enabled,
-                    path.map_or_else(String::new, |path| path.display().to_string()),
+                    state.is_enabled(),
+                    state
+                        .path()
+                        .map_or_else(String::new, |path| path.display().to_string()),
                 )
             })
         });
@@ -372,34 +431,26 @@ impl Manager {
         });
         let iso_exists = config.iso_exists.unwrap_or_else(|| Arc::new(Path::exists));
         Ok(Self {
-            hyp,
+            hyp: config.hypervisor,
             definer: config.definer,
             autostart_clearer: config.autostart_clearer,
-            store,
+            store: config.store,
             host_id: config.host_id,
-            fleet,
-            iso,
+            fleet: config.fleet,
+            iso: config.iso,
             resizer: config
                 .resizer
                 .unwrap_or_else(|| Arc::new(QemuImgResizer::default())),
-            plan,
+            plan: config.plan,
             storage_dir: config.storage_dir,
-            cooldown: nonzero(config.name_cooldown, Duration::from_secs(24 * 60 * 60)),
-            batch_size: if config.batch_size == 0 {
-                4
-            } else {
-                config.batch_size
-            },
-            dns: if config.dns.is_empty() {
-                bento_network::DEFAULT_DNS.to_vec()
-            } else {
-                config.dns
-            },
+            cooldown: config.name_cooldown,
+            batch_size: config.batch_size,
+            dns: config.dns,
             log: config.logger.unwrap_or_else(|| Arc::new(TracingLogger)),
             nested,
-            poll_every: nonzero(config.poll_interval, Duration::from_secs(30)),
-            start_poll: nonzero(config.start_poll_interval, Duration::from_millis(500)),
-            start_wait: nonzero(config.start_timeout, Duration::from_secs(5 * 60)),
+            poll_every: config.poll_interval,
+            start_poll: config.start_poll_interval,
+            start_wait: config.start_timeout,
             sleep: config.sleep.unwrap_or_else(|| Arc::new(TokioSleep)),
             new_uuid: config.new_uuid.unwrap_or_else(|| Arc::new(random_uuid)),
             now: config
@@ -461,7 +512,7 @@ impl Manager {
         owner: &User,
         with_iso: bool,
     ) -> Result<String> {
-        let subnet = parse_prefix(&owner.subnet).map_err(|error| {
+        let subnet = owner.subnet.parse::<Ipv4Prefix>().map_err(|error| {
             Error::operation(format!(
                 "lifecycle: user {} has a bad subnet {:?}: {error}",
                 owner.name, owner.subnet
@@ -470,7 +521,9 @@ impl Manager {
         let index = self.plan.index(subnet).map_err(|error| {
             Error::operation(format!(
                 "lifecycle: subnet {}/{} outside the private range: {error}",
-                subnet.addr, subnet.bits
+                subnet.addr,
+                subnet.bits,
+                error = bento_types::error_chain(&error)
             ))
         })?;
         let network = UserNetwork::new(self.plan, index as isize).map_err(Error::caused)?;
@@ -504,14 +557,14 @@ impl Manager {
             .user_by_id(instance.owner_id)
             .await
             .map_err(|error| {
-                Error::operation(format!("lifecycle: owner of {}: {error}", instance.name))
+                Error::operation(format!(
+                    "lifecycle: owner of {}: {error}",
+                    instance.name,
+                    error = bento_types::error_chain(&*error)
+                ))
             })?;
         self.domain_xml(instance, &owner, with_iso)
     }
-}
-
-fn nonzero(value: Duration, default: Duration) -> Duration {
-    if value.is_zero() { default } else { value }
 }
 
 /// Makes an ID for an instance, process, or request (MULTI-NODE 11.3).
@@ -540,20 +593,6 @@ pub fn random_uuid() -> String {
     )
 }
 
-pub(crate) fn parse_prefix(value: &str) -> std::result::Result<Ipv4Prefix, String> {
-    let (address, bits) = value
-        .rsplit_once('/')
-        .ok_or_else(|| "missing prefix length".to_string())?;
-    let addr = address
-        .parse::<Ipv4Addr>()
-        .map_err(|error| error.to_string())?;
-    let bits = bits.parse::<u8>().map_err(|error| error.to_string())?;
-    if bits > 32 {
-        return Err("prefix length out of range".to_string());
-    }
-    Ok(Ipv4Prefix { addr, bits })
-}
-
 pub(crate) struct AddressView(pub(crate) Arc<dyn Store>);
 
 #[async_trait]
@@ -566,18 +605,9 @@ impl AddressStore for AddressView {
         Ok(rows
             .into_iter()
             .filter_map(|instance| instance.address.parse().ok())
-            .filter(|address: &Ipv4Addr| prefix_contains(subnet, *address))
+            .filter(|address: &Ipv4Addr| subnet.contains(*address))
             .collect())
     }
-}
-
-fn prefix_contains(prefix: Ipv4Prefix, address: Ipv4Addr) -> bool {
-    let mask = if prefix.bits == 0 {
-        0
-    } else {
-        u32::MAX << (32 - prefix.bits)
-    };
-    u32::from(prefix.addr) & mask == u32::from(address) & mask
 }
 
 /// Picks the address and slot for a new instance on one machine.
@@ -595,10 +625,10 @@ pub(crate) async fn allocate_in_owned_slot(
     store: &Arc<dyn Store>,
     host_id: i64,
     subnet: Ipv4Prefix,
-) -> Result<(Ipv4Addr, i64)> {
+) -> Result<(Ipv4Addr, u64)> {
     let deployment = store.deployment().await.map_err(Error::caused)?;
     let slots = Slots::new(deployment.runner_prefix).map_err(Error::caused)?;
-    let mut owned: Vec<i64> = store
+    let mut owned: Vec<u64> = store
         .slots()
         .await
         .map_err(Error::caused)?
@@ -614,7 +644,8 @@ pub(crate) async fn allocate_in_owned_slot(
     let view = AddressView(store.clone());
     let mut exhausted = None;
     for slot in owned {
-        match bento_network::allocate_address(&view, subnet, slots, slot as u32).await {
+        let number = u32::try_from(slot).map_err(Error::caused)?;
+        match bento_network::allocate_address(&view, subnet, slots, number).await {
             Ok(address) => return Ok((address, slot)),
             Err(error @ bento_network::Error::AddressesExhausted) => exhausted = Some(error),
             Err(error) => return Err(Error::caused(error)),

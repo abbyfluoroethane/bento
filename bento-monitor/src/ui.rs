@@ -584,12 +584,12 @@ fn count(number: usize, thing: &str) -> String {
     }
 }
 
-fn mib(value: i64) -> String {
-    human_bytes((value.max(0) as u64).saturating_mul(1024 * 1024))
+fn mib(value: u64) -> String {
+    human_bytes(value.saturating_mul(1024 * 1024))
 }
 
-fn gib(value: i64) -> String {
-    human_bytes((value.max(0) as u64).saturating_mul(1024 * 1024 * 1024))
+fn gib(value: u64) -> String {
+    human_bytes(value.saturating_mul(1024 * 1024 * 1024))
 }
 
 /// A name cut to fit its column, with the cut marked.
@@ -706,7 +706,7 @@ fn config_lines(config: &Config) -> Vec<Line<'static>> {
         field("overcommit", format!("{:.2}", config.overcommit_ratio)),
         field("name cooldown", human_duration(config.name_cooldown.0)),
         field("restore batch", config.restore_batch_size.to_string()),
-        field("private range", config.private_range.clone()),
+        field("private range", config.private_range.to_string()),
         field(
             "operators",
             if config.operators.is_empty() {
@@ -717,13 +717,16 @@ fn config_lines(config: &Config) -> Vec<Line<'static>> {
         ),
         field("acme email", or_none(&config.acme.email)),
         field("acme token", present(&config.acme.cloudflare_token)),
-        field("oidc issuer", or_none(&config.oidc.issuer)),
+        field(
+            "oidc issuer",
+            or_none(config.oidc.issuer.as_deref().unwrap_or_default()),
+        ),
         field("oidc client", or_none(&config.oidc.client_id)),
         field("oidc secret", present(&config.oidc.client_secret)),
         field("oidc signup", config.oidc.allow_signup.to_string()),
     ];
-    if !config.bootc.builder_image.is_empty() {
-        lines.push(field("bootc builder", config.bootc.builder_image.clone()));
+    if let Some(builder) = &config.bootc.builder_image {
+        lines.push(field("bootc builder", builder.clone()));
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
@@ -731,10 +734,9 @@ fn config_lines(config: &Config) -> Vec<Line<'static>> {
         Style::new().add_modifier(Modifier::BOLD),
     )));
     for image in &config.images {
-        let source = if image.oci.is_empty() {
-            image.url.clone()
-        } else {
-            format!("oci {}", image.oci)
+        let source = match &image.source {
+            bento_config::ImageSource::Url(url) => url.clone(),
+            bento_config::ImageSource::Oci(oci) => format!("oci {oci}"),
         };
         let pin = match &image.pinned_checksum {
             Some(_) => " (pinned)",
@@ -1181,9 +1183,8 @@ mod tests {
     fn reserved_sizes_read_in_the_units_libvirt_reports_them_in() {
         assert_eq!(mib(2048), "2.0 GiB");
         assert_eq!(gib(20), "20.0 GiB");
-        // A machine that reported nothing must not read as a negative
-        // size.
-        assert_eq!(mib(-1), "0 B");
+        // A machine that reported nothing reads as zero.
+        assert_eq!(mib(0), "0 B");
     }
 
     #[test]

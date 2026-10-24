@@ -8,8 +8,7 @@ mod store;
 
 pub use report::{ReportSource, Status, report};
 pub use store::{
-    CommandRunner, DB, DEFAULT_DIR, Doer, DynError, Error, ReqwestClient, Result, RunError, Runner,
-    Store,
+    CommandRunner, DB, Doer, DynError, Error, ReqwestClient, Result, RunError, Runner, Store,
 };
 
 #[cfg(test)]

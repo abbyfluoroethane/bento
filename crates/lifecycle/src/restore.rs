@@ -11,14 +11,18 @@ impl Manager {
     /// Restore selects only this host's instances (MULTI-NODE 21).
     pub async fn restore(&self) -> Result<()> {
         let domains = self.hyp.list().await.map_err(|error| {
-            Error::operation(format!("lifecycle: restore: list domains: {error}"))
+            Error::operation(format!(
+                "lifecycle: restore: list domains: {error}",
+                error = bento_types::error_chain(&error)
+            ))
         })?;
         if let Some(clearer) = &self.autostart_clearer {
             for domain in &domains {
                 if let Err(error) = clearer.clear_autostart(&domain.name).await {
                     self.log.warn(&format!(
                         "restore: autostart not cleared for {}: {error}",
-                        domain.name
+                        domain.name,
+                        error = bento_types::error_chain(&error)
                     ));
                 }
             }
@@ -34,14 +38,20 @@ impl Manager {
             .await
             .map_err(|error| {
                 Error::operation(format!(
-                    "lifecycle: restore: record observed states: {error}"
+                    "lifecycle: restore: record observed states: {error}",
+                    error = bento_types::error_chain(&*error)
                 ))
             })?;
         let instances = self
             .store
             .instances_to_restore(self.host_id)
             .await
-            .map_err(|error| Error::operation(format!("lifecycle: restore: {error}")))?;
+            .map_err(|error| {
+                Error::operation(format!(
+                    "lifecycle: restore: {error}",
+                    error = bento_types::error_chain(&*error)
+                ))
+            })?;
         if instances.is_empty() {
             self.log.info("restore: nothing to start");
             return Ok(());
@@ -61,13 +71,16 @@ impl Manager {
                     .set_observed_state(&instance.uuid, State::Starting)
                     .await
                 {
-                    self.log
-                        .warn(&format!("restore: starting state not recorded: {error}"));
+                    self.log.warn(&format!(
+                        "restore: starting state not recorded: {error}",
+                        error = bento_types::error_chain(&*error)
+                    ));
                 }
                 if let Err(error) = self.hyp.start(&instance.name).await {
                     self.log.warn(&format!(
                         "restore: {} did not start: {error}",
-                        instance.name
+                        instance.name,
+                        error = bento_types::error_chain(&error)
                     ));
                     self.sync_observed(instance).await;
                 } else {
@@ -78,7 +91,8 @@ impl Manager {
                 if let Err(error) = self.wait_running(&instance.name).await {
                     self.log.warn(&format!(
                         "restore: {} did not reach running: {error}",
-                        instance.name
+                        instance.name,
+                        error = bento_types::error_chain(&error)
                     ));
                     self.sync_observed(instance).await;
                 } else if let Err(error) = self
@@ -86,8 +100,10 @@ impl Manager {
                     .set_observed_state(&instance.uuid, State::Running)
                     .await
                 {
-                    self.log
-                        .warn(&format!("restore: running state not recorded: {error}"));
+                    self.log.warn(&format!(
+                        "restore: running state not recorded: {error}",
+                        error = bento_types::error_chain(&*error)
+                    ));
                 }
             }
             self.log.info(&format!("restore: batch {} done", index + 1));
@@ -124,8 +140,10 @@ impl Manager {
             .await
             .unwrap_or(State::Stopped);
         if let Err(error) = self.store.set_observed_state(&instance.uuid, state).await {
-            self.log
-                .warn(&format!("observed state not recorded: {error}"));
+            self.log.warn(&format!(
+                "observed state not recorded: {error}",
+                error = bento_types::error_chain(&*error)
+            ));
         }
     }
 }

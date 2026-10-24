@@ -5,44 +5,40 @@ use time::OffsetDateTime;
 use crate::{Error, Result, Store, format_time, parse_time};
 
 impl Store {
-    /// Stores a programmatic access token (SPEC 13). Only the hash arrives
+    /// Stores a programmatic access token (SPEC 13). `None` for
+    /// `expires_at` stores a token that never expires. Only the hash arrives
     /// here; the store never sees the token itself. The caller hashes the
     /// secret and hands out the plaintext once.
     pub async fn create_token(
         &self,
         user_id: i64,
         hash: impl Into<String>,
-        expires_at: OffsetDateTime,
+        expires_at: Option<OffsetDateTime>,
     ) -> Result<i64> {
         let hash = hash.into();
         self.with_conn(move |conn| {
             conn.execute(
                 "INSERT INTO tokens (user_id, hash, expires_at) VALUES (?, ?, ?)",
-                params![user_id, hash, format_time(expires_at)?],
+                params![user_id, hash, expires_at.map(format_time).transpose()?],
             )?;
             Ok(conn.last_insert_rowid())
         })
         .await
     }
 
-    /// Looks a token up by hash. Unknown hashes return [`Error::NotFound`]
-    /// and tokens at or past their expiry return [`Error::TokenExpired`].
+    /// Looks a token up by hash. Unknown hashes return [`Error::NotFound`].
+    /// The row comes back whatever its expiry: the auth service enforces
+    /// expiry against its own clock (SPEC 13).
     pub async fn token_by_hash(&self, hash: impl Into<String>) -> Result<Token> {
         let hash = hash.into();
-        let now = self.clock();
         self.with_conn(move |conn| {
-            let token = conn
-                .query_row(
-                    "SELECT id, user_id, hash, expires_at FROM tokens WHERE hash = ?",
-                    [hash],
-                    scan_token,
-                )
-                .optional()?
-                .ok_or(Error::NotFound)?;
-            if now() >= token.expires_at {
-                return Err(Error::TokenExpired(Box::new(token)));
-            }
-            Ok(token)
+            conn.query_row(
+                "SELECT id, user_id, hash, expires_at FROM tokens WHERE hash = ?",
+                [hash],
+                scan_token,
+            )
+            .optional()?
+            .ok_or(Error::NotFound)
         })
         .await
     }
@@ -76,12 +72,12 @@ impl Store {
 }
 
 fn scan_token(row: &rusqlite::Row<'_>) -> rusqlite::Result<Token> {
-    let expires: String = row.get(3)?;
+    let expires: Option<String> = row.get(3)?;
     Ok(Token {
         id: row.get(0)?,
         user_id: row.get(1)?,
         hash: row.get(2)?,
-        expires_at: parse_time(3, &expires)?,
+        expires_at: expires.map(|text| parse_time(3, &text)).transpose()?,
     })
 }
 
@@ -101,31 +97,54 @@ mod tests {
         let (user, _) = seed_store(&store).await;
         let expiry = clock.now() + Duration::HOUR;
         let id = store
-            .create_token(user.id, "hash-of-secret", expiry)
+            .create_token(user.id, "hash-of-secret", Some(expiry))
             .await
             .unwrap();
         let token = store.token_by_hash("hash-of-secret").await.unwrap();
         assert_eq!(token.id, id);
         assert_eq!(token.user_id, user.id);
-        assert_eq!(token.expires_at, expiry);
+        assert_eq!(token.expires_at, Some(expiry));
         assert!(matches!(
             store.token_by_hash("unknown").await,
             Err(Error::NotFound)
         ));
         clock.advance(Duration::hours(2));
-        // The rejected row travels with the error: the auth service
-        // enforces expiry against its own clock (SPEC 13).
-        let expired = store.token_by_hash("hash-of-secret").await;
-        let Err(Error::TokenExpired(row)) = expired else {
-            panic!("expected TokenExpired, got {expired:?}");
-        };
-        assert_eq!(row.id, id);
-        assert_eq!(row.expires_at, expiry);
+        // The row still comes back: the auth service enforces expiry
+        // against its own clock (SPEC 13).
+        let past = store.token_by_hash("hash-of-secret").await.unwrap();
+        assert_eq!(past.id, id);
+        assert_eq!(past.expires_at, Some(expiry));
         store.delete_token(user.id, id).await.unwrap();
         assert!(matches!(
             store.token_by_hash("hash-of-secret").await,
             Err(Error::NotFound)
         ));
+    }
+
+    #[tokio::test]
+    async fn a_token_without_expiry_stores_null_and_reads_back_as_none() {
+        let store = new_test_store().await;
+        let user = store
+            .register_user("amber", "amber@example.org", None, test_range())
+            .await
+            .unwrap();
+        store
+            .create_token(user.id, "hash-forever", None)
+            .await
+            .unwrap();
+        let token = store.token_by_hash("hash-forever").await.unwrap();
+        assert_eq!(token.expires_at, None);
+        let stored: Option<String> = store
+            .with_conn(|conn| {
+                Ok(conn.query_row(
+                    "SELECT expires_at FROM tokens WHERE hash = 'hash-forever'",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await
+            .unwrap();
+        assert_eq!(stored, None);
     }
 
     #[tokio::test]
@@ -136,7 +155,7 @@ mod tests {
             .await
             .unwrap();
         let id = store
-            .create_token(user.id, "hash-by-id", time::OffsetDateTime::UNIX_EPOCH)
+            .create_token(user.id, "hash-by-id", None)
             .await
             .unwrap();
         store.delete_token_by_id(id).await.unwrap();

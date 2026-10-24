@@ -10,6 +10,25 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+/// Renders an error and its whole `source()` chain as one line, joined
+/// with ": ". An error's own text names only its layer, so a message
+/// shown to a person or written to a log goes through this to keep the
+/// cause.
+pub fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
+    let mut text = error.to_string();
+    let mut current = error.source();
+    while let Some(cause) = current {
+        let layer = cause.to_string();
+        // A transparent wrapper repeats its inner text. Skip that repeat.
+        if !text.ends_with(&layer) {
+            text.push_str(": ");
+            text.push_str(&layer);
+        }
+        current = cause.source();
+    }
+    text
+}
+
 /// A value that did not name any variant of a string enum.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("types: {value:?} is not a valid {kind}")]
@@ -18,6 +37,18 @@ pub struct ParseError {
     pub kind: &'static str,
     /// The value that was rejected.
     pub value: String,
+}
+
+/// Parses a string enum through its serde form, so the `rename_all`
+/// attribute is the one source of the wire names. Each `as_str` must agree
+/// with it; a test checks that.
+fn parse_wire<T: serde::de::DeserializeOwned>(
+    kind: &'static str,
+    value: &str,
+) -> Result<T, ParseError> {
+    use serde::de::IntoDeserializer;
+    T::deserialize(IntoDeserializer::<serde::de::value::Error>::into_deserializer(value))
+        .map_err(|_| ParseError::new(kind, value))
 }
 
 impl ParseError {
@@ -60,12 +91,7 @@ impl FromStr for State {
     type Err = ParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "running" => Ok(State::Running),
-            "stopped" => Ok(State::Stopped),
-            "starting" => Ok(State::Starting),
-            other => Err(ParseError::new("state", other)),
-        }
+        parse_wire("state", s)
     }
 }
 
@@ -98,11 +124,7 @@ impl FromStr for DesiredState {
     type Err = ParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "running" => Ok(DesiredState::Running),
-            "stopped" => Ok(DesiredState::Stopped),
-            other => Err(ParseError::new("desired state", other)),
-        }
+        parse_wire("desired state", s)
     }
 }
 
@@ -138,12 +160,7 @@ impl FromStr for Visibility {
     type Err = ParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "off" => Ok(Visibility::Off),
-            "private" => Ok(Visibility::Private),
-            "public" => Ok(Visibility::Public),
-            other => Err(ParseError::new("visibility", other)),
-        }
+        parse_wire("visibility", s)
     }
 }
 
@@ -162,8 +179,8 @@ pub struct Instance {
     pub address: String,
     pub mac: String,
     pub vcpu: u32,
-    pub memory_mib: i64,
-    pub disk_gib: i64,
+    pub memory_mib: u64,
+    pub disk_gib: u64,
     pub nested: bool,
     pub ksm: bool,
     pub http_port: u16,
@@ -176,7 +193,22 @@ pub struct Instance {
     pub last_seen_at: Option<OffsetDateTime>,
     /// The runner slot that supplied `address` (MULTI-NODE 16). `None`
     /// until slot-aware allocation places it (MULTI-NODE 22 step 6).
-    pub slot: Option<i64>,
+    pub slot: Option<u64>,
+}
+
+/// The guest port that receives HTTP when an instance sets none (SPEC 9.1).
+pub const DEFAULT_HTTP_PORT: u16 = 80;
+
+impl Instance {
+    /// The guest port that receives HTTP. A stored `0` means the default.
+    #[must_use]
+    pub fn effective_http_port(&self) -> u16 {
+        if self.http_port == 0 {
+            DEFAULT_HTTP_PORT
+        } else {
+            self.http_port
+        }
+    }
 }
 
 /// A person with a Bento account (SPEC 12).
@@ -194,37 +226,104 @@ pub struct User {
     pub created_at: OffsetDateTime,
 }
 
+/// One resource ceiling of a host (SPEC 6.1). `Limit(0)` means no room at
+/// all. Only `Unbounded` skips a check, and no number reads as it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Ceiling {
+    /// The check is skipped. Tests use this. `bentod` refuses to start
+    /// without real host figures, so a running deployment never holds one.
+    Unbounded,
+    /// The most the host can hold, in the unit of the resource.
+    Limit(u64),
+}
+
+impl Ceiling {
+    /// Whether `total` is more than this ceiling allows.
+    pub fn exceeded_by(self, total: u64) -> bool {
+        match self {
+            Ceiling::Unbounded => false,
+            Ceiling::Limit(limit) => total > limit,
+        }
+    }
+}
+
+impl std::fmt::Display for Ceiling {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Ceiling::Unbounded => f.write_str("unbounded"),
+            Ceiling::Limit(limit) => write!(f, "{limit}"),
+        }
+    }
+}
+
 /// What the host can hold (SPEC 6.1). Bento has no per-user limit, so
-/// these two numbers are the only ceiling on a create or a resize. The
-/// binary reads them from the host once at startup.
+/// these two ceilings are the only bound on a create or a resize. The
+/// binary reads them from the host once at startup. There is no default:
+/// a caller names each ceiling, or names [`Capacity::unbounded`].
 ///
 /// vCPU has no entry. Processor time is shared, so a host may carry more
 /// virtual processors than it has cores.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capacity {
     /// Host memory times the operator's overcommit ratio (SPEC 5.3).
-    pub memory_mib: i64,
+    pub memory_mib: Ceiling,
     /// The size of the storage volume, against virtual disk size.
-    pub disk_gib: i64,
+    pub disk_gib: Ceiling,
 }
 
 impl Capacity {
     /// Applies the deployment's memory allowance to one host's physical
     /// figures, shared by placement and the final capacity check (SPEC 6.1).
-    pub fn from_host(memory_mib: i64, disk_gib: i64, overcommit_ratio: f64) -> Self {
-        Self {
-            memory_mib: (memory_mib as f64 * overcommit_ratio) as i64,
+    pub fn from_host(memory_mib: u64, disk_gib: u64, overcommit_ratio: f64) -> Self {
+        Self::limited(
+            overcommitted_memory_mib(memory_mib, overcommit_ratio),
             disk_gib,
+        )
+    }
+
+    /// A capacity with a real limit for each resource.
+    pub const fn limited(memory_mib: u64, disk_gib: u64) -> Self {
+        Self {
+            memory_mib: Ceiling::Limit(memory_mib),
+            disk_gib: Ceiling::Limit(disk_gib),
         }
     }
 
-    /// A capacity that bounds nothing. Zero means "no ceiling", not "no
-    /// room": a check whose ceiling is zero is skipped. Tests use this.
-    /// `bentod` refuses to start without real host figures, so a running
-    /// deployment never holds one.
-    pub fn unbounded() -> Self {
-        Self::default()
+    /// A capacity that bounds nothing. A caller that wants no ceiling
+    /// says so by name; no number means it.
+    pub const fn unbounded() -> Self {
+        Self {
+            memory_mib: Ceiling::Unbounded,
+            disk_gib: Ceiling::Unbounded,
+        }
     }
+}
+
+/// Host memory times the operator's overcommit ratio (SPEC 5.3).
+pub fn overcommitted_memory_mib(memory_mib: u64, overcommit_ratio: f64) -> u64 {
+    // A float scale has no exact integer form; `as` saturates, so a
+    // negative or NaN ratio gives 0 and an overflow gives `u64::MAX`.
+    #[allow(
+        clippy::cast_precision_loss,
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss
+    )]
+    let scaled = (memory_mib as f64 * overcommit_ratio) as u64;
+    scaled
+}
+
+/// A float rounded to the nearest `u64`. `as` from a float saturates: a
+/// negative or NaN input gives 0 and a huge one gives `u64::MAX`, so a
+/// caller's minimum check refuses both.
+pub fn whole_u64(value: f64) -> u64 {
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let whole = value.round() as u64;
+    whole
+}
+
+/// Whole MiB from a GiB figure typed into a form.
+pub fn mib_from_gib(gib: f64) -> u64 {
+    whole_u64(gib * 1024.0)
 }
 
 /// One public key registered by a user. The SSH frontend looks keys up by
@@ -297,12 +396,7 @@ impl FromStr for Placement {
     type Err = ParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "active" => Ok(Placement::Active),
-            "draining" => Ok(Placement::Draining),
-            "removed" => Ok(Placement::Removed),
-            other => Err(ParseError::new("placement", other)),
-        }
+        parse_wire("placement", s)
     }
 }
 
@@ -310,9 +404,9 @@ impl FromStr for Placement {
 /// every machine against it (MULTI-NODE 12).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Placing {
-    pub vcpu: i64,
-    pub memory_mib: i64,
-    pub disk_gib: i64,
+    pub vcpu: u32,
+    pub memory_mib: u64,
+    pub disk_gib: u64,
     /// The architecture of the image the instance boots. A machine of
     /// another architecture cannot run it.
     pub arch: Option<String>,
@@ -321,7 +415,7 @@ pub struct Placing {
 /// One runner slot: the same subprefix of every user `/24` (MULTI-NODE 7.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Slot {
-    pub slot: i64,
+    pub slot: u64,
     pub state: SlotState,
     pub owner_host_id: i64,
     /// Increases every time the slot changes hands. A runner refuses an
@@ -355,12 +449,7 @@ impl FromStr for SlotState {
     type Err = ParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "active" => Ok(SlotState::Active),
-            "draining" => Ok(SlotState::Draining),
-            "moving" => Ok(SlotState::Moving),
-            other => Err(ParseError::new("slot state", other)),
-        }
+        parse_wire("slot state", s)
     }
 }
 
@@ -384,7 +473,7 @@ pub struct Deployment {
 
 impl Deployment {
     /// How many slots the prefix divides a user `/24` into: 1, 2, 4, or 8.
-    pub fn slot_count(&self) -> i64 {
+    pub fn slot_count(&self) -> u64 {
         1 << (self.runner_prefix.saturating_sub(24)).min(3)
     }
 }
@@ -411,11 +500,7 @@ impl std::str::FromStr for ImageKind {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "qcow2" => Ok(Self::Qcow2),
-            "oci" => Ok(Self::Oci),
-            other => Err(format!("unknown image kind {other:?}")),
-        }
+        parse_wire("image kind", value).map_err(|_| format!("unknown image kind {value:?}"))
     }
 }
 
@@ -439,7 +524,7 @@ pub struct ImageVersion {
     pub checksum: String,
     pub image_name: String,
     pub path: String,
-    pub size: i64,
+    pub size: u64,
     /// How this immutable disk version was produced.
     #[serde(default)]
     pub kind: ImageKind,
@@ -498,8 +583,9 @@ pub struct Token {
     pub id: i64,
     pub user_id: i64,
     pub hash: String,
-    #[serde(with = "time::serde::rfc3339")]
-    pub expires_at: OffsetDateTime,
+    /// `None` for a token that never expires.
+    #[serde(with = "time::serde::rfc3339::option")]
+    pub expires_at: Option<OffsetDateTime>,
 }
 
 /// The shape rule for an instance name (SPEC 7.2).
@@ -536,6 +622,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn only_unbounded_skips_a_ceiling_and_zero_allows_nothing() {
+        assert!(!Ceiling::Unbounded.exceeded_by(u64::MAX));
+        assert!(Ceiling::Limit(0).exceeded_by(1));
+        assert!(!Ceiling::Limit(0).exceeded_by(0));
+        assert!(!Ceiling::Limit(10).exceeded_by(10));
+        assert!(Ceiling::Limit(10).exceeded_by(11));
+        assert_eq!(
+            Capacity::from_host(1024, 0, 1.0).disk_gib,
+            Ceiling::Limit(0)
+        );
+        assert_eq!(
+            Capacity::from_host(1000, 5, 1.5).memory_mib,
+            Ceiling::Limit(1500)
+        );
+    }
+
+    #[test]
     fn string_enums_round_trip() {
         for s in [State::Running, State::Stopped, State::Starting] {
             assert_eq!(s.as_str().parse::<State>().unwrap(), s);
@@ -545,6 +648,63 @@ mod tests {
         }
         for v in [Visibility::Off, Visibility::Private, Visibility::Public] {
             assert_eq!(v.as_str().parse::<Visibility>().unwrap(), v);
+        }
+    }
+
+    #[test]
+    fn zero_http_port_means_the_default() {
+        let mut instance = Instance {
+            uuid: "u".into(),
+            name: "n".into(),
+            owner_id: 1,
+            host_id: 1,
+            image_name: "i".into(),
+            base_checksum: String::new(),
+            state: State::Stopped,
+            desired_state: DesiredState::Stopped,
+            address: "10.0.0.2".into(),
+            mac: String::new(),
+            vcpu: 1,
+            memory_mib: 512,
+            disk_gib: 1,
+            nested: false,
+            ksm: false,
+            http_port: 0,
+            visibility: Visibility::Off,
+            created_at: OffsetDateTime::UNIX_EPOCH,
+            last_seen_at: None,
+            slot: None,
+        };
+        assert_eq!(instance.effective_http_port(), 80);
+        instance.http_port = 8080;
+        assert_eq!(instance.effective_http_port(), 8080);
+    }
+
+    #[test]
+    fn as_str_matches_the_serde_name() {
+        fn check<T: Serialize>(value: &T, name: &str) {
+            assert_eq!(serde_json::to_string(value).unwrap(), format!("\"{name}\""));
+        }
+        for v in [State::Running, State::Stopped, State::Starting] {
+            check(&v, v.as_str());
+        }
+        for v in [DesiredState::Running, DesiredState::Stopped] {
+            check(&v, v.as_str());
+        }
+        for v in [Visibility::Off, Visibility::Private, Visibility::Public] {
+            check(&v, v.as_str());
+        }
+        for v in [Placement::Active, Placement::Draining, Placement::Removed] {
+            check(&v, v.as_str());
+            assert_eq!(v.as_str().parse::<Placement>().unwrap(), v);
+        }
+        for v in [SlotState::Active, SlotState::Draining, SlotState::Moving] {
+            check(&v, v.as_str());
+            assert_eq!(v.as_str().parse::<SlotState>().unwrap(), v);
+        }
+        for v in [ImageKind::Qcow2, ImageKind::Oci] {
+            check(&v, v.as_str());
+            assert_eq!(v.as_str().parse::<ImageKind>().unwrap(), v);
         }
     }
 

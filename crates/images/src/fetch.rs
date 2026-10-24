@@ -143,7 +143,7 @@ impl Store {
 
         // 2. Compute the checksum while writing.
         let mut hash = Sha256::new();
-        let mut size = 0_i64;
+        let mut size = 0_u64;
         let mut stream = response.bytes_stream();
         while let Some(chunk) = stream.next().await {
             let chunk =
@@ -153,8 +153,8 @@ impl Store {
                 .map_err(|error| io_error(format!("download {}", image.url), error))?;
             hash.update(&chunk);
             size = size
-                .checked_add(i64::try_from(chunk.len()).unwrap_or(i64::MAX))
-                .ok_or_else(|| Error::Invalid("download exceeds i64 size".to_owned()))?;
+                .checked_add(u64::try_from(chunk.len()).unwrap_or(u64::MAX))
+                .ok_or_else(|| Error::Invalid("download exceeds u64 size".to_owned()))?;
         }
         file.flush()
             .await
@@ -189,7 +189,7 @@ impl Store {
         image: Image,
         temporary_path: TempPath,
         checksum: String,
-        size: i64,
+        size: u64,
     ) -> Result<()> {
         // Steps 4-7 create an image version; only they need the store lock.
         let _guard = self.acquire_lock().await?;
@@ -392,7 +392,7 @@ impl Store {
         _output: TempDir,
         disk: PathBuf,
         checksum: String,
-        size: i64,
+        size: u64,
         source_digest: String,
     ) -> Result<()> {
         let _guard = self.acquire_lock().await?;
@@ -687,12 +687,12 @@ fn rename_generated_disk(disk: &Path, path: &Path) -> Result<FileRollback> {
     })
 }
 
-async fn hash_file(path: &Path) -> Result<(String, i64)> {
+async fn hash_file(path: &Path) -> Result<(String, u64)> {
     let mut file = tokio::fs::File::open(path)
         .await
         .map_err(|error| io_error("open generated qcow2", error))?;
     let mut hash = Sha256::new();
-    let mut size = 0_i64;
+    let mut size = 0_u64;
     let mut buffer = vec![0_u8; 1024 * 1024];
     loop {
         let read = tokio::io::AsyncReadExt::read(&mut file, &mut buffer)
@@ -703,8 +703,8 @@ async fn hash_file(path: &Path) -> Result<(String, i64)> {
         }
         hash.update(&buffer[..read]);
         size = size
-            .checked_add(i64::try_from(read).unwrap_or(i64::MAX))
-            .ok_or_else(|| Error::Invalid("generated image exceeds i64 size".to_owned()))?;
+            .checked_add(u64::try_from(read).unwrap_or(u64::MAX))
+            .ok_or_else(|| Error::Invalid("generated image exceeds u64 size".to_owned()))?;
     }
     Ok((hex::encode(hash.finalize()), size))
 }
@@ -1113,7 +1113,7 @@ mod tests {
         assert_eq!(version.path, path.display().to_string());
         assert_eq!(
             version.size,
-            i64::try_from(content.len()).expect("small content")
+            u64::try_from(content.len()).expect("small content")
         );
         assert_ne!(version.fetched_at, OffsetDateTime::UNIX_EPOCH);
         assert_eq!(db.images_snapshot()[0].current_checksum, Some(checksum));
@@ -1222,7 +1222,7 @@ mod tests {
             checksum: checksum.clone(),
             image_name: "repair".into(),
             path: String::new(),
-            size: i64::try_from(content.len()).unwrap(),
+            size: u64::try_from(content.len()).unwrap(),
             kind: ImageKind::Qcow2,
             source_digest: None,
             fetched_at: OffsetDateTime::UNIX_EPOCH,

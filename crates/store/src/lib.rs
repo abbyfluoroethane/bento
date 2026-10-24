@@ -45,12 +45,6 @@ pub enum Error {
     /// refused whoever asks. The message does not say whose key it is.
     #[error("store: that SSH key is already registered")]
     SshKeyTaken,
-    /// A token row exists but its expiry has passed (SPEC 13). The row
-    /// travels with the error on purpose: the auth service enforces
-    /// expiry against its own clock, so it needs the row the store
-    /// already rejected.
-    #[error("store: token expired")]
-    TokenExpired(Box<bento_types::Token>),
     /// A create or resize would provision more than the host holds
     /// (SPEC 6.1). `resource` is `memory` or `disk`, and the three
     /// numbers share that resource's unit.
@@ -59,9 +53,9 @@ pub enum Error {
     )]
     Capacity {
         resource: &'static str,
-        used: i64,
-        requested: i64,
-        limit: i64,
+        used: u64,
+        requested: u64,
+        limit: u64,
     },
     /// A released name is still reserved for its previous owner (SPEC 7.2).
     /// `remaining` feeds the error message shown by the CLI (SPEC 15).
@@ -93,30 +87,30 @@ pub enum Error {
     RunnerPrefix(u8),
     /// A smaller prefix would leave an owned slot with no number.
     #[error("store: prefix {prefix} has no room for slot {slot}, which is owned")]
-    RunnerPrefixStrandsSlot { prefix: u8, slot: i64 },
+    RunnerPrefixStrandsSlot { prefix: u8, slot: u64 },
     /// A merge would give one prefix two owners (MULTI-NODE 17.2).
     #[error("store: prefix {prefix} would merge slots with different owners into slot {slot}")]
-    RunnerPrefixSplitsOwners { prefix: u8, slot: i64 },
+    RunnerPrefixSplitsOwners { prefix: u8, slot: u64 },
     /// The slot number is outside what the runner prefix divides into.
     #[error("store: slot {slot} does not exist: the deployment has {count}")]
-    NoSuchSlot { slot: i64, count: i64 },
+    NoSuchSlot { slot: u64, count: u64 },
     /// Instances still hold addresses the slot supplied (MULTI-NODE 17).
     #[error("store: slot {slot} still holds {occupied} instances of another host")]
-    SlotInUse { slot: i64, occupied: i64 },
+    SlotInUse { slot: u64, occupied: u64 },
     /// No runner can take a new instance (MULTI-NODE 12). The message
     /// names every runner and why each one was refused, because "no
     /// room" alone does not say which machine to fix.
     #[error("store: no runner can take this instance: {reasons}")]
     NoPlacement { reasons: String },
     /// A restore source must exist and be a readable SQLite database.
-    #[error("store: restore source {path}: {source}")]
+    #[error("store: restore source {path}")]
     RestoreSource {
         path: String,
         #[source]
         source: std::io::Error,
     },
     /// The dump destination could not be inspected or created.
-    #[error("store: dump destination {path}: {source}")]
+    #[error("store: dump destination {path}")]
     DumpDestination {
         path: String,
         #[source]
@@ -129,10 +123,10 @@ pub enum Error {
     #[error("store: cannot close database while another store handle or operation is active")]
     ConnectionInUse,
     /// A blocking database task was cancelled or panicked.
-    #[error("store: database task failed: {0}")]
+    #[error("store: database task failed")]
     Task(#[from] tokio::task::JoinError),
     /// SQLite rejected an operation or stored value.
-    #[error("store: {0}")]
+    #[error("store: sqlite")]
     Sqlite(#[from] rusqlite::Error),
 }
 
@@ -300,6 +294,37 @@ fn parse_time(column: usize, value: &str) -> rusqlite::Result<OffsetDateTime> {
             Box::new(error),
         )
     })
+}
+
+/// SQLite stores every integer as `i64`. A size, a count, or a slot is
+/// never negative, so the store keeps them as `u64` and converts here,
+/// at the rusqlite boundary only. A value that does not fit is a store
+/// error, not a wrapped number.
+pub(crate) fn to_sql_int(value: u64) -> rusqlite::Result<i64> {
+    i64::try_from(value).map_err(|error| rusqlite::Error::ToSqlConversionFailure(Box::new(error)))
+}
+
+/// The read side of [`to_sql_int`]: a negative column is a store error.
+pub(crate) fn from_sql_int(column: usize, value: i64) -> rusqlite::Result<u64> {
+    u64::try_from(value).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            column,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })
+}
+
+/// Reads an unsigned column.
+pub(crate) fn get_u64(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<u64> {
+    from_sql_int(column, row.get(column)?)
+}
+
+/// Reads a nullable unsigned column.
+pub(crate) fn get_opt_u64(row: &rusqlite::Row<'_>, column: usize) -> rusqlite::Result<Option<u64>> {
+    row.get::<_, Option<i64>>(column)?
+        .map(|value| from_sql_int(column, value))
+        .transpose()
 }
 
 fn path_text(path: &Path) -> String {

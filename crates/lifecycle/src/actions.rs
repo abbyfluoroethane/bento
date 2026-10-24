@@ -8,8 +8,8 @@ use crate::{Error, Manager, Result};
 pub struct ResizeRequest {
     pub uuid: String,
     pub vcpu: u32,
-    pub memory_mib: i64,
-    pub disk_gib: i64,
+    pub memory_mib: u64,
+    pub disk_gib: u64,
     pub nested: bool,
 }
 
@@ -50,7 +50,11 @@ impl Manager {
             .start(&instance.name)
             .await
             .map_err(|error| {
-                Error::operation(format!("lifecycle: start {}: {error}", instance.name))
+                Error::operation(format!(
+                    "lifecycle: start {}: {error}",
+                    instance.name,
+                    error = bento_types::error_chain(&error)
+                ))
             })
     }
 
@@ -69,7 +73,11 @@ impl Manager {
             .stop(&instance.name)
             .await
             .map_err(|error| {
-                Error::operation(format!("lifecycle: stop {}: {error}", instance.name))
+                Error::operation(format!(
+                    "lifecycle: stop {}: {error}",
+                    instance.name,
+                    error = bento_types::error_chain(&error)
+                ))
             })?;
         self.store
             .set_observed_state(uuid, State::Stopped)
@@ -90,7 +98,11 @@ impl Manager {
             .reboot(&instance.name)
             .await
             .map_err(|error| {
-                Error::operation(format!("lifecycle: restart {}: {error}", instance.name))
+                Error::operation(format!(
+                    "lifecycle: restart {}: {error}",
+                    instance.name,
+                    error = bento_types::error_chain(&error)
+                ))
             })?;
         self.store
             .set_desired_state(uuid, DesiredState::Running)
@@ -109,7 +121,8 @@ impl Manager {
             Err(error) => {
                 return Err(Error::operation(format!(
                     "lifecycle: rm {}: {error}",
-                    instance.name
+                    instance.name,
+                    error = bento_types::error_chain(&error)
                 )));
             }
         }
@@ -120,11 +133,16 @@ impl Manager {
         if let Err(error) = self.fleet.deprovision(instance.host_id, &instance).await {
             self.log.warn(&format!(
                 "rm: files not deleted for {}: {error}",
-                instance.name
+                instance.name,
+                error = bento_types::error_chain(&*error)
             ));
         }
         self.store.delete_instance(uuid).await.map_err(|error| {
-            Error::operation(format!("lifecycle: rm {}: {error}", instance.name))
+            Error::operation(format!(
+                "lifecycle: rm {}: {error}",
+                instance.name,
+                error = bento_types::error_chain(&*error)
+            ))
         })?;
         self.log
             .info(&format!("rm: instance {} removed", instance.name));
@@ -136,7 +154,7 @@ impl Manager {
     /// mutation.
     pub async fn resize(&self, request: ResizeRequest) -> Result<ResizeResult> {
         let mut instance = self.store.instance(&request.uuid).await.map_err(external)?;
-        if request.vcpu == 0 || request.memory_mib <= 0 || request.disk_gib <= 0 {
+        if request.vcpu == 0 || request.memory_mib == 0 || request.disk_gib == 0 {
             return Err(Error::operation(
                 "lifecycle: resize needs positive vcpu, memory, and disk",
             ));
@@ -203,7 +221,7 @@ impl Manager {
     /// Grows the overlay on the machine that holds it. This machine uses
     /// its own resizer; any other machine grows its own file
     /// (MULTI-NODE 11.5).
-    async fn grow_disk(&self, instance: &Instance, disk_gib: i64) -> Result<()> {
+    async fn grow_disk(&self, instance: &Instance, disk_gib: u64) -> Result<()> {
         if instance.host_id == self.host_id {
             return self
                 .resizer
@@ -234,7 +252,11 @@ impl Manager {
             )
             .await?;
         definer.define(&xml).await.map_err(|error| {
-            Error::operation(format!("lifecycle: redefine {}: {error}", instance.name))
+            Error::operation(format!(
+                "lifecycle: redefine {}: {error}",
+                instance.name,
+                error = bento_types::error_chain(&error)
+            ))
         })
     }
 }
@@ -253,7 +275,11 @@ impl Manager {
             .user_by_id(instance.owner_id)
             .await
             .map_err(|error| {
-                Error::operation(format!("lifecycle: owner of {}: {error}", instance.name))
+                Error::operation(format!(
+                    "lifecycle: owner of {}: {error}",
+                    instance.name,
+                    error = bento_types::error_chain(&*error)
+                ))
             })?;
         let spec = crate::RedefineSpec {
             host_id: instance.host_id,
@@ -262,7 +288,11 @@ impl Manager {
             previous_name: previous_name.map(str::to_owned),
         };
         self.fleet.redefine(&spec).await.map_err(|error| {
-            Error::operation(format!("lifecycle: redefine {}: {error}", instance.name))
+            Error::operation(format!(
+                "lifecycle: redefine {}: {error}",
+                instance.name,
+                error = bento_types::error_chain(&*error)
+            ))
         })
     }
 }
