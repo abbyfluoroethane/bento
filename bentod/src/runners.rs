@@ -259,14 +259,13 @@ impl NetworkSync {
         if boot_id.is_empty() {
             return;
         }
-        let previous = self
-            .boots
-            .lock()
-            .await
-            .insert(host_id, boot_id.to_owned());
+        let previous = self.boots.lock().await.insert(host_id, boot_id.to_owned());
         if previous.is_some_and(|previous| previous != boot_id) {
             self.applied.lock().await.remove(&host_id);
-            tracing::info!(runner_id = host_id, "runner rebooted, so its network is resent");
+            tracing::info!(
+                runner_id = host_id,
+                "runner rebooted, so its network is resent"
+            );
         }
     }
 

@@ -94,7 +94,11 @@ impl Fleet for FakeImages {
         instance: &bento_types::Instance,
         _disk_gib: i64,
     ) -> Result<(), bento_lifecycle::DynError> {
-        Err(format!("unexpected disk resize of {} on machine {host_id}", instance.name).into())
+        Err(format!(
+            "unexpected disk resize of {} on machine {host_id}",
+            instance.name
+        )
+        .into())
     }
 
     async fn redefine(
@@ -546,10 +550,7 @@ async fn ssh_starter_starts_through_the_manager_and_keeps_desired_state() {
         .await
         .unwrap();
 
-    assert_eq!(
-        env.hypervisor.state("web").await.unwrap(),
-        State::Running
-    );
+    assert_eq!(env.hypervisor.state("web").await.unwrap(), State::Running);
     let row = env.store.instance(&instance.uuid).await.unwrap();
     assert_eq!(row.desired_state, DesiredState::Stopped);
 }

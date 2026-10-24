@@ -113,7 +113,9 @@ fn scan_ssh_key(row: &rusqlite::Row<'_>) -> rusqlite::Result<SshKey> {
 #[cfg(test)]
 mod tests {
     use crate::Error;
-    use crate::tests::{FakeClock, new_test_store, new_test_store_with_clock, seed_store, test_range};
+    use crate::tests::{
+        FakeClock, new_test_store, new_test_store_with_clock, seed_store, test_range,
+    };
 
     #[tokio::test]
     async fn ssh_key_fingerprint_lookup() {
@@ -228,6 +230,9 @@ mod tests {
             Err(Error::SshKeyTaken)
         ));
         // The failed link rolled back, so the claim did not stick.
-        assert_eq!(store.pairing(pairing.id).await.unwrap().linked_user_id, None);
+        assert_eq!(
+            store.pairing(pairing.id).await.unwrap().linked_user_id,
+            None
+        );
     }
 }

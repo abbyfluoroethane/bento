@@ -1108,7 +1108,10 @@ async fn a_connection_starts_an_instance_on_the_machine_that_runs_it() {
     move_to_runner(&f);
     f.images.acted_on.lock().unwrap().clear();
 
-    f.manager.start_for_connection(&instance.uuid).await.unwrap();
+    f.manager
+        .start_for_connection(&instance.uuid)
+        .await
+        .unwrap();
 
     assert_eq!(f.images.acted_on.lock().unwrap().as_slice(), &[2]);
     assert_eq!(f.fake.domain("web").unwrap().state, State::Running);
@@ -1122,7 +1125,10 @@ async fn a_connection_start_keeps_the_desired_state() {
     let instance = setup(&f).await;
     f.manager.stop(&instance.uuid).await.unwrap();
 
-    f.manager.start_for_connection(&instance.uuid).await.unwrap();
+    f.manager
+        .start_for_connection(&instance.uuid)
+        .await
+        .unwrap();
 
     assert_eq!(f.fake.domain("web").unwrap().state, State::Running);
     let stored = f.store.instance(&instance.uuid).await.unwrap();
