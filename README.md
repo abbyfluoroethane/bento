@@ -100,6 +100,8 @@ server-rendered, and every TLS user is pinned to the `ring` provider.
 
 ```
 make build       # target/release/bentod and target/release/bento-monitor
+sudo make install   # install on this machine, with a backup and a rollback line
+make install-runners  # send the build to every other runner over SSH
 make monitor     # build and start the terminal screen against this host
 make check       # cargo clippy -D warnings && cargo test --workspace
 make unit        # the in-process tests only

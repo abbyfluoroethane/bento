@@ -635,6 +635,70 @@ bentod reconcile                       # "libvirt and the database agree"
 curl -sI https://bento.example.org/    # dashboard
 ```
 
+### Upgrading
+
+An upgrade is a binary swap. Build as yourself, install as root, and
+then restart the units yourself:
+
+```
+make build                 # also writes target/release/BUILD
+sudo make install          # this machine
+make install-runners       # every other runner, over SSH; not with sudo
+```
+
+`sudo make install` does not build. Under sudo, root has no toolchain,
+and a build as root makes `target/` belong to root. Before it replaces
+the binaries, it keeps a way back in `/var/lib/bento/rollback/`: the
+old `bentod` and `bento-monitor`, and on the machine that runs `serve`,
+a database copy. It keeps the newest five sets. It then prints the
+restart command for the units on this machine and the rollback
+command. If the build is already installed, it does nothing.
+
+**The installed binary makes the database copy, never the new one.**
+`dump-db` opens the store, and opening the store applies the
+migrations. A copy made by the new binary would migrate the live
+database under the running `serve` first, and then the copy would be
+worth nothing.
+
+`BUILD` records the commit, the runner protocol version, and the newest
+migration. The install compares it with the build it replaces:
+
+* A new schema means `serve` migrates the database at its next start.
+  The printed rollback then includes the `restore-db` step.
+* A new protocol version means the machines cannot talk across the
+  change. Install every machine, then restart them all together
+  (MULTI-NODE 11.5).
+
+**`make install-runners` sends one build to every other runner.** It
+reads the `[[runners]]` of `/etc/bento/bento.toml`, skips the entry at
+this machine's own `[runner] listen` address, and connects to each
+other runner **by its name**. Each runner therefore needs a `Host`
+entry in your `~/.ssh/config`:
+
+```
+Host tsukasa
+    HostName 10.0.0.97
+    Port 2222
+    User operator
+```
+
+The SSH details stay out of `bento.toml` on purpose. The configuration
+refuses an unknown key, so a new key there stops an older binary, and
+that is the binary a rollback must start. On each runner, the command
+copies the build and `scripts/install.sh` to a temporary directory and
+runs the script under `sudo`. Then it compares the sha256 of both
+binaries with the local build. Do not compare the file size: two builds
+can have the same size and different contents.
+
+It restarts nothing. At the end it prints one `ssh -t <runner> 'sudo
+systemctl restart bentod-runner'` line for each runner. Restart `serve`
+on the controller first, then its other units, then each runner. Then
+check `bentod slots` and `bentod reconcile`.
+
+The controller does not send binaries over the runner port. That port
+has no authentication, and a binary sent over it would make it a way
+to run code as root on every runner.
+
 ### bento-monitor, the terminal screen
 
 Everything in sections 4 and 6 also has a screen. `make build` produces
@@ -678,7 +742,9 @@ address rather than loopback, is a runner.
 
 **The binary step installs both binaries.** `bentod` and `bento-monitor`
 come from one build and go in together, because a deployment whose halves
-came from different commits is one you cannot reason about. The step is
+came from different commits is one you cannot reason about. The step runs
+`make build` and then the same script as `sudo make install`, so it keeps
+the same way back (see Upgrading above). The step is
 done only when both are installed **and** neither is older than the copy
 in `target/release`; a rebuilt binary that was never installed is named
 on the screen. That is the check a version number cannot do: every commit
