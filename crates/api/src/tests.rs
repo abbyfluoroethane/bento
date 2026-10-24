@@ -1207,7 +1207,11 @@ async fn registering_a_taken_ssh_key_answers_409() {
     let response = request(&fixture.app, Method::POST, "/api/ssh-keys", &body).await;
     assert_eq!(response.status, StatusCode::CONFLICT);
     let error: ErrorBody = decode(&response);
-    assert!(error.error.contains("already registered"), "{}", error.error);
+    assert!(
+        error.error.contains("already registered"),
+        "{}",
+        error.error
+    );
     let response = request(&fixture.app, Method::GET, "/api/ssh-keys", "").await;
     assert_eq!(decode::<Vec<SshKeyJson>>(&response).len(), 1);
 }

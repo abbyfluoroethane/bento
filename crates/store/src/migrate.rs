@@ -640,9 +640,7 @@ mod tests {
     }
 
     fn key_ids(conn: &Connection) -> Vec<i64> {
-        let mut statement = conn
-            .prepare("SELECT id FROM ssh_keys ORDER BY id")
-            .unwrap();
+        let mut statement = conn.prepare("SELECT id FROM ssh_keys ORDER BY id").unwrap();
         statement
             .query_map([], |row| row.get(0))
             .unwrap()

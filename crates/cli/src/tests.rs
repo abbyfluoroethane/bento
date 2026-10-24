@@ -153,7 +153,11 @@ impl Store for FakeStore {
     ) -> Result<i64, BoxError> {
         let mut data = self.0.lock().unwrap();
         // Like the store: a fingerprint is registered once (SPEC 13).
-        if data.added_keys.iter().any(|key| key.fingerprint == fingerprint) {
+        if data
+            .added_keys
+            .iter()
+            .any(|key| key.fingerprint == fingerprint)
+        {
             return Err(Box::new(StoreError::SshKeyTaken));
         }
         data.added_keys.push(SshKey {
