@@ -2,3 +2,5 @@
 /target/
 /bentod-bin
 .worktrees
+.claude
+
