@@ -358,7 +358,7 @@ mod tests {
     fn the_show_call_names_every_unit() {
         let cmd = show_command();
         for unit in UNITS {
-            assert!(cmd.args.contains(&unit.name.to_string()));
+            assert!(cmd.args.iter().any(|arg| arg == unit.name));
         }
     }
 
