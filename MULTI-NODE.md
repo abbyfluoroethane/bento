@@ -1398,6 +1398,8 @@ runner that no longer exists.
 Logs attach runner ID, slot, instance UUID, controller epoch, desired
 generation, and request ID to every distributed lifecycle action.
 
+**User totals.** A user total counts CPU and memory only for instances that were read in the last 2 sampler intervals. Storage always counts.
+
 ## 21. Reconciliation
 
 The durable network-convergence worker in section 8.2 performs automatic

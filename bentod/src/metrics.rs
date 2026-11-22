@@ -53,6 +53,13 @@ const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
 /// each second.
 const NS_PER_SEC: f64 = 1_000_000_000.0;
 
+/// How old a reading may be and still count in an account total, and the
+/// longest gap a counter delta may span. A domain that is stopped, or one
+/// on a runner that does not answer, sends no reading; without a bound its
+/// last rate and memory would stay in the owner's total for ever
+/// (MULTI-NODE 20).
+const FRESH_FOR: i64 = 2 * INTERVAL.as_secs() as i64;
+
 /// A bounded series, oldest first.
 #[derive(Debug, Default)]
 struct Series(VecDeque<Point>);
@@ -98,6 +105,10 @@ struct InstanceState {
     cpu_ns_per_sec: f64,
     /// The previous reading, which the next delta is measured from.
     previous: Option<(u64, i64)>,
+    /// When the last reading arrived. The account total counts only a
+    /// fresh one. The per-instance series keep their points: the charts
+    /// show the gap, and a runner that is away keeps its charts flat.
+    last_seen: i64,
 }
 
 /// The series of one machine.
@@ -236,17 +247,28 @@ impl Sampler {
         if let Some(rss_kib) = sample.rss_kib {
             entry.memory_used_mib.push(at, rss_kib as f64 / 1024.0);
         }
-        if let Some((previous_ns, previous_at)) = entry.previous {
-            let elapsed = at - previous_at;
-            let spent = sample.cpu_time_ns.checked_sub(previous_ns);
-            if let (Some(spent), true) = (spent, elapsed > 0) {
-                let rate = spent as f64 / elapsed as f64;
-                entry.cpu_ns_per_sec = rate;
-                let vcpus = sample.vcpus.max(1) as f64;
-                entry
-                    .cpu_pct
-                    .push(at, (rate / (vcpus * NS_PER_SEC) * 100.0).clamp(0.0, 100.0));
+        entry.last_seen = at;
+        match entry.previous {
+            // A delta over a long gap would average the rate across time
+            // when the domain did not run, so it is not taken.
+            Some((previous_ns, previous_at)) if at - previous_at <= FRESH_FOR => {
+                let elapsed = at - previous_at;
+                match sample.cpu_time_ns.checked_sub(previous_ns) {
+                    Some(spent) if elapsed > 0 => {
+                        let rate = spent as f64 / elapsed as f64;
+                        entry.cpu_ns_per_sec = rate;
+                        let vcpus = sample.vcpus.max(1) as f64;
+                        entry
+                            .cpu_pct
+                            .push(at, (rate / (vcpus * NS_PER_SEC) * 100.0).clamp(0.0, 100.0));
+                    }
+                    // A counter that went backwards: the old rate belongs
+                    // to the domain that ended.
+                    None => entry.cpu_ns_per_sec = 0.0,
+                    Some(_) => {}
+                }
             }
+            _ => entry.cpu_ns_per_sec = 0.0,
         }
         entry.previous = Some((sample.cpu_time_ns, at));
     }
@@ -514,7 +536,11 @@ impl Metrics for Sampler {
     }
 
     async fn user(&self, user_id: i64) -> Result<UserMetrics, BoxError> {
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let state = self.state.lock().expect("metrics state");
+        // Storage counts whatever the age of the reading: a stopped
+        // instance still holds its disk. Processor and memory count only
+        // while the instance is read.
         let mine = state
             .instances
             .values()
@@ -536,8 +562,10 @@ impl Metrics for Sampler {
                 .get(&entry.host_id)
                 .map_or(0, |host| host.cpu_count)
                 .max(1) as f64;
-            cpu_pct += entry.cpu_ns_per_sec / (cores * NS_PER_SEC) * 100.0;
-            totals.memory_used_mib += bento_types::whole_u64(entry.memory_used_mib.last());
+            if now - entry.last_seen <= FRESH_FOR {
+                cpu_pct += entry.cpu_ns_per_sec / (cores * NS_PER_SEC) * 100.0;
+                totals.memory_used_mib += bento_types::whole_u64(entry.memory_used_mib.last());
+            }
             totals.storage_used_gib += entry.storage_used_gib;
         }
         totals.cpu_pct = cpu_pct.clamp(0.0, 100.0);
@@ -902,5 +930,83 @@ mod tests {
         let points = series.window(Duration::from_secs(100), 1_270);
         assert_eq!(points.len(), 4);
         assert_eq!(points[0].at, 1_180);
+    }
+
+    #[tokio::test]
+    async fn an_instance_that_is_no_longer_read_leaves_the_account_total() {
+        // A stopped VM, or a VM on a runner that does not answer, sends no
+        // reading. Its last rate and memory must not stay in the total
+        // (MULTI-NODE 20).
+        let sampler = sampler();
+        sampler.record_host(HOST, HOST_NAME, reading(1000, 850), now());
+        let t = now();
+        let old = t - 4 * INTERVAL.as_secs() as i64;
+        sampler.record_instance("uuid-a", 1, HOST, &sample(0, 2, Some(512 * 1024)), 2.0, old);
+        sampler.record_instance(
+            "uuid-a",
+            1,
+            HOST,
+            &sample(30_000_000_000, 2, Some(512 * 1024)),
+            2.0,
+            old + 30,
+        );
+        // The last reading is 3 intervals old.
+        let stale = old + 30;
+        assert!(t - stale > FRESH_FOR);
+
+        let totals = sampler.user(1).await.unwrap();
+        assert_eq!(totals.cpu_pct, 0.0);
+        assert_eq!(totals.memory_used_mib, 0);
+        // The disk is still there.
+        assert_eq!(totals.storage_used_gib, 2.0);
+
+        // The same instance counts again once it is read.
+        sampler.record_instance(
+            "uuid-a",
+            1,
+            HOST,
+            &sample(60_000_000_000, 2, Some(512 * 1024)),
+            2.0,
+            t,
+        );
+        assert_eq!(sampler.user(1).await.unwrap().memory_used_mib, 512);
+    }
+
+    #[tokio::test]
+    async fn a_counter_reset_clears_the_old_rate() {
+        let sampler = sampler();
+        let t = now();
+        sampler.record_host(HOST, HOST_NAME, reading(1000, 850), t);
+        sampler.record_instance("uuid-a", 1, HOST, &sample(0, 2, None), 0.0, t - 60);
+        sampler.record_instance(
+            "uuid-a",
+            1,
+            HOST,
+            &sample(30_000_000_000, 2, None),
+            0.0,
+            t - 30,
+        );
+        assert!(sampler.user(1).await.unwrap().cpu_pct > 0.0);
+
+        // The domain restarted: the counter is lower than before.
+        sampler.record_instance("uuid-a", 1, HOST, &sample(1_000, 2, None), 0.0, t);
+        assert_eq!(sampler.user(1).await.unwrap().cpu_pct, 0.0);
+    }
+
+    #[tokio::test]
+    async fn a_delta_is_not_averaged_over_a_long_gap() {
+        let sampler = sampler();
+        let t = now();
+        sampler.record_host(HOST, HOST_NAME, reading(1000, 850), t);
+        let gap = 10 * INTERVAL.as_secs() as i64;
+        sampler.record_instance("uuid-a", 1, HOST, &sample(0, 1, None), 0.0, t - gap);
+        sampler.record_instance("uuid-a", 1, HOST, &sample(60_000_000_000, 1, None), 0.0, t);
+
+        let metrics = sampler
+            .instance("uuid-a", Duration::from_secs(3600))
+            .await
+            .unwrap();
+        assert!(metrics.cpu_pct.is_empty(), "no rate over a long gap");
+        assert_eq!(sampler.user(1).await.unwrap().cpu_pct, 0.0);
     }
 }
