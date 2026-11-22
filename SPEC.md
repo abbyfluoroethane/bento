@@ -489,6 +489,10 @@ Step 3 is required. Section 7.2 gives the reason.
 
 The `rm` command asks for confirmation. Accept a `--force` flag for scripts.
 
+**One action at a time.** Actions on one instance (create, start, stop, restart, remove, resize, rename, copy) run one after the other. Each action reads the row again after it gets its turn. When the redefine of a resize fails, write the old vCPU, memory, and nested values back, and keep the new disk size. A shutdown or destroy that libvirt refuses as an invalid operation counts as success when the domain is shut off after the call. When the reply to a domain start is lost, destroy the domain before the undefine. When a create on a different machine fails, delete the row only after that machine confirms that the domain is absent. If the machine does not answer, keep the row (MULTI-NODE 14.1).
+
+**Provisioning.** A create or a copy inserts the row as `provisioning` with the desired state `running`, and sets the observed state from the machine when it ends correctly. The poll does not change a `provisioning` row, and restore does not start it. The row keeps its name, its address, and its resources. While a row is `provisioning`, start, stop, restart, resize, rename, copy of it, and a start for a connection answer 409. Remove works. When a create fails on a different machine and the domain is not confirmed absent, the row stays as `stopped` with the desired state `stopped`.
+
 ### 11.2 Host reboot
 
 **Bento restores each instance to its last recorded desired state.** An instance that a user left running comes back running. An instance that a user stopped stays stopped.
@@ -505,6 +509,10 @@ At startup the control plane does the following:
 Start the instances in batches for a reason. A host with 20 instances that start at once produces a large memory demand and a large number of disk reads at the same moment. The default batch size is 4. Make the value an operator setting.
 
 Report progress in the startup log and on the dashboard. A user who connects during the restore sees `starting`, not an error.
+
+**Restore rules.** Restore skips a row that has no domain, and logs a warning that names `bentod reconcile`. Immediately before it starts an instance, restore reads the row again. It skips the instance when the row is gone, when the desired state is not `running`, or when the observed state is not `stopped`. While restore runs, the poll does not replace `starting` with `stopped`.
+
+**Leftovers of a create.** When `bentod serve` starts, restore first settles each row that is still `provisioning` and whose create does not run in this process. If the domain exists, the state comes from libvirt. If there is no domain, the row becomes `stopped` with the desired state `stopped`, and a warning names the instance and tells the operator to remove it or create it again. Bento does not delete it. The restore of a different machine (MULTI-NODE 14.3) uses the same rules as the local restore.
 
 ## 12. Data model
 

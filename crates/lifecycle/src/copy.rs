@@ -12,11 +12,10 @@ impl Manager {
     /// backing image version and receives its own UUID, name, network identity,
     /// and seed. Its disk may grow but never shrink.
     pub async fn copy(&self, source_uuid: &str, request: NewRequest) -> Result<Instance> {
-        let source = self
-            .store
-            .instance(source_uuid)
-            .await
-            .map_err(crate::actions::external)?;
+        // The lock covers the stopped check and the whole file copy, so a
+        // start of the source cannot tear the copy (SPEC 15).
+        let (_source_guard, source) = self.locked_instance(source_uuid).await?;
+        Self::refuse_provisioning(&source)?;
         let source_version = self
             .store
             .image_version(&source.base_checksum)
@@ -96,7 +95,8 @@ impl Manager {
             host_id: request.host_id,
             image_name: source.image_name.clone(),
             base_checksum: source.base_checksum.clone(),
-            state: State::Stopped,
+            // Owned by this copy until it ends (SPEC 11.2).
+            state: State::Provisioning,
             desired_state: DesiredState::Running,
             address: address.to_string(),
             mac: bento_network::mac(&uuid),
@@ -115,6 +115,10 @@ impl Manager {
             // source's slot is full and the machine owns another.
             slot: Some(slot),
         };
+        // Nothing else knows this UUID yet, so the lock is free. Holding
+        // it from before the row exists keeps a remove from racing the
+        // rest of the copy.
+        let _guard = self.lock_instance(&uuid).await;
         self.store
             .create_instance(instance.clone(), self.cooldown, capacity)
             .await
@@ -161,12 +165,8 @@ impl Manager {
             return Err(self.unwind_copy(&instance, Box::new(error)).await);
         }
         instance.state = State::Running;
-        if let Err(error) = self.store.set_observed_state(&uuid, State::Running).await {
-            self.log.warn(&format!(
-                "cp: observed state not recorded; poller will catch up: {error}",
-                error = bento_types::error_chain(&*error)
-            ));
-        }
+        self.finish_provisioning(&instance.name, &uuid, State::Running)
+            .await;
         Ok(instance)
     }
 }

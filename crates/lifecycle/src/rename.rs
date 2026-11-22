@@ -8,11 +8,10 @@ impl Manager {
     /// The stopped domain is undefined under the old name and redefined under
     /// the new one; the old name enters cooldown with no alias (SPEC 7.2, 7.3).
     pub async fn rename(&self, uuid: &str, new_name: &str) -> Result<()> {
-        let mut instance = self
-            .store
-            .instance(uuid)
-            .await
-            .map_err(crate::actions::external)?;
+        // The lock covers the stopped check and the undefine, so a start
+        // cannot land between them and lose a running guest (SPEC 7.3).
+        let (_guard, mut instance) = self.locked_instance(uuid).await?;
+        Self::refuse_provisioning(&instance)?;
         if new_name == instance.name {
             return Ok(());
         }

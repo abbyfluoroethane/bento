@@ -107,7 +107,10 @@ impl Manager {
             host_id,
             image_name: request.image_name.clone(),
             base_checksum: checksum.clone(),
-            state: State::Stopped,
+            // The row exists before the domain does. `provisioning` keeps
+            // the poll and restore away from it until this create ends
+            // (SPEC 11.2).
+            state: State::Provisioning,
             desired_state: DesiredState::Running,
             address: address.to_string(),
             mac: bento_network::mac(&uuid),
@@ -132,6 +135,10 @@ impl Manager {
             .host_capacity(host_id)
             .await
             .map_err(Error::caused)?;
+        // Held until the create ends, so a remove, a start, or the poller's
+        // first-boot cleanup cannot act on a half-built instance
+        // (SPEC 11.1).
+        let _guard = self.lock_instance(&uuid).await;
         self.store
             .create_instance(instance.clone(), self.cooldown, capacity)
             .await
@@ -139,12 +146,12 @@ impl Manager {
         let guest = match GuestNetwork::new(subnet, address, Some(&self.dns)) {
             Ok(guest) => guest,
             Err(error) => {
-                return Err(self.unwind_new(&instance, Box::new(error)).await);
+                return Err(self.unwind_new(&instance, Box::new(error), false).await);
             }
         };
         let network = match self.user_network_name(&request.owner) {
             Ok(name) => name,
-            Err(error) => return Err(self.unwind_new(&instance, Box::new(error)).await),
+            Err(error) => return Err(self.unwind_new(&instance, Box::new(error), false).await),
         };
         let spec = crate::manager::ProvisionSpec {
             host_id,
@@ -167,15 +174,11 @@ impl Manager {
         // machine (MULTI-NODE 13.1).
         let observed = match self.fleet.provision(&spec).await {
             Ok(state) => state,
-            Err(error) => return Err(self.unwind_new(&instance, error).await),
+            Err(error) => return Err(self.unwind_new(&instance, error, true).await),
         };
         instance.state = observed;
-        if let Err(error) = self.store.set_observed_state(&uuid, observed).await {
-            self.log.warn(&format!(
-                "new: observed state not recorded; poller will catch up: {error}",
-                error = bento_types::error_chain(&*error)
-            ));
-        }
+        self.finish_provisioning(&instance.name, &uuid, observed)
+            .await;
         self.log
             .info(&format!("new: instance {} created", request.name));
         Ok(instance)
@@ -231,6 +234,51 @@ impl Manager {
             .name)
     }
 
+    /// Ends the `provisioning` state with what libvirt showed. When this
+    /// write fails the row stays `provisioning`, and the poll does not
+    /// touch it: the next start of bentod settles it from libvirt, and a
+    /// remove always works (SPEC 11.2).
+    pub(crate) async fn finish_provisioning(&self, name: &str, uuid: &str, observed: State) {
+        match self.store.finish_provisioning(uuid, observed).await {
+            Ok(true) => {}
+            Ok(false) => self.log.warn(&format!(
+                "new: {name} is no longer provisioning; its state was not recorded"
+            )),
+            Err(error) => self.log.warn(&format!(
+                "new: observed state of {name} not recorded; it stays provisioning \
+                 until bentod restarts: {error}",
+                error = bento_types::error_chain(&*error)
+            )),
+        }
+    }
+
+    /// Turns a kept `provisioning` row into a stopped instance whose
+    /// desired state is stopped (SPEC 11.2).
+    async fn keep_row_stopped(&self, instance: &Instance) {
+        if let Err(error) = self
+            .store
+            .finish_provisioning(&instance.uuid, State::Stopped)
+            .await
+        {
+            self.log.warn(&format!(
+                "new: row of {} not set to stopped: {error}",
+                instance.name,
+                error = bento_types::error_chain(&*error)
+            ));
+        }
+        if let Err(error) = self
+            .store
+            .set_desired_state(&instance.uuid, DesiredState::Stopped)
+            .await
+        {
+            self.log.warn(&format!(
+                "new: desired state of {} not set to stopped: {error}",
+                instance.name,
+                error = bento_types::error_chain(&*error)
+            ));
+        }
+    }
+
     /// Removes the row and the local files of a copy that failed.
     ///
     /// A copy is built on this machine, so this side made the files and
@@ -251,11 +299,12 @@ impl Manager {
                 error = bento_types::error_chain(&error)
             ));
         }
-        if let Err(error) = self.store.delete_instance(&instance.uuid).await {
-            errors.push(format!(
+        match self.store.delete_instance(&instance.uuid).await {
+            Ok(_) => self.forget_lock(&instance.uuid),
+            Err(error) => errors.push(format!(
                 "unwind instance row: {error}",
                 error = bento_types::error_chain(&*error)
-            ));
+            )),
         }
         self.log.warn(&format!(
             "cp: failed, partial work unwound: {}",
@@ -274,13 +323,48 @@ impl Manager {
     /// the instance removed its own partial work before it reported the
     /// failure, and it is the only side that can: a controller cannot
     /// delete a file on another machine (MULTI-NODE 13.1).
-    pub(crate) async fn unwind_new(&self, instance: &Instance, cause: crate::DynError) -> Error {
+    ///
+    /// `sent` says whether the machine was asked to build the instance.
+    /// Before that, it cannot hold a domain, so it is not asked about one.
+    pub(crate) async fn unwind_new(
+        &self,
+        instance: &Instance,
+        cause: crate::DynError,
+        sent: bool,
+    ) -> Error {
         let mut errors = vec![bento_types::error_chain(&*cause)];
-        if let Err(error) = self.store.delete_instance(&instance.uuid).await {
-            errors.push(format!(
+        // An error from another machine does not prove that it did
+        // nothing: a timeout or a lost reply can follow a finished create.
+        // The row is the only record of that domain and of its address, so
+        // it goes only after the machine confirms the domain is gone. An
+        // unreachable machine leaves the row, and the user can remove it
+        // later (MULTI-NODE 14.1).
+        if sent
+            && instance.host_id != self.host_id
+            && let Err(error) = self.remove_remote_domain(instance).await
+        {
+            errors.push(format!("row kept, domain not confirmed gone: {error}"));
+            self.log.warn(&format!(
+                "new: failed, row of {} kept: {}",
+                instance.name,
+                errors.join(": ")
+            ));
+            // The kept row is a plain stopped instance that the user can
+            // remove. Desired stopped keeps restore from starting a
+            // domain that may be half built (SPEC 11.2, MULTI-NODE 14.1).
+            self.keep_row_stopped(instance).await;
+            return Error::operation(format!(
+                "lifecycle: new {}: {}",
+                instance.name,
+                errors.join(": ")
+            ));
+        }
+        match self.store.delete_instance(&instance.uuid).await {
+            Ok(_) => self.forget_lock(&instance.uuid),
+            Err(error) => errors.push(format!(
                 "unwind instance row: {error}",
                 error = bento_types::error_chain(&*error)
-            ));
+            )),
         }
         self.log.warn(&format!(
             "new: failed, partial work unwound: {}",
@@ -291,6 +375,28 @@ impl Manager {
             instance.name,
             errors.join(": ")
         ))
+    }
+
+    /// Removes the domain of an instance that failed to build on another
+    /// machine, when that machine has one. A domain is matched by UUID,
+    /// never by name alone, so a domain that belongs to something else is
+    /// not touched.
+    async fn remove_remote_domain(&self, instance: &Instance) -> std::result::Result<(), String> {
+        let hyp = self
+            .hyp_for(instance)
+            .await
+            .map_err(|error| bento_types::error_chain(&error))?;
+        let domains = hyp
+            .list()
+            .await
+            .map_err(|error| bento_types::error_chain(&error))?;
+        if !domains.iter().any(|domain| domain.uuid == instance.uuid) {
+            return Ok(());
+        }
+        match hyp.remove(&instance.name).await {
+            Ok(()) | Err(bento_hypervisor::Error::DomainNotFound(_)) => Ok(()),
+            Err(error) => Err(bento_types::error_chain(&error)),
+        }
     }
 }
 

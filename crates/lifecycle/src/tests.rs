@@ -20,6 +20,7 @@ use tempfile::TempDir;
 use time::macros::datetime;
 
 use super::*;
+use crate::poller::FIRST_BOOT_SETTLE;
 
 fn boxed(message: &str) -> DynError {
     Box::new(io::Error::other(message.to_string()))
@@ -214,6 +215,38 @@ impl Store for TestStore {
             .cloned()
             .collect())
     }
+    async fn finish_provisioning(
+        &self,
+        uuid: &str,
+        observed: State,
+    ) -> std::result::Result<bool, DynError> {
+        let mut data = self.data();
+        data.mutations
+            .push(format!("finish-provisioning {uuid} {observed}"));
+        match data
+            .instances
+            .iter_mut()
+            .find(|item| item.uuid == uuid && item.state == State::Provisioning)
+        {
+            Some(item) => {
+                item.state = observed;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+    async fn provisioning_instances(
+        &self,
+        host_id: i64,
+    ) -> std::result::Result<Vec<Instance>, DynError> {
+        Ok(self
+            .data()
+            .instances
+            .iter()
+            .filter(|item| item.host_id == host_id && item.state == State::Provisioning)
+            .cloned()
+            .collect())
+    }
     async fn image(&self, name: &str) -> std::result::Result<Image, DynError> {
         self.data()
             .images
@@ -384,7 +417,11 @@ impl Store for TestStore {
         data.mutations
             .push(format!("observed-batch {}", states.len()));
         for item in &mut data.instances {
-            if let Some(state) = states.get(&item.uuid) {
+            // Like the real store, the poll write leaves a row that a
+            // create still owns alone (SPEC 11.2).
+            if item.state != State::Provisioning
+                && let Some(state) = states.get(&item.uuid)
+            {
                 item.state = *state;
             }
         }
@@ -413,6 +450,12 @@ struct TestImages {
     disk_resized: Mutex<Vec<String>>,
     /// Makes a remote disk resize fail.
     disk_error: Mutex<Option<String>>,
+    /// Makes `provision` create the domain and then report an error, as a
+    /// runner does when its reply is lost (MULTI-NODE 14.1).
+    lose_reply: Mutex<bool>,
+    /// Makes `provision` announce itself and wait, so a test can run
+    /// another action while a create is in flight.
+    gate: Mutex<Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>>,
     /// The machine this fake stands for. Only work aimed here reaches
     /// the hypervisor, as with the real one.
     fake: Arc<Fake>,
@@ -433,6 +476,8 @@ impl TestImages {
             redefined: Mutex::new(Vec::new()),
             disk_resized: Mutex::new(Vec::new()),
             disk_error: Mutex::new(None),
+            lose_reply: Mutex::new(false),
+            gate: Mutex::new(None),
             fake,
             iso,
             storage_dir,
@@ -456,6 +501,11 @@ impl Fleet for TestImages {
             .join(format!("{}-seed.iso", spec.instance.uuid));
         if let Some(error) = self.error.lock().unwrap().clone() {
             return Err(boxed(&error));
+        }
+        let gate = self.gate.lock().unwrap().clone();
+        if let Some((entered, release)) = gate {
+            entered.notify_one();
+            release.notified().await;
         }
         tokio::fs::write(&overlay, b"overlay").await?;
         if spec.with_seed_iso
@@ -492,6 +542,9 @@ impl Fleet for TestImages {
         if let Err(error) = bento_hypervisor::Hypervisor::create(self.fake.as_ref(), &xml).await {
             self.unwind(&spec.instance.uuid).await;
             return Err(boxed(&error.to_string()));
+        }
+        if *self.lose_reply.lock().unwrap() {
+            return Err(boxed("reply lost"));
         }
         Ok(if spec.start {
             State::Running
@@ -611,6 +664,66 @@ impl Hypervisor for RunnerLike {
     }
 }
 
+/// A hypervisor that pauses the first `state` call after `arm`, once the
+/// real answer is known. It holds an action between its check and its act,
+/// so that a test can run another action in that gap.
+struct GateHyp {
+    fake: Arc<Fake>,
+    armed: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl GateHyp {
+    fn new(fake: Arc<Fake>) -> Arc<Self> {
+        Arc::new(Self {
+            fake,
+            armed: std::sync::atomic::AtomicBool::new(false),
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        })
+    }
+    fn arm(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    /// Lets the paused action go on after a real delay, long enough for a
+    /// competing action to run if nothing stops it.
+    async fn release_later(&self) {
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        self.release.notify_one();
+    }
+}
+
+#[async_trait]
+impl Hypervisor for GateHyp {
+    async fn create(&self, xml: &str) -> std::result::Result<(), HypervisorError> {
+        self.fake.create(xml).await
+    }
+    async fn start(&self, name: &str) -> std::result::Result<(), HypervisorError> {
+        self.fake.start(name).await
+    }
+    async fn stop(&self, name: &str) -> std::result::Result<StopResult, HypervisorError> {
+        self.fake.stop(name).await
+    }
+    async fn reboot(&self, name: &str) -> std::result::Result<(), HypervisorError> {
+        self.fake.reboot(name).await
+    }
+    async fn remove(&self, name: &str) -> std::result::Result<(), HypervisorError> {
+        self.fake.remove(name).await
+    }
+    async fn list(&self) -> std::result::Result<Vec<DomainInfo>, HypervisorError> {
+        self.fake.list().await
+    }
+    async fn state(&self, name: &str) -> std::result::Result<State, HypervisorError> {
+        let answer = self.fake.state(name).await;
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.entered.notify_one();
+            self.release.notified().await;
+        }
+        answer
+    }
+}
+
 impl TestImages {
     /// A real machine removes its own partial work before it reports a
     /// failure, so this one does too.
@@ -723,7 +836,16 @@ struct Fixture {
     clearer: Arc<TestClearer>,
     log: Arc<TestLog>,
     sleep: Arc<TestSleep>,
+    /// What the manager's clock says. A test moves it with `advance`.
+    clock: Arc<Mutex<time::OffsetDateTime>>,
     _temp: TempDir,
+}
+
+impl Fixture {
+    fn advance(&self, by: Duration) {
+        let mut now = self.clock.lock().unwrap();
+        *now += by;
+    }
 }
 
 fn fixture(with_definer: bool, with_clearer: bool) -> Fixture {
@@ -735,6 +857,7 @@ fn fixture(with_definer: bool, with_clearer: bool) -> Fixture {
     let clearer = Arc::new(TestClearer::default());
     let log = Arc::new(TestLog::default());
     let sleep = Arc::new(TestSleep::default());
+    let clock = Arc::new(Mutex::new(datetime!(2026-08-10 12:00 UTC)));
     let temp = tempfile::tempdir().unwrap();
     let images = Arc::new(TestImages::new(
         fake.clone(),
@@ -759,7 +882,10 @@ fn fixture(with_definer: bool, with_clearer: bool) -> Fixture {
                 format!("{next:08}-1111-4111-8111-111111111111")
             }
         })),
-        now: Some(Arc::new(|| datetime!(2026-08-10 12:00 UTC))),
+        now: Some(Arc::new({
+            let clock = clock.clone();
+            move || *clock.lock().unwrap()
+        })),
         iso_exists: Some(Arc::new(move |path| {
             iso_for_exists.seeds.lock().unwrap().contains_key(path)
         })),
@@ -791,6 +917,7 @@ fn fixture(with_definer: bool, with_clearer: bool) -> Fixture {
         clearer,
         log,
         sleep,
+        clock,
         _temp: temp,
     }
 }
@@ -2066,11 +2193,66 @@ async fn poll_once_finishes_first_boot() {
     assert!((f.manager.iso_exists)(
         &f.manager.seed_iso_path(&instance.uuid)
     ));
+    // Four polls over 90 s are not enough. The fifth, 120 s after the
+    // first, finishes the cleanup (SPEC 5.2).
+    for _ in 0..4 {
+        f.manager.poll_once().await.unwrap();
+        assert!(seed_present(&f, &instance));
+        f.advance(Duration::from_secs(30));
+    }
     f.manager.poll_once().await.unwrap();
-    assert!(!(f.manager.iso_exists)(
-        &f.manager.seed_iso_path(&instance.uuid)
-    ));
+    assert!(!seed_present(&f, &instance));
     assert!(!f.definer.xml.lock().unwrap()[0].contains("seed.iso"));
+}
+
+fn seed_present(f: &Fixture, instance: &Instance) -> bool {
+    (f.manager.iso_exists)(&f.manager.seed_iso_path(&instance.uuid))
+}
+
+#[tokio::test]
+async fn running_for_less_than_two_minutes_keeps_the_seed() {
+    let f = fixture(true, false);
+    let instance = setup(&f).await;
+    f.manager.poll_once().await.unwrap();
+    f.advance(FIRST_BOOT_SETTLE - Duration::from_secs(1));
+    f.manager.poll_once().await.unwrap();
+    assert!(seed_present(&f, &instance));
+    assert!(f.definer.xml.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_stop_between_two_polls_starts_the_first_boot_time_again() {
+    let f = fixture(true, false);
+    let instance = setup(&f).await;
+    f.manager.poll_once().await.unwrap();
+    f.advance(Duration::from_secs(90));
+    // The guest stops before cloud-init is known to have read the seed.
+    f.fake.stop("web").await.unwrap();
+    f.manager.poll_once().await.unwrap();
+    f.fake.start("web").await.unwrap();
+    f.advance(Duration::from_secs(60));
+    f.manager.poll_once().await.unwrap(); // the time starts here
+    f.advance(Duration::from_secs(60));
+    f.manager.poll_once().await.unwrap();
+    assert!(seed_present(&f, &instance), "only 60 s of unbroken running");
+    f.advance(Duration::from_secs(60));
+    f.manager.poll_once().await.unwrap();
+    assert!(!seed_present(&f, &instance));
+}
+
+#[tokio::test]
+async fn a_domain_that_is_not_listed_starts_the_first_boot_time_again() {
+    let f = fixture(true, false);
+    let instance = setup(&f).await;
+    f.manager.poll_once().await.unwrap();
+    f.advance(Duration::from_secs(100));
+    let domain = f.fake.domain("web").unwrap();
+    f.fake.remove("web").await.unwrap();
+    f.manager.poll_once().await.unwrap();
+    f.fake.set_domain(domain);
+    f.advance(Duration::from_secs(100));
+    f.manager.poll_once().await.unwrap();
+    assert!(seed_present(&f, &instance));
 }
 
 #[tokio::test]
@@ -2110,9 +2292,49 @@ async fn handle_event_running_finishes_first_boot() {
         .handle_event(&instance.uuid, State::Running)
         .await
         .unwrap();
-    assert!(!(f.manager.iso_exists)(
-        &f.manager.seed_iso_path(&instance.uuid)
-    ));
+    // The first event only starts the time (SPEC 5.2).
+    assert!(seed_present(&f, &instance));
+    f.advance(FIRST_BOOT_SETTLE);
+    f.manager
+        .handle_event(&instance.uuid, State::Running)
+        .await
+        .unwrap();
+    assert!(!seed_present(&f, &instance));
+}
+
+#[tokio::test]
+async fn a_stopped_event_breaks_the_first_boot_run() {
+    let f = fixture(true, false);
+    let instance = setup(&f).await;
+    let uuid = &instance.uuid;
+    f.manager.handle_event(uuid, State::Running).await.unwrap();
+    f.advance(Duration::from_secs(100));
+    f.manager.handle_event(uuid, State::Stopped).await.unwrap();
+    f.advance(Duration::from_secs(100));
+    f.manager.handle_event(uuid, State::Running).await.unwrap();
+    f.advance(Duration::from_secs(100));
+    f.manager.handle_event(uuid, State::Running).await.unwrap();
+    assert!(seed_present(&f, &instance));
+}
+
+#[tokio::test]
+async fn a_finished_cleanup_drops_the_first_boot_entry() {
+    let f = fixture(true, false);
+    setup(&f).await;
+    f.manager.poll_once().await.unwrap();
+    assert_eq!(f.manager.first_running.lock().unwrap().len(), 1);
+    f.advance(FIRST_BOOT_SETTLE);
+    f.manager.poll_once().await.unwrap();
+    assert!(f.manager.first_running.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_remove_drops_the_first_boot_entry() {
+    let f = fixture(true, false);
+    let instance = setup(&f).await;
+    f.manager.poll_once().await.unwrap();
+    f.manager.remove(&instance.uuid).await.unwrap();
+    assert!(f.manager.first_running.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -2441,4 +2663,737 @@ fn random_uuid() {
         assert_eq!(&id[14..15], "4");
         assert!(seen.insert(id));
     }
+}
+
+#[tokio::test]
+async fn rename_waits_for_a_concurrent_start() {
+    // A start between the stopped check and the undefine of a rename
+    // once powered off a running guest (SPEC 7.3).
+    let mut f = fixture(true, false);
+    let instance = setup(&f).await;
+    f.manager.stop(&instance.uuid).await.unwrap();
+    let gate = GateHyp::new(f.fake.clone());
+    f.manager.hyp = gate.clone();
+    gate.arm();
+
+    let (renamed, _started, ()) = tokio::join!(
+        f.manager.rename(&instance.uuid, "api"),
+        async {
+            gate.entered.notified().await;
+            f.manager.start(&instance.uuid).await
+        },
+        gate.release_later(),
+    );
+
+    renamed.unwrap();
+    let calls = f.fake.calls();
+    assert!(
+        !calls.iter().any(|call| call == "start web"),
+        "a start ran while the rename held the instance: {calls:?}"
+    );
+}
+
+#[tokio::test]
+async fn copy_waits_for_a_concurrent_start_of_the_source() {
+    // A start of the source while its disk is copied gives a torn copy
+    // (SPEC 15).
+    let mut f = fixture(false, false);
+    let instance = setup(&f).await;
+    f.manager.stop(&instance.uuid).await.unwrap();
+    let owner = f.store.data().users[&1].clone();
+    let gate = GateHyp::new(f.fake.clone());
+    f.manager.hyp = gate.clone();
+    gate.arm();
+
+    let (copied, _started, ()) = tokio::join!(
+        f.manager.copy(&instance.uuid, copy_request(owner, "web2")),
+        async {
+            gate.entered.notified().await;
+            f.manager.start(&instance.uuid).await
+        },
+        gate.release_later(),
+    );
+
+    copied.unwrap();
+    let calls = f.fake.calls();
+    let created = calls.iter().position(|call| call == "create web2").unwrap();
+    let started = calls.iter().position(|call| call == "start web").unwrap();
+    assert!(created < started, "the source started mid-copy: {calls:?}");
+}
+
+#[tokio::test]
+async fn remove_waits_for_create() {
+    // A remove during a create once deleted the row, and the create then
+    // started a domain that had no row (SPEC 11.1).
+    let f = fixture(false, false);
+    let owner = f.store.add_user(1, "amber", "10.77.0.0/24");
+    f.store.add_image(Some("aa11"));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    *f.images.gate.lock().unwrap() = Some((entered.clone(), release.clone()));
+    let uuid = "00000001-1111-4111-8111-111111111111";
+
+    let (created, removed, ()) = tokio::join!(
+        f.manager.create(request(owner, "web")),
+        async {
+            entered.notified().await;
+            f.manager.remove(uuid).await
+        },
+        async {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            release.notify_one();
+        },
+    );
+
+    created.unwrap();
+    removed.unwrap();
+    assert!(f.fake.domain("web").is_none(), "a domain has no row");
+    assert!(f.store.data().instances.is_empty());
+}
+
+#[tokio::test]
+async fn first_boot_cleanup_uses_the_current_row() {
+    // The poller holds a row from before a resize. Building the XML from
+    // it put the old size back (SPEC 5.2, 11.1).
+    let f = fixture(true, false);
+    let stale = setup(&f).await;
+    f.manager
+        .resize(ResizeRequest {
+            uuid: stale.uuid.clone(),
+            vcpu: 4,
+            memory_mib: 4096,
+            disk_gib: 20,
+            nested: false,
+        })
+        .await
+        .unwrap();
+
+    f.manager.poll_once().await.unwrap();
+    f.advance(FIRST_BOOT_SETTLE);
+    f.manager.poll_once().await.unwrap();
+
+    let xml = f.definer.xml.lock().unwrap().last().unwrap().clone();
+    assert!(xml.contains(">4096<"), "{xml}");
+}
+
+#[tokio::test]
+async fn poll_once_marks_a_row_without_a_domain_stopped() {
+    // Libvirt is authoritative (SPEC 12). A row whose domain is gone must
+    // not stay running.
+    let f = fixture(false, false);
+    let instance = setup(&f).await;
+    f.fake.remove("web").await.unwrap();
+
+    f.manager.poll_once().await.unwrap();
+
+    assert_eq!(
+        f.store.instance(&instance.uuid).await.unwrap().state,
+        State::Stopped
+    );
+}
+
+#[tokio::test]
+async fn poll_does_not_downgrade_starting() {
+    // While restore starts instances, the user sees `starting` (SPEC
+    // 11.2). A poll that finds the domain still shut off must not undo it.
+    let f = fixture(false, false);
+    let instance = setup(&f).await;
+    f.fake.stop("web").await.unwrap();
+    f.store
+        .set_observed_state(&instance.uuid, State::Starting)
+        .await
+        .unwrap();
+    f.manager
+        .restoring
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    f.manager.poll_once().await.unwrap();
+    assert_eq!(
+        f.store.instance(&instance.uuid).await.unwrap().state,
+        State::Starting
+    );
+
+    // The protection ends with the restore, so nothing stays stuck.
+    f.manager
+        .restoring
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    f.manager.poll_once().await.unwrap();
+    assert_eq!(
+        f.store.instance(&instance.uuid).await.unwrap().state,
+        State::Stopped
+    );
+}
+
+#[tokio::test]
+async fn poll_corrects_a_starting_row_without_a_domain() {
+    let f = fixture(false, false);
+    let instance = setup(&f).await;
+    f.fake.remove("web").await.unwrap();
+    f.store
+        .set_observed_state(&instance.uuid, State::Starting)
+        .await
+        .unwrap();
+    f.manager
+        .restoring
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    f.manager.poll_once().await.unwrap();
+
+    assert_eq!(
+        f.store.instance(&instance.uuid).await.unwrap().state,
+        State::Stopped
+    );
+}
+
+#[tokio::test]
+async fn restore_skips_a_row_without_a_domain() {
+    // Writing `starting` for a row with no domain leaves a row that no
+    // start can fix (SPEC 11.2, 12).
+    let f = fixture(false, false);
+    let instances = seed_restore(&f, 1).await;
+    f.fake.remove("vm0").await.unwrap();
+    let before = f.store.data().mutations.len();
+
+    f.manager.restore().await.unwrap();
+
+    assert!(!f.fake.calls().contains(&"start vm0".into()));
+    let data = f.store.data();
+    assert!(
+        !data.mutations[before..]
+            .iter()
+            .any(|mutation| mutation == &format!("observed {} starting", instances[0].uuid)),
+        "{:?}",
+        data.mutations
+    );
+    drop(data);
+    let log = f.log.0.lock().unwrap().join("\n");
+    assert!(log.contains("bentod reconcile"), "{log}");
+}
+
+#[tokio::test]
+async fn restore_skips_an_instance_that_changed_while_queued() {
+    // A `stop` or `rm` that lands during an earlier start must win over
+    // the list that restore read at its start (SPEC 11.1, 11.2).
+    let mut f = fixture(false, false);
+    f.manager.batch_size = 1;
+    let instances = seed_restore(&f, 3).await;
+    let store = f.store.clone();
+    let second = instances[1].uuid.clone();
+    let third = instances[2].uuid.clone();
+    f.fake.set_hook(move |operation, name| {
+        if operation == "start" && name == "vm0" {
+            let mut data = store.data();
+            for item in &mut data.instances {
+                if item.uuid == second {
+                    item.desired_state = DesiredState::Stopped;
+                }
+            }
+            data.instances.retain(|item| item.uuid != third);
+        }
+        Ok(())
+    });
+
+    f.manager.restore().await.unwrap();
+
+    let calls = f.fake.calls();
+    assert!(calls.contains(&"start vm0".into()));
+    assert!(!calls.contains(&"start vm1".into()), "{calls:?}");
+    assert!(!calls.contains(&"start vm2".into()), "{calls:?}");
+}
+
+#[tokio::test]
+async fn restore_recovers_a_stale_starting_row() {
+    // A crash in the middle of an earlier restore leaves `starting` on a
+    // row whose domain is shut off. The next restore must start it.
+    let f = fixture(false, false);
+    let instances = seed_restore(&f, 1).await;
+    f.store
+        .set_observed_state(&instances[0].uuid, State::Starting)
+        .await
+        .unwrap();
+
+    f.manager.restore().await.unwrap();
+
+    assert!(f.fake.calls().contains(&"start vm0".into()));
+    assert_eq!(
+        f.store.instance(&instances[0].uuid).await.unwrap().state,
+        State::Running
+    );
+}
+
+#[tokio::test]
+async fn resize_redefine_failure_reverts_the_row() {
+    // A failed redefine must not leave the new figures in the row, or a
+    // retry sees nothing to change and skips the redefine (SPEC 11.1).
+    let f = fixture(true, false);
+    let instance = setup(&f).await;
+    *f.definer.fail.lock().unwrap() = true;
+    let request = ResizeRequest {
+        uuid: instance.uuid.clone(),
+        vcpu: 4,
+        memory_mib: 4096,
+        disk_gib: 30,
+        nested: false,
+    };
+
+    f.manager.resize(request.clone()).await.unwrap_err();
+
+    let row = f.store.instance(&instance.uuid).await.unwrap();
+    assert_eq!((row.vcpu, row.memory_mib, row.nested), (2, 2048, false));
+    // The file did grow, so the row keeps the size the file has.
+    assert_eq!(row.disk_gib, 30);
+
+    *f.definer.fail.lock().unwrap() = false;
+    let retry = f.manager.resize(request).await.unwrap();
+    assert!(retry.restart_required);
+}
+
+#[tokio::test]
+async fn two_connections_start_a_stopped_instance_without_an_error() {
+    // Libvirt refuses to start a domain that already runs. The second
+    // session sees a stale `stopped` row, and must not fail (SPEC 10
+    // step 7).
+    let f = fixture(false, false);
+    let instance = setup(&f).await;
+    f.fake.stop("web").await.unwrap();
+    let starts = Arc::new(Mutex::new(0_u32));
+    f.fake.set_hook({
+        let starts = starts.clone();
+        move |operation, _| {
+            if operation != "start" {
+                return Ok(());
+            }
+            let mut starts = starts.lock().unwrap();
+            *starts += 1;
+            if *starts > 1 {
+                Err(HypervisorError::Operation(
+                    "domain is already running".into(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    });
+
+    f.manager
+        .start_for_connection(&instance.uuid)
+        .await
+        .unwrap();
+    f.manager
+        .start_for_connection(&instance.uuid)
+        .await
+        .unwrap();
+
+    assert_eq!(f.fake.domain("web").unwrap().state, State::Running);
+}
+
+fn place_on_runner(f: &Fixture) {
+    let mut data = f.store.data();
+    data.placeable_hosts = 2;
+    data.chosen_host = Some(2);
+    data.slots[0].owner_host_id = 2;
+}
+
+#[tokio::test]
+async fn a_lost_reply_from_a_runner_does_not_leave_a_domain_without_a_row() {
+    // The runner can finish a create after the controller gave up on its
+    // reply. Deleting the row then leaves a running domain that nothing
+    // owns (MULTI-NODE 14.1).
+    let f = fixture(false, false);
+    place_on_runner(&f);
+    *f.images.lose_reply.lock().unwrap() = true;
+    let owner = f.store.add_user(1, "amber", "10.77.0.0/24");
+    f.store.add_image(Some("aa11"));
+
+    f.manager.create(request(owner, "web")).await.unwrap_err();
+
+    assert!(f.fake.domain("web").is_none(), "a domain has no row");
+    assert!(f.store.data().instances.is_empty());
+}
+
+#[tokio::test]
+async fn an_unreachable_runner_keeps_the_row_of_a_failed_create() {
+    // Bento must not erase the only record of a domain that may exist
+    // (MULTI-NODE 14.1).
+    let f = fixture(false, false);
+    place_on_runner(&f);
+    *f.images.error.lock().unwrap() = Some("timed out".into());
+    f.images.unreachable.lock().unwrap().push(2);
+    let owner = f.store.add_user(1, "amber", "10.77.0.0/24");
+    f.store.add_image(Some("aa11"));
+
+    let error = f.manager.create(request(owner, "web")).await.unwrap_err();
+
+    assert!(error.to_string().contains("timed out"), "{error}");
+    assert_eq!(f.store.data().instances.len(), 1);
+}
+
+#[tokio::test]
+async fn a_failed_create_never_removes_a_domain_that_is_not_its_own() {
+    // A domain with the same name and another UUID is not ours to remove.
+    let f = fixture(false, false);
+    place_on_runner(&f);
+    f.fake.set_domain(FakeDomain {
+        name: "web".into(),
+        uuid: "ffffffff-ffff-4fff-8fff-ffffffffffff".into(),
+        xml: String::new(),
+        state: State::Running,
+        autostart: false,
+    });
+    *f.images.error.lock().unwrap() = Some("no room".into());
+    let owner = f.store.add_user(1, "amber", "10.77.0.0/24");
+    f.store.add_image(Some("aa11"));
+
+    f.manager.create(request(owner, "web")).await.unwrap_err();
+
+    assert!(f.fake.domain("web").is_some());
+    assert!(f.store.data().instances.is_empty());
+}
+
+// ---- the `provisioning` state (SPEC 11.2) ----
+
+#[tokio::test]
+async fn a_create_holds_the_row_provisioning_until_it_ends() {
+    let f = fixture(false, false);
+    let owner = f.store.add_user(1, "amber", "10.77.0.0/24");
+    f.store.add_image(Some("aa11"));
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    *f.images.gate.lock().unwrap() = Some((entered.clone(), release.clone()));
+
+    let (created, ()) = tokio::join!(f.manager.create(request(owner, "web")), async {
+        entered.notified().await;
+        let row = f.store.data().instances[0].clone();
+        assert_eq!(
+            (row.state, row.desired_state),
+            (State::Provisioning, DesiredState::Running)
+        );
+        release.notify_one();
+    });
+
+    let instance = created.unwrap();
+    assert_eq!(
+        f.store.instance(&instance.uuid).await.unwrap().state,
+        State::Running
+    );
+    assert!(
+        f.store
+            .data()
+            .mutations
+            .contains(&format!("finish-provisioning {} running", instance.uuid))
+    );
+}
+
+#[tokio::test]
+async fn a_copy_holds_the_row_provisioning_until_it_ends() {
+    let f = fixture(false, false);
+    let source = setup(&f).await;
+    f.manager.stop(&source.uuid).await.unwrap();
+    let owner = f.store.user_by_id(1).await.unwrap();
+    let seen = Arc::new(Mutex::new(None));
+    let store = f.store.clone();
+    let slot = seen.clone();
+    f.fake.set_hook(move |operation, _| {
+        if operation == "create" {
+            *slot.lock().unwrap() = store.data().instances.last().map(|row| row.state);
+        }
+        Ok(())
+    });
+
+    let clone = f
+        .manager
+        .copy(&source.uuid, copy_request(owner, "clone"))
+        .await
+        .unwrap();
+
+    assert_eq!(*seen.lock().unwrap(), Some(State::Provisioning));
+    assert_eq!(
+        f.store.instance(&clone.uuid).await.unwrap().state,
+        State::Running
+    );
+}
+
+#[tokio::test]
+async fn a_kept_row_is_a_plain_stopped_instance_that_restore_does_not_start() {
+    // A failed create on a machine that cannot be reached keeps its row
+    // (MULTI-NODE 14.1). The row must not be started by a later restore,
+    // and the user must be able to remove it.
+    let f = fixture(false, false);
+    place_on_runner(&f);
+    *f.images.error.lock().unwrap() = Some("timed out".into());
+    f.images.unreachable.lock().unwrap().push(2);
+    let owner = f.store.add_user(1, "amber", "10.77.0.0/24");
+    f.store.add_image(Some("aa11"));
+    f.manager.create(request(owner, "web")).await.unwrap_err();
+    let row = f.store.data().instances[0].clone();
+    assert_eq!(
+        (row.state, row.desired_state),
+        (State::Stopped, DesiredState::Stopped)
+    );
+
+    f.images.unreachable.lock().unwrap().clear();
+    f.manager.restore_host(2).await.unwrap();
+    assert!(!f.fake.calls().iter().any(|call| call.starts_with("start ")));
+    f.manager.remove(&row.uuid).await.unwrap();
+    assert!(f.store.data().instances.is_empty());
+}
+
+/// Makes a row look like one that a crash or a failed create left.
+async fn leave_provisioning(f: &Fixture, instance: &Instance) {
+    f.store
+        .set_observed_state(&instance.uuid, State::Provisioning)
+        .await
+        .unwrap();
+}
+
+fn is_still_provisioning<T: std::fmt::Debug>(result: Result<T>) -> bool {
+    matches!(result, Err(Error::StillProvisioning(_)))
+}
+
+#[tokio::test]
+async fn an_action_refuses_a_provisioning_row() {
+    let f = fixture(true, false);
+    let instance = setup(&f).await;
+    let uuid = &instance.uuid;
+    leave_provisioning(&f, &instance).await;
+    let owner = f.store.user_by_id(1).await.unwrap();
+    let calls = f.fake.calls().len();
+    let mutations = f.store.data().mutations.len();
+
+    assert!(is_still_provisioning(f.manager.start(uuid).await));
+    assert!(is_still_provisioning(f.manager.stop(uuid).await));
+    assert!(is_still_provisioning(f.manager.restart(uuid).await));
+    assert!(is_still_provisioning(
+        f.manager.resize(grow_to_30(uuid)).await
+    ));
+    assert!(is_still_provisioning(f.manager.rename(uuid, "db").await));
+    assert!(is_still_provisioning(
+        f.manager.copy(uuid, copy_request(owner, "clone")).await
+    ));
+    assert!(is_still_provisioning(
+        f.manager.start_for_connection(uuid).await
+    ));
+
+    assert_eq!(f.fake.calls().len(), calls, "a refusal touched libvirt");
+    assert_eq!(f.store.data().mutations.len(), mutations);
+}
+
+#[tokio::test]
+async fn a_remove_works_on_a_provisioning_row_with_no_domain() {
+    let f = fixture(false, false);
+    let instance = setup(&f).await;
+    leave_provisioning(&f, &instance).await;
+    f.fake.remove("web").await.unwrap();
+
+    f.manager.remove(&instance.uuid).await.unwrap();
+
+    assert!(f.store.data().instances.is_empty());
+}
+
+#[tokio::test]
+async fn restore_settles_a_provisioning_row_whose_domain_exists() {
+    let f = fixture(false, false);
+    let instance = setup(&f).await;
+    leave_provisioning(&f, &instance).await;
+
+    f.manager.restore().await.unwrap();
+
+    let row = f.store.instance(&instance.uuid).await.unwrap();
+    assert_eq!(row.state, State::Running);
+    assert!(
+        f.store
+            .data()
+            .mutations
+            .contains(&format!("finish-provisioning {} running", instance.uuid))
+    );
+}
+
+#[tokio::test]
+async fn restore_stops_a_provisioning_row_that_has_no_domain_and_warns() {
+    let f = fixture(false, false);
+    let instance = setup(&f).await;
+    leave_provisioning(&f, &instance).await;
+    f.fake.remove("web").await.unwrap();
+
+    f.manager.restore().await.unwrap();
+
+    let row = f.store.instance(&instance.uuid).await.unwrap();
+    assert_eq!(
+        (row.state, row.desired_state),
+        (State::Stopped, DesiredState::Stopped)
+    );
+    // SPEC 11.1: Bento does not delete on its own.
+    assert_eq!(f.store.data().instances.len(), 1);
+    assert!(!f.fake.calls().iter().any(|call| call.starts_with("start ")));
+    let log = f.log.0.lock().unwrap().join("\n");
+    assert!(log.contains("web") && log.contains("remove it"), "{log}");
+}
+
+#[tokio::test]
+async fn restore_leaves_a_provisioning_row_whose_create_runs_in_this_process() {
+    let f = fixture(false, false);
+    let instance = setup(&f).await;
+    leave_provisioning(&f, &instance).await;
+    let _create_holds_the_lock = f.manager.lock_instance(&instance.uuid).await;
+
+    f.manager.restore().await.unwrap();
+
+    assert_eq!(
+        f.store.instance(&instance.uuid).await.unwrap().state,
+        State::Provisioning
+    );
+}
+
+#[tokio::test]
+async fn poll_leaves_a_provisioning_row_alone() {
+    let f = fixture(true, false);
+    let instance = setup(&f).await;
+    leave_provisioning(&f, &instance).await;
+
+    // The domain exists and runs: no state write, no first-boot timer.
+    f.manager.poll_once().await.unwrap();
+    f.advance(FIRST_BOOT_SETTLE);
+    f.manager.poll_once().await.unwrap();
+    assert_eq!(
+        f.store.instance(&instance.uuid).await.unwrap().state,
+        State::Provisioning
+    );
+    assert!(seed_present(&f, &instance));
+    assert!(f.manager.first_running.lock().unwrap().is_empty());
+
+    // No domain: the row is not "stopped" either.
+    f.fake.remove("web").await.unwrap();
+    f.manager.poll_once().await.unwrap();
+    assert_eq!(
+        f.store.instance(&instance.uuid).await.unwrap().state,
+        State::Provisioning
+    );
+}
+
+// ---- restore for one machine (MULTI-NODE 14.3) ----
+
+#[tokio::test]
+async fn restore_host_starts_a_stopped_row_on_that_machine() {
+    let f = fixture(false, false);
+    let instances = seed_restore(&f, 1).await;
+    move_to_runner(&f);
+
+    f.manager.restore_host(2).await.unwrap();
+
+    assert!(f.fake.calls().contains(&"start vm0".into()));
+    assert_eq!(
+        f.store.instance(&instances[0].uuid).await.unwrap().state,
+        State::Running
+    );
+    assert!(f.images.acted_on.lock().unwrap().contains(&2));
+    assert!(!f.manager.is_restoring(2));
+}
+
+#[tokio::test]
+async fn restore_host_skips_a_row_with_no_domain() {
+    let f = fixture(false, false);
+    let instances = seed_restore(&f, 1).await;
+    move_to_runner(&f);
+    f.fake.remove("vm0").await.unwrap();
+
+    f.manager.restore_host(2).await.unwrap();
+
+    assert!(!f.fake.calls().contains(&"start vm0".into()));
+    assert!(
+        !f.store
+            .data()
+            .mutations
+            .contains(&format!("observed {} starting", instances[0].uuid))
+    );
+}
+
+#[tokio::test]
+async fn restore_host_skips_a_row_that_the_user_stopped() {
+    let f = fixture(false, false);
+    let instances = seed_restore(&f, 1).await;
+    move_to_runner(&f);
+    f.store
+        .set_desired_state(&instances[0].uuid, DesiredState::Stopped)
+        .await
+        .unwrap();
+
+    f.manager.restore_host(2).await.unwrap();
+
+    assert!(!f.fake.calls().contains(&"start vm0".into()));
+}
+
+#[tokio::test]
+async fn restore_host_leaves_other_machines_alone() {
+    let f = fixture(false, false);
+    seed_restore(&f, 1).await;
+
+    f.manager.restore_host(2).await.unwrap();
+
+    assert!(!f.fake.calls().contains(&"start vm0".into()));
+}
+
+#[tokio::test]
+async fn restore_host_says_so_when_the_machine_cannot_be_reached() {
+    let f = fixture(false, false);
+    seed_restore(&f, 1).await;
+    move_to_runner(&f);
+    f.images.unreachable.lock().unwrap().push(2);
+
+    assert!(f.manager.restore_host(2).await.is_err());
+}
+
+#[tokio::test]
+async fn restore_host_shows_starting_while_it_works() {
+    let f = fixture(false, false);
+    let instances = seed_restore(&f, 1).await;
+    move_to_runner(&f);
+    let manager = &f.manager;
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (store, slot, uuid) = (f.store.clone(), seen.clone(), instances[0].uuid.clone());
+    f.fake.set_hook(move |operation, _| {
+        if operation == "start" {
+            let row = store
+                .data()
+                .instances
+                .iter()
+                .find(|i| i.uuid == uuid)
+                .cloned();
+            slot.lock().unwrap().push(row.map(|row| row.state));
+        }
+        Ok(())
+    });
+
+    manager.restore_host(2).await.unwrap();
+
+    assert_eq!(*seen.lock().unwrap(), [Some(State::Starting)]);
+}
+
+#[tokio::test]
+async fn two_restores_of_one_machine_start_a_vm_once() {
+    let f = fixture(false, false);
+    let instances = seed_restore(&f, 1).await;
+    move_to_runner(&f);
+    // Both calls read the queue, then wait for the lock. The one that
+    // gets it second must read the row again and see `starting`.
+    let held = f.manager.lock_instance(&instances[0].uuid).await;
+
+    let (first, second, ()) = tokio::join!(
+        f.manager.restore_host(2),
+        f.manager.restore_host(2),
+        async {
+            tokio::time::sleep(Duration::from_millis(40)).await;
+            drop(held);
+        }
+    );
+
+    first.unwrap();
+    second.unwrap();
+    let starts = f
+        .fake
+        .calls()
+        .iter()
+        .filter(|call| call.as_str() == "start vm0")
+        .count();
+    assert_eq!(starts, 1);
+    assert!(!f.manager.is_restoring(2));
 }

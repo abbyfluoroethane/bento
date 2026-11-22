@@ -23,8 +23,10 @@ pub struct ResizeResult {
 impl Manager {
     /// Starts a stopped instance and records desired running (SPEC 11.1).
     pub async fn start(&self, uuid: &str) -> Result<()> {
-        let instance = self.store.instance(uuid).await.map_err(external)?;
-        self.start_domain(&instance).await?;
+        let (_guard, instance) = self.locked_instance(uuid).await?;
+        Self::refuse_provisioning(&instance)?;
+        let hyp = self.hyp_for(&instance).await?;
+        Self::start_domain(&hyp, &instance).await?;
         self.store
             .set_desired_state(uuid, DesiredState::Running)
             .await
@@ -35,34 +37,55 @@ impl Manager {
             .map_err(external)
     }
 
+    /// Holding the lock, an action that finds the row `provisioning` has
+    /// met a create that a crash cut short, or a row that a failed create
+    /// kept. The domain may not exist or may be half built, so only a
+    /// remove may act on it (SPEC 11.2).
+    pub(crate) fn refuse_provisioning(instance: &Instance) -> Result<()> {
+        if instance.state == State::Provisioning {
+            return Err(Error::StillProvisioning(instance.name.clone()));
+        }
+        Ok(())
+    }
+
     /// Starts the domain for an SSH or web terminal connection, on the
     /// machine that runs it. Unlike [`Manager::start`] it leaves the desired
     /// state alone, so a later host reboot returns the instance to what the
     /// user last asked for (SPEC 10 step 7, 11.2).
     pub async fn start_for_connection(&self, uuid: &str) -> Result<()> {
-        let instance = self.store.instance(uuid).await.map_err(external)?;
-        self.start_domain(&instance).await
+        let (_guard, instance) = self.locked_instance(uuid).await?;
+        Self::refuse_provisioning(&instance)?;
+        let hyp = self.hyp_for(&instance).await?;
+        // The row can say `stopped` while another session or a guest
+        // reboot already runs the domain, and libvirt refuses to start a
+        // running domain. libvirt is the authority on what runs (SPEC 12),
+        // so a connection to a running domain has nothing to start. Any
+        // other answer falls through to the start, which reports it.
+        if matches!(hyp.state(&instance.name).await, Ok(State::Running)) {
+            return Ok(());
+        }
+        Self::start_domain(&hyp, &instance).await
     }
 
-    async fn start_domain(&self, instance: &Instance) -> Result<()> {
-        self.hyp_for(instance)
-            .await?
-            .start(&instance.name)
-            .await
-            .map_err(|error| {
-                Error::operation(format!(
-                    "lifecycle: start {}: {error}",
-                    instance.name,
-                    error = bento_types::error_chain(&error)
-                ))
-            })
+    async fn start_domain(
+        hyp: &std::sync::Arc<dyn bento_hypervisor::Hypervisor>,
+        instance: &Instance,
+    ) -> Result<()> {
+        hyp.start(&instance.name).await.map_err(|error| {
+            Error::operation(format!(
+                "lifecycle: start {}: {error}",
+                instance.name,
+                error = bento_types::error_chain(&error)
+            ))
+        })
     }
 
     /// Requests ACPI shutdown, waits, and only then destroys. Desired stopped
     /// is persisted before the wait so a crash cannot restore it running
     /// (SPEC 11.1).
     pub async fn stop(&self, uuid: &str) -> Result<StopResult> {
-        let instance = self.store.instance(uuid).await.map_err(external)?;
+        let (_guard, instance) = self.locked_instance(uuid).await?;
+        Self::refuse_provisioning(&instance)?;
         self.store
             .set_desired_state(uuid, DesiredState::Stopped)
             .await
@@ -92,7 +115,8 @@ impl Manager {
 
     /// Reboots and records desired running (SPEC 11.1).
     pub async fn restart(&self, uuid: &str) -> Result<()> {
-        let instance = self.store.instance(uuid).await.map_err(external)?;
+        let (_guard, instance) = self.locked_instance(uuid).await?;
+        Self::refuse_provisioning(&instance)?;
         self.hyp_for(&instance)
             .await?
             .reboot(&instance.name)
@@ -115,7 +139,12 @@ impl Manager {
     /// in one transaction. Nothing invokes this on a timer: Bento never
     /// deletes an instance on its own (SPEC section 3).
     pub async fn remove(&self, uuid: &str) -> Result<()> {
-        let instance = self.store.instance(uuid).await.map_err(external)?;
+        // A `provisioning` row is allowed here, and a missing domain is
+        // tolerated below: this is how the user cleans up (SPEC 11.2).
+        // The lock makes a remove wait for a create of the same instance
+        // to end. Without it the row and the files could go while the
+        // create still builds a domain for them (SPEC 11.1).
+        let (_guard, instance) = self.locked_instance(uuid).await?;
         match self.hyp_for(&instance).await?.remove(&instance.name).await {
             Ok(()) | Err(HypervisorError::DomainNotFound(_)) => {}
             Err(error) => {
@@ -144,6 +173,7 @@ impl Manager {
                 error = bento_types::error_chain(&*error)
             ))
         })?;
+        self.forget_lock(uuid);
         self.log
             .info(&format!("rm: instance {} removed", instance.name));
         Ok(())
@@ -153,7 +183,8 @@ impl Manager {
     /// growth is supported, and host capacity is checked before any host
     /// mutation.
     pub async fn resize(&self, request: ResizeRequest) -> Result<ResizeResult> {
-        let mut instance = self.store.instance(&request.uuid).await.map_err(external)?;
+        let (_guard, mut instance) = self.locked_instance(&request.uuid).await?;
+        Self::refuse_provisioning(&instance)?;
         if request.vcpu == 0 || request.memory_mib == 0 || request.disk_gib == 0 {
             return Err(Error::operation(
                 "lifecycle: resize needs positive vcpu, memory, and disk",
@@ -209,11 +240,36 @@ impl Manager {
             .await
             .map_err(external)?;
         if result.restart_required {
+            let (vcpu, memory_mib, nested) = (instance.vcpu, instance.memory_mib, instance.nested);
             instance.vcpu = request.vcpu;
             instance.memory_mib = request.memory_mib;
             instance.disk_gib = request.disk_gib;
             instance.nested = request.nested;
-            self.redefine(&instance).await?;
+            if let Err(error) = self.redefine(&instance).await {
+                // A row that keeps the new figures would make a retry see
+                // nothing to change and skip the redefine. The file did
+                // grow and cannot shrink, so the row keeps the new disk
+                // size (SPEC 11.1).
+                if let Err(revert) = self
+                    .store
+                    .resize(
+                        &request.uuid,
+                        vcpu,
+                        memory_mib,
+                        request.disk_gib,
+                        nested,
+                        capacity,
+                    )
+                    .await
+                {
+                    self.log.error(&format!(
+                        "resize: row of {} not reverted after a failed redefine: {revert}",
+                        instance.name,
+                        revert = bento_types::error_chain(&*revert)
+                    ));
+                }
+                return Err(error);
+            }
         }
         Ok(result)
     }

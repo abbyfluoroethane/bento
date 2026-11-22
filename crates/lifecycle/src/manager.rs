@@ -15,6 +15,7 @@ use bento_types::{
     State, User,
 };
 use time::OffsetDateTime;
+use tokio::sync::OwnedMutexGuard;
 
 use crate::{Error, QemuImgResizer};
 
@@ -45,6 +46,20 @@ pub trait Store: Send + Sync {
     /// Lists one host's desired-running, observed-stopped instances. Restore
     /// must not act on another host's instances (SPEC 11.2, MULTI-NODE 21).
     async fn instances_to_restore(
+        &self,
+        host_id: i64,
+    ) -> std::result::Result<Vec<Instance>, DynError>;
+    /// Ends the `provisioning` state of a row that a create or a copy
+    /// built, and records the state libvirt shows. It changes a row only
+    /// while it is `provisioning`, and says whether it did (SPEC 11.2).
+    async fn finish_provisioning(
+        &self,
+        uuid: &str,
+        observed: State,
+    ) -> std::result::Result<bool, DynError>;
+    /// Lists the rows of one host that are still `provisioning`: a create
+    /// that is running now, or one that a crash cut short (SPEC 11.2).
+    async fn provisioning_instances(
         &self,
         host_id: i64,
     ) -> std::result::Result<Vec<Instance>, DynError>;
@@ -388,6 +403,26 @@ pub struct Manager {
     pub(crate) now: Clock,
     pub(crate) delete_iso: DeleteIso,
     pub(crate) iso_exists: IsoExists,
+    /// One lock per instance UUID. Every action that checks a fact and then
+    /// acts on it holds the lock across both, so a start, a rename, a copy,
+    /// a removal, and a create of the same instance cannot interleave
+    /// (SPEC 11.1, 12).
+    locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// True while `restore` runs. The poller then leaves a `starting` row
+    /// alone when the domain is still shut off, so the user sees `starting`
+    /// (SPEC 11.2). It is false again when restore ends, so nothing stays
+    /// stuck.
+    pub(crate) restoring: std::sync::atomic::AtomicBool,
+    /// Machines that a `restore_host` is working on now, with the number
+    /// of calls. The observer of a runner reads it through
+    /// [`Manager::is_restoring`], so that it does not write `stopped` over
+    /// a `starting` row (SPEC 11.2, MULTI-NODE 14.3).
+    pub(crate) restoring_hosts: std::sync::Mutex<HashMap<i64, usize>>,
+    /// When each instance that still has a seed ISO was first seen
+    /// `running` in an unbroken run of polls (SPEC 5.2). It lives in
+    /// memory only: a restart of bentod loses it and the time starts
+    /// again, which only delays the cleanup.
+    pub(crate) first_running: std::sync::Mutex<HashMap<String, OffsetDateTime>>,
 }
 
 impl Manager {
@@ -458,7 +493,66 @@ impl Manager {
                 .unwrap_or_else(|| Arc::new(OffsetDateTime::now_utc)),
             delete_iso,
             iso_exists,
+            locks: std::sync::Mutex::default(),
+            restoring: std::sync::atomic::AtomicBool::new(false),
+            restoring_hosts: std::sync::Mutex::default(),
+            first_running: std::sync::Mutex::default(),
         })
+    }
+
+    fn lock_for(&self, uuid: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(uuid.to_owned())
+            .or_default()
+            .clone()
+    }
+
+    /// Waits for the action lock of one instance. The guard must be held
+    /// from the first read of the row to the last write, and the row must
+    /// be read again after the guard is taken. A method that holds it must
+    /// not call another method that takes it for the same UUID.
+    pub(crate) async fn lock_instance(&self, uuid: &str) -> OwnedMutexGuard<()> {
+        self.lock_for(uuid).lock_owned().await
+    }
+
+    /// Takes the lock only when no action holds it. A background sweep uses
+    /// this so that one slow action cannot stall the sweep of every other
+    /// instance.
+    pub(crate) fn try_lock_instance(&self, uuid: &str) -> Option<OwnedMutexGuard<()>> {
+        self.lock_for(uuid).try_lock_owned().ok()
+    }
+
+    /// Drops the lock entry of an instance whose row is gone. A holder that
+    /// still has the guard keeps its own handle, so this is safe to call
+    /// while the guard is held.
+    pub(crate) fn forget_lock(&self, uuid: &str) {
+        self.locks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(uuid);
+        // The first-boot time of a removed instance goes with it.
+        self.first_running
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(uuid);
+    }
+
+    /// Takes the action lock, then reads the row. The row is read after
+    /// the lock so that no check works on a snapshot another action has
+    /// already changed.
+    pub(crate) async fn locked_instance(
+        &self,
+        uuid: &str,
+    ) -> Result<(OwnedMutexGuard<()>, Instance)> {
+        let guard = self.lock_instance(uuid).await;
+        let instance = self
+            .store
+            .instance(uuid)
+            .await
+            .map_err(crate::actions::external)?;
+        Ok((guard, instance))
     }
 
     /// Root volume path. It derives from UUID so rename never moves a disk.

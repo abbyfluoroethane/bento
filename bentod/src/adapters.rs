@@ -216,6 +216,16 @@ impl bento_lifecycle::Store for LifecycleStore {
     async fn instances_to_restore(&self, host_id: i64) -> Result<Vec<Instance>, LifecycleError> {
         Ok(self.0.instances_to_restore(host_id).await?)
     }
+    async fn finish_provisioning(
+        &self,
+        uuid: &str,
+        observed: State,
+    ) -> Result<bool, LifecycleError> {
+        Ok(self.0.finish_provisioning(uuid, observed).await?)
+    }
+    async fn provisioning_instances(&self, host_id: i64) -> Result<Vec<Instance>, LifecycleError> {
+        Ok(self.0.provisioning_instances(host_id).await?)
+    }
     async fn image(&self, name: &str) -> Result<Image, LifecycleError> {
         Ok(self.0.image(name).await?)
     }
@@ -807,6 +817,7 @@ pub(crate) fn api_lifecycle_error(error: bento_lifecycle::Error) -> ApiError {
         | E::CopySourceRunning(_)
         | E::CopyAcrossMachines(_)
         | E::NestedUnavailable(_)
+        | E::StillProvisioning(_)
         | E::NoImageVersion(_) => Some(StatusCode::CONFLICT),
         E::DiskShrink(_) => Some(StatusCode::BAD_REQUEST),
         _ => None,

@@ -64,6 +64,11 @@ pub enum Error {
     /// A domain name can only be changed while it is stopped (SPEC 7.3).
     #[error("lifecycle: stop the instance before renaming it: {0}")]
     RenameNeedsStop(String),
+    /// The row is still `provisioning`: a create or copy that a crash
+    /// cut short, or one that failed and kept its row. Only a removal can
+    /// act on it (SPEC 11.2).
+    #[error("lifecycle: {0} did not finish provisioning; remove it, or create it again")]
+    StillProvisioning(String),
     /// An operation failed, with its orchestration context preserved.
     #[error("{0}")]
     Operation(String),
