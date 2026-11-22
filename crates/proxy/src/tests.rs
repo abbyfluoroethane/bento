@@ -852,47 +852,37 @@ async fn source_error_is_internal_server_error() {
 }
 
 #[test]
-fn request_host_normalization_and_sni_precedence() {
+fn request_host_normalization() {
     let cases = [
         (
             "plain",
             format!("box.{TEST_BASE}"),
-            None,
             format!("box.{TEST_BASE}"),
         ),
         (
             "port",
             format!("box.{TEST_BASE}:3456"),
-            None,
             format!("box.{TEST_BASE}"),
         ),
         (
             "uppercase",
             format!("BOX.{}", TEST_BASE.to_ascii_uppercase()),
-            None,
             format!("box.{TEST_BASE}"),
         ),
         (
             "trailing dot",
             format!("box.{TEST_BASE}."),
-            None,
             format!("box.{TEST_BASE}"),
         ),
-        (
-            "sni",
-            "other.example.net".to_owned(),
-            Some(format!("box.{TEST_BASE}")),
-            format!("box.{TEST_BASE}"),
-        ),
-        ("empty", String::new(), None, String::new()),
+        ("empty", String::new(), String::new()),
     ];
-    for (name, host, sni, expected) in cases {
+    for (name, host, expected) in cases {
         let request = Request::builder()
             .uri("http://placeholder/")
             .header(header::HOST, host)
             .body(full_body(Bytes::new()))
             .unwrap();
-        assert_eq!(request_host(&request, sni.as_deref()), expected, "{name}");
+        assert_eq!(request_host(&request), expected, "{name}");
     }
 }
 
@@ -1044,7 +1034,6 @@ async fn serve_stops_when_shutdown_is_cancelled() {
     let shutdown = CancellationToken::new();
     let task = tokio::spawn(proxy.serve(
         "127.0.0.1",
-        None,
         Some(listen),
         shutdown.clone().cancelled_owned(),
     ));
@@ -1124,7 +1113,7 @@ async fn serve_front(proxy: Arc<Proxy>) -> SocketAddr {
                         });
                         Ok::<_, Infallible>(
                             proxy
-                                .handle_connection(request, DEFAULT_PORT, REMOTE, None, false)
+                                .handle_connection(request, DEFAULT_PORT, REMOTE, false)
                                 .await,
                         )
                     }

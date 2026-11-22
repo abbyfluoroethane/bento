@@ -434,7 +434,6 @@ http = "127.0.0.1:{port}"
 # started here, but the ports still have to stay off the control plane's.
 https = "127.0.0.1:0"
 ssh = "127.0.0.1:0"
-tls = "off"
 
 [defaults]
 image = "{IMAGE_NAME}"

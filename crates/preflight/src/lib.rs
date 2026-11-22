@@ -35,7 +35,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use bento_config::{Config, TlsMode, resolve_listen_addr};
+use bento_config::{Config, resolve_listen_addr};
 use bento_hypervisor::{CheckConfig, CheckDeps, CheckReport, CheckResult};
 use serde::Serialize;
 
@@ -472,7 +472,7 @@ impl Run<'_> {
 
         if controller {
             self.push(base_domain(config));
-            self.push(tls_settings(config));
+            self.push(front_proxy(config));
             self.push(oidc_settings(config));
             self.push(oidc_discovery(config, self.input.online, self.probe));
             self.push(dns(config, self.input.online, self.probe));
@@ -1348,50 +1348,43 @@ fn base_domain(config: &Config) -> Requirement {
     requirement.met(domain)
 }
 
-fn tls_settings(config: &Config) -> Requirement {
-    let requirement = Requirement::new("tls-settings", Group::Config, "TLS settings", true);
-    match config.listen.tls {
-        // The proxy refuses to start without the token (bentod/src/
-        // proxyd.rs). It starts without an email, so an empty email only
-        // warns.
-        TlsMode::Acme if config.acme.cloudflare_token.is_empty() => requirement.fail(
-            "tls = \"acme\" needs acme.cloudflare_token. The wildcard certificate uses the DNS-01 challenge (SPEC 8). The proxy does not start without it.",
-            Some(manual(
-                "Set acme.cloudflare_token (DEPLOYING.md section 4). Or set listen.tls = \"off\" behind a different TLS server (DEPLOYING.md section 5).",
-            )),
-        ),
-        TlsMode::Acme if config.acme.email.is_empty() => {
-            let mut requirement = requirement;
-            requirement.fatal = false;
-            requirement.fail(
-                "acme.email is empty. The certificate authority cannot tell you about a certificate problem (SPEC 8).",
-                Some(manual("Set acme.email (DEPLOYING.md section 4).")),
-            )
-        }
-        TlsMode::Acme => {
-            requirement.met("tls = \"acme\" with an email and a DNS token (SPEC 8).")
-        }
-        TlsMode::Off => {
-            let public = resolve_listen_addr(&config.listen.https)
-                .map(|address| !address.ip().is_loopback())
-                .unwrap_or(false);
-            if !public {
-                return requirement.met("tls = \"off\" on a loopback address.");
-            }
-            let mut requirement = requirement;
-            requirement.fatal = false;
-            requirement.fail(
-                &format!(
-                    "tls = \"off\" serves plain HTTP on {}, which is not a loopback address. \
-                     The internet must not get to these listeners directly.",
-                    config.listen.https
-                ),
-                Some(manual(
-                    "Bind listen.https to 127.0.0.1 behind the TLS server (DEPLOYING.md section 5).",
-                )),
-            )
-        }
+/// The proxy serves plain HTTP; a TLS terminator in front of Bento owns
+/// the certificate (SPEC 8). A public bind and keys left from the time the
+/// proxy terminated TLS only warn: the proxy starts with either.
+fn front_proxy(config: &Config) -> Requirement {
+    let mut requirement =
+        Requirement::new("front-proxy", Group::Config, "Behind a TLS terminator", false);
+    let public = resolve_listen_addr(&config.listen.https)
+        .map(|address| !address.ip().is_loopback())
+        .unwrap_or(false);
+    let mut problems = Vec::new();
+    let mut fixes = Vec::new();
+    if public {
+        problems.push(format!(
+            "The proxy serves plain HTTP on {}, which is not a loopback address. \
+             The internet must not get to these listeners directly.",
+            config.listen.https
+        ));
+        fixes.push(
+            "Bind listen.https to 127.0.0.1 behind the TLS terminator (DEPLOYING.md section 5)."
+                .to_string(),
+        );
     }
+    if !config.retired_keys.is_empty() {
+        let keys = config.retired_keys.join(" and ");
+        problems.push(format!(
+            "{keys} no longer have an effect: Bento does not terminate TLS (SPEC 8)."
+        ));
+        fixes.push(format!("Remove {keys} from the configuration."));
+    }
+    if problems.is_empty() {
+        return requirement.met(&format!(
+            "Plain HTTP on {}. The TLS terminator owns the certificate (SPEC 8).",
+            config.listen.https
+        ));
+    }
+    requirement.fatal = false;
+    requirement.fail(&problems.join(" "), Some(manual(&fixes.join(" "))))
 }
 
 fn oidc_settings(config: &Config) -> Requirement {

@@ -154,7 +154,7 @@ footer a:hover {{ color: var(--primary); }}
 <footer>v{version} &ldquo;{codename}&rdquo; &middot; Made with love by the bento team &lt;3 &middot; <a href="https://github.com/abbyfluoroethane/bento/blob/main/LICENSE">MIT License</a></footer>
 </main>
 <section class="cards" aria-label="About Bento">
-  <div class="card"><h2>One binary</h2><p>The control plane, the HTTPS proxy, and the SSH front end ship as a single Rust program.</p></div>
+  <div class="card"><h2>One binary</h2><p>The control plane, the HTTP proxy, and the SSH front end ship as a single Rust program.</p></div>
   <div class="card"><h2>Your name is your address</h2><p>Every VM answers at <code>name.{domain}</code> over HTTPS, with the certificate handled for you.</p></div>
   <div class="card"><h2>SSH does everything</h2><p><code>ssh {domain} new &lt;name&gt;</code> creates a machine; every action here has a command-line twin.</p></div>
 </section>

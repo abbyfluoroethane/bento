@@ -420,7 +420,7 @@ pub fn commands(
                 ));
             }
             Ok(vec![
-                // 0600: the file carries the ACME and OIDC secrets
+                // 0600: the file carries the OIDC secret
                 // (DEPLOYING.md 4).
                 Cmd::owned(
                     "install",

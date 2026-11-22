@@ -681,13 +681,11 @@ fn draw_config(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 /// The settings an operator checks, and nothing that carries a secret: the
-/// ACME token and the OIDC client secret are reported as set or missing,
-/// never printed.
+/// OIDC client secret is reported as set or missing, never printed.
 fn config_lines(config: &Config) -> Vec<Line<'static>> {
     let mut lines = vec![
         field("base domain", config.base_domain.clone()),
         field("libvirt", config.libvirt_uri.clone()),
-        field("tls", config.listen.tls.as_str().to_string()),
         field(
             "listen",
             format!(
@@ -715,8 +713,6 @@ fn config_lines(config: &Config) -> Vec<Line<'static>> {
                 config.operators.join(", ")
             },
         ),
-        field("acme email", or_none(&config.acme.email)),
-        field("acme token", present(&config.acme.cloudflare_token)),
         field(
             "oidc issuer",
             or_none(config.oidc.issuer.as_deref().unwrap_or_default()),
@@ -1283,7 +1279,6 @@ mod tests {
     #[test]
     fn a_secret_is_reported_as_set_and_never_printed() {
         let mut config = Config::default();
-        config.acme.cloudflare_token = "cf-secret-value".to_string();
         config.oidc.client_secret = "oidc-secret-value".to_string();
         let text: String = config_lines(&config)
             .iter()

@@ -16,7 +16,6 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::JoinSet;
-use tokio_rustls::TlsAcceptor;
 use tokio_util::sync::CancellationToken;
 
 use crate::{BoxError, Error, Proxy};
@@ -79,17 +78,15 @@ fn default_listen() -> ListenFunc {
 }
 
 impl Proxy {
-    /// Binds every proxy port on `bind_host` and serves all of them. When
-    /// `tls_config` is `Some`, every accepted stream terminates TLS; `None`
-    /// serves plain HTTP for deployments with an external TLS terminator.
-    /// Binding is all-or-nothing. The method returns after `shutdown`
+    /// Binds every proxy port on `bind_host` and serves plain HTTP on all
+    /// of them. A TLS terminator in front of Bento owns the certificate
+    /// (SPEC 8). Binding is all-or-nothing. The method returns after `shutdown`
     /// resolves or a listener fails, allowing active connections up to five
     /// seconds to finish gracefully. An intentional shutdown returns
     /// [`Error::Shutdown`].
     pub async fn serve<F>(
         self: Arc<Self>,
         bind_host: &str,
-        tls_config: Option<Arc<rustls::ServerConfig>>,
         listen: Option<ListenFunc>,
         shutdown: F,
     ) -> Result<(), Error>
@@ -141,10 +138,9 @@ impl Proxy {
                 Some((port, source)) = error_rx.recv() => break Err(Error::Serve { port, source }),
                 Some(accepted) = accepted_rx.recv() => {
                     let proxy = self.clone();
-                    let tls_config = tls_config.clone();
                     let cancel = cancel.clone();
                     connections.spawn(async move {
-                        serve_connection(proxy, accepted, tls_config, cancel).await;
+                        serve_connection(proxy, accepted, cancel).await;
                     });
                 }
                 else => break Ok(()),
@@ -198,56 +194,11 @@ fn format_address(bind_host: &str, port: u16) -> String {
     }
 }
 
-async fn serve_connection(
-    proxy: Arc<Proxy>,
-    accepted: Accepted,
-    tls_config: Option<Arc<rustls::ServerConfig>>,
-    cancel: CancellationToken,
-) {
-    if let Some(config) = tls_config {
-        let Ok(stream) = TlsAcceptor::from(config).accept(accepted.stream).await else {
-            return;
-        };
-        let server_name = stream.get_ref().1.server_name().map(str::to_owned);
-        run_http(
-            proxy,
-            stream,
-            accepted.port,
-            accepted.peer,
-            server_name,
-            true,
-            cancel,
-        )
-        .await;
-    } else {
-        run_http(
-            proxy,
-            accepted.stream,
-            accepted.port,
-            accepted.peer,
-            None,
-            false,
-            cancel,
-        )
-        .await;
-    }
-}
-
-async fn run_http<IO>(
-    proxy: Arc<Proxy>,
-    stream: IO,
-    port: u16,
-    peer: SocketAddr,
-    server_name: Option<String>,
-    tls: bool,
-    cancel: CancellationToken,
-) where
-    IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-{
+async fn serve_connection(proxy: Arc<Proxy>, accepted: Accepted, cancel: CancellationToken) {
+    let Accepted { port, stream, peer } = accepted;
     let tunnels = cancel.clone();
     let service = service_fn(move |request: Request<Incoming>| {
         let proxy = proxy.clone();
-        let server_name = server_name.clone();
         let tunnels = tunnels.clone();
         async move {
             let mut request = request.map(|body| {
@@ -257,9 +208,9 @@ async fn run_http<IO>(
             // Upgraded tunnels end with the listener (SPEC 9).
             request.extensions_mut().insert(crate::Shutdown(tunnels));
             Ok::<_, std::convert::Infallible>(
-                proxy
-                    .handle_connection(request, port, peer, server_name.as_deref(), tls)
-                    .await,
+                // The listener is plain HTTP, so the hop from the front
+                // proxy is never TLS (SPEC 8).
+                proxy.handle_connection(request, port, peer, false).await,
             )
         }
     });

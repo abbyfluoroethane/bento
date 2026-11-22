@@ -3,7 +3,7 @@
 //! Every setting named in SPEC.md that the operator controls lives here:
 //! base domain, libvirt URI, directories, database path, overcommit
 //! ratio, name cooldown, reboot-restore batch size, the private address
-//! range for user `/24`s, ACME and OIDC settings, and listen addresses.
+//! range for user `/24`s, OIDC settings, and listen addresses.
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
@@ -100,29 +100,6 @@ fn invalid(msg: impl Into<String>) -> Error {
     Error::Invalid(msg.into())
 }
 
-/// How the proxy listeners get their certificate.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum TlsMode {
-    /// SPEC 8: the proxy obtains the wildcard certificate itself over
-    /// DNS-01.
-    #[default]
-    Acme,
-    /// Serve plain HTTP, for a host where something else already owns
-    /// port 443 and terminates TLS in front of Bento. Those listeners
-    /// must not be reachable from the internet directly.
-    Off,
-}
-
-impl TlsMode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            TlsMode::Acme => "acme",
-            TlsMode::Off => "off",
-        }
-    }
-}
-
 /// The full operator configuration, with every default resolved.
 ///
 /// [`Config::parse`] is the only place that turns an omitted key into a
@@ -169,7 +146,6 @@ pub struct Config {
 
     pub listen: Listen,
     pub defaults: Defaults,
-    pub acme: Acme,
     pub oidc: Oidc,
     pub bootc: Bootc,
     pub runner: Runner,
@@ -179,6 +155,12 @@ pub struct Config {
 
     /// The operator image allowlist (SPEC 5.1).
     pub images: Vec<ImageEntry>,
+
+    /// Keys an older Bento read and this one ignores, as written in the
+    /// file. Bento no longer terminates TLS (SPEC 8): `listen.tls = "off"`
+    /// and `[acme]` still load, so an upgrade does not stop a running
+    /// deployment, and `bentod check` asks the operator to remove them.
+    pub retired_keys: Vec<&'static str>,
 }
 
 /// Settings for the runner service on this machine.
@@ -252,20 +234,32 @@ pub fn endpoint_host(endpoint: &str) -> Option<&str> {
 }
 
 /// The listen addresses of the three processes.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[derive(Debug, Clone)]
 pub struct Listen {
     /// The control plane listen address (dashboard and API).
     pub http: String,
-    /// The HTTP proxy listen address for port 443.
+    /// The HTTP proxy's main listen address. The key keeps its old name;
+    /// the listener speaks plain HTTP, and the TLS terminator in front of
+    /// Bento forwards to it (SPEC 8).
     pub https: String,
     /// The SSH frontend listen address.
     pub ssh: String,
     /// Bounds the extra proxy ports (SPEC 9.1).
     pub proxy_port_min: u16,
     pub proxy_port_max: u16,
-    /// How the proxy listeners get their certificate.
-    pub tls: TlsMode,
+}
+
+/// `[listen]` as written. `tls` is retired (SPEC 8); see
+/// [`Config::retired_keys`].
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawListen {
+    http: Option<String>,
+    https: Option<String>,
+    ssh: Option<String>,
+    proxy_port_min: Option<u16>,
+    proxy_port_max: Option<u16>,
+    tls: Option<String>,
 }
 
 /// The shape of a `new` without flags (SPEC 15). An absent `image`
@@ -303,21 +297,6 @@ impl Default for Bootc {
             build_timeout: GoDuration(defaults::BOOTC_BUILD_TIMEOUT),
         }
     }
-}
-
-/// Certificate settings (SPEC 8). The wildcard certificate needs the
-/// DNS-01 challenge, so a DNS provider token is required.
-#[derive(Debug, Clone, Default, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct Acme {
-    /// The ACME account contact.
-    pub email: String,
-    /// The DNS API token, ideally limited to the `_acme-challenge`
-    /// records.
-    pub cloudflare_token: String,
-    /// Overrides the ACME directory URL. Empty means the production
-    /// Let's Encrypt directory.
-    pub directory: String,
 }
 
 /// The dashboard identity settings (SPEC 13).
@@ -448,12 +427,12 @@ impl Default for Config {
             operators: Vec::new(),
             listen: Listen::default(),
             defaults: Defaults::default(),
-            acme: Acme::default(),
             oidc: Oidc::default(),
             bootc: Bootc::default(),
             runner: Runner::default(),
             runners: Vec::new(),
             images: Vec::new(),
+            retired_keys: Vec::new(),
         }
     }
 }
@@ -476,7 +455,6 @@ impl Default for Listen {
             ssh: defaults::LISTEN_SSH.to_string(),
             proxy_port_min: defaults::PROXY_PORT_MIN,
             proxy_port_max: defaults::PROXY_PORT_MAX,
-            tls: TlsMode::Acme,
         }
     }
 }
@@ -587,9 +565,10 @@ struct RawConfig {
     key_dir: Option<String>,
     dns: Option<Vec<IpAddr>>,
     operators: Option<Vec<String>>,
-    listen: Option<Listen>,
+    listen: Option<RawListen>,
     defaults: Option<Defaults>,
-    acme: Option<Acme>,
+    /// Retired with TLS termination (SPEC 8). Any content loads.
+    acme: Option<toml::Table>,
     oidc: Option<Oidc>,
     bootc: Option<Bootc>,
     runner: Option<Runner>,
@@ -598,7 +577,7 @@ struct RawConfig {
 }
 
 impl RawConfig {
-    fn resolve(self) -> Config {
+    fn resolve(self) -> Result<Config, Error> {
         let mut cfg = Config::default();
         macro_rules! set {
             ($($field:ident),* $(,)?) => {
@@ -619,9 +598,7 @@ impl RawConfig {
             key_dir,
             dns,
             operators,
-            listen,
             defaults,
-            acme,
             oidc,
             bootc,
             runner,
@@ -634,7 +611,32 @@ impl RawConfig {
         cfg.instance_domain = self
             .instance_domain
             .unwrap_or_else(|| cfg.base_domain.clone());
-        cfg
+        if let Some(listen) = self.listen {
+            macro_rules! set_listen {
+                ($($field:ident),* $(,)?) => {
+                    $(if let Some(value) = listen.$field { cfg.listen.$field = value; })*
+                };
+            }
+            set_listen!(http, https, ssh, proxy_port_min, proxy_port_max);
+            match listen.tls.as_deref() {
+                None => {}
+                // "off" described what is now the only mode (SPEC 8).
+                Some("off") => cfg.retired_keys.push("listen.tls"),
+                // Silently serving plain HTTP where the file asks for TLS
+                // would expose the listeners, so this stops startup.
+                Some(other) => {
+                    return Err(invalid(format!(
+                        "listen.tls = {other:?} is no longer supported: Bento serves plain HTTP \
+                         behind a TLS terminator such as Caddy (SPEC 8, DEPLOYING.md section 5). \
+                         Remove listen.tls and [acme]"
+                    )));
+                }
+            }
+        }
+        if self.acme.is_some() {
+            cfg.retired_keys.push("[acme]");
+        }
+        Ok(cfg)
     }
 }
 
@@ -653,7 +655,7 @@ impl Config {
     /// Decodes TOML text, applies defaults for unset values, and
     /// validates the result.
     pub fn parse(data: &str) -> Result<Config, Error> {
-        let cfg = toml::from_str::<RawConfig>(data)?.resolve();
+        let cfg = toml::from_str::<RawConfig>(data)?.resolve()?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -939,8 +941,7 @@ mod tests {
         assert_eq!(cfg.listen.ssh, ":22");
         assert_eq!(cfg.listen.proxy_port_min, 3000);
         assert_eq!(cfg.listen.proxy_port_max, 9999);
-        // SPEC 8 is the default: the proxy owns its certificate.
-        assert_eq!(cfg.listen.tls, TlsMode::Acme);
+        assert!(cfg.retired_keys.is_empty());
         assert_eq!(cfg.bootc.rootfs, "ext4");
         assert_eq!(cfg.bootc.container_storage, "/var/lib/containers/storage");
         assert_eq!(cfg.bootc.builder_image, None);
@@ -980,11 +981,6 @@ ssh = ":2222"
 proxy_port_min = 4000
 proxy_port_max = 5000
 
-[acme]
-email = "op@foid.space"
-cloudflare_token = "cf-token"
-directory = "https://acme-staging-v02.api.letsencrypt.org/directory"
-
 [oidc]
 issuer = "https://id.foid.space"
 client_id = "bento"
@@ -1005,7 +1001,6 @@ pinned_checksum = "sha256-deadbeef"
         assert_eq!(cfg.overcommit_ratio, 1.5);
         assert_eq!(cfg.restore_batch_size, 8);
         assert_eq!(cfg.listen.ssh, ":2222");
-        assert_eq!(cfg.acme.cloudflare_token, "cf-token");
         assert_eq!(cfg.oidc.issuer.as_deref(), Some("https://id.foid.space"));
         assert_eq!(cfg.images.len(), 2);
         assert_eq!(
@@ -1068,7 +1063,7 @@ pinned_checksum = "sha256-deadbeef"
         ] {
             parse_err(
                 &format!(
-                    "base_domain = \"b.example\"\n[listen]\nhttp = \"{http}\"\nhttps = \"{https}\"\nssh = \"{ssh}\"\ntls = \"off\""
+                    "base_domain = \"b.example\"\n[listen]\nhttp = \"{http}\"\nhttps = \"{https}\"\nssh = \"{ssh}\""
                 ),
                 "same port",
             );
@@ -1084,7 +1079,7 @@ pinned_checksum = "sha256-deadbeef"
             ("127.0.0.1:10080", ":443", ":22"),
         ] {
             Config::parse(&format!(
-                "base_domain = \"b.example\"\n[listen]\nhttp = \"{http}\"\nhttps = \"{https}\"\nssh = \"{ssh}\"\ntls = \"off\""
+                "base_domain = \"b.example\"\n[listen]\nhttp = \"{http}\"\nhttps = \"{https}\"\nssh = \"{ssh}\""
             ))
             .unwrap_or_else(|e| panic!("{http} {https} {ssh}: {e}"));
         }
@@ -1103,7 +1098,7 @@ pinned_checksum = "sha256-deadbeef"
         );
         parse_err(
             "base_domain = \"b.example\"\n[listen]\ntls = \"selfsigned\"",
-            "tls",
+            "listen.tls = \"selfsigned\" is no longer supported",
         );
         parse_err(
             "base_domain = \"b.example\"\nprivate_range = \"not-a-cidr\"",
@@ -1414,16 +1409,41 @@ endpoint = "http://10.0.0.97:10443"
         assert!(!closed.oidc.allow_signup);
     }
 
-    /// Covers the deployment where another proxy already owns port 443
-    /// of the host and forwards to Bento.
+    /// A file written for the Bento that terminated TLS still loads when
+    /// it already put a TLS terminator in front (SPEC 8). The retired keys
+    /// are named so `bentod check` can ask for their removal.
     #[test]
-    fn parse_tls_off() {
+    fn retired_tls_keys_load_and_are_named() {
         let cfg = Config::parse(
-            "base_domain = \"b.example\"\n[listen]\ntls = \"off\"\nhttps = \"127.0.0.1:10443\"",
+            "base_domain = \"b.example\"\n[listen]\ntls = \"off\"\nhttps = \"127.0.0.1:10443\"\n\
+             [acme]\nemail = \"ops@example.org\"\ncloudflare_token = \"token\"\n",
         )
         .unwrap();
-        assert_eq!(cfg.listen.tls, TlsMode::Off);
         assert_eq!(cfg.listen.https, "127.0.0.1:10443");
+        assert_eq!(cfg.retired_keys, ["listen.tls", "[acme]"]);
+    }
+
+    /// A file that asks the proxy for TLS must not start a plain-HTTP
+    /// listener in its place.
+    #[test]
+    fn retired_tls_acme_stops_startup() {
+        parse_err(
+            "base_domain = \"b.example\"\n[listen]\ntls = \"acme\"",
+            "listen.tls = \"acme\" is no longer supported",
+        );
+    }
+
+    /// `[listen]` keys left out keep their defaults one by one.
+    #[test]
+    fn a_partial_listen_table_keeps_the_other_defaults() {
+        let cfg =
+            Config::parse("base_domain = \"b.example\"\n[listen]\nhttps = \"127.0.0.1:10443\"")
+                .unwrap();
+        assert_eq!(cfg.listen.https, "127.0.0.1:10443");
+        assert_eq!(cfg.listen.http, defaults::LISTEN_HTTP);
+        assert_eq!(cfg.listen.ssh, defaults::LISTEN_SSH);
+        assert_eq!(cfg.listen.proxy_port_min, defaults::PROXY_PORT_MIN);
+        assert_eq!(cfg.listen.proxy_port_max, defaults::PROXY_PORT_MAX);
     }
 
     /// Guards the default pair: the proxy binds every port of its range,

@@ -82,19 +82,15 @@ operators = []
 # Keep this port outside the proxy port range below: the proxy binds
 # every port of that range.
 #http = "127.0.0.1:10080"
-# HTTP proxy TLS listener.
-#https = ":443"
+# HTTP proxy main listener. It speaks plain HTTP: a TLS terminator such
+# as Caddy goes in front and forwards here (SPEC 8, DEPLOYING.md section
+# 5). Bind it to a private address.
+#https = "127.0.0.1:10443"
 # SSH frontend.
 #ssh = ":22"
 # Extra proxy port range (SPEC 9.1). Always private.
 #proxy_port_min = 3000
 #proxy_port_max = 9999
-# How the proxy listeners get their certificate. "acme" is SPEC 8: the
-# proxy obtains the wildcard certificate itself over DNS-01. "off"
-# serves plain HTTP, for a host where something else already owns port
-# 443 and terminates TLS in front of Bento — set `https` to a private
-# address as well, because these listeners have no TLS of their own.
-#tls = "acme"
 
 [runner]
 # Runner management listener (MULTI-NODE 11.1). Set this to this
@@ -122,17 +118,6 @@ operators = []
 #vcpu = 2
 #memory_mib = 2048
 #disk_gib = 20
-
-# Not used when listen.tls is "off".
-[acme]
-# ACME account contact for the wildcard certificate (SPEC 8).
-email = "operator@example.org"
-# Cloudflare DNS API token for the DNS-01 challenge. Limit the token to
-# the _acme-challenge records if possible.
-cloudflare_token = ""
-# Override the ACME directory, e.g. for the Let's Encrypt staging
-# environment during development. Empty means production.
-#directory = ""
 
 [oidc]
 # OIDC provider (SPEC 13). Pocket ID is suitable. This is the only thing

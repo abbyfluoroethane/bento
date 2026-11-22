@@ -37,6 +37,8 @@ storage mounted read-write. This is an inherent trust boundary of the
 image-builder workflow, not ordinary image-view permission.
 
 Bento needs root: it runs `nft`, and by default binds ports 22 and 443.
+Bento does not terminate TLS. A TLS terminator such as Caddy goes in
+front of the proxy (section 5, SPEC 8).
 
 ### Modular libvirt daemons
 
@@ -96,7 +98,7 @@ Bento binds three things:
 | What | Default | Notes |
 |------|---------|-------|
 | control plane | `127.0.0.1:10080` | must be **outside** the proxy range |
-| proxy, main port | `:443` | carries the base domain and instances' default HTTP port |
+| proxy, main port | `:443` | plain HTTP; carries the base domain and instances' default HTTP port. Bind it privately, for example `127.0.0.1:10443` (section 5) |
 | proxy, high ports | `:3000-9999` | SPEC 9.1; port N goes to port N on the guest |
 | SSH frontend | `:22` | |
 
@@ -234,14 +236,14 @@ then fails. This is easy to miss because the CNAME itself resolves fine.
 A second, related trap: the `*.bento.example.org` wildcard also matches
 `_acme-challenge.bento.example.org`, so a resolver with the wildcard
 cached can answer the propagation check from the wildcard instead of the
-TXT record. Point the ACME client's propagation check at public
-resolvers if it lets you.
+TXT record. Point the propagation check of the TLS terminator's ACME
+client at public resolvers if it lets you (section 5).
 
 ## 4. Configuration
 
 Copy `bento.example.toml` to `/etc/bento/bento.toml`. The minimum is
-`base_domain`, one `[[images]]` entry, and — unless you are terminating
-TLS elsewhere, see below — the `[acme]` Cloudflare token.
+`base_domain`, one `[[images]]` entry, and a private `listen.https` for
+the TLS terminator to forward to (section 5).
 
 ```
 mkdir -p /etc/bento /var/lib/bento/storage
@@ -313,22 +315,27 @@ files. This catches the common contract errors, but it cannot prove that a
 guest will boot correctly. Ordinary OCI application images do not satisfy
 this contract.
 
-## 5. Behind an existing TLS terminator
+## 5. The TLS terminator
 
-SPEC 8 has the proxy obtain the wildcard certificate itself and own port
-443. If something else already owns 443 on this host — a Caddy or nginx
-serving other domains — set:
+Bento does not terminate TLS (SPEC 8). Its proxy speaks plain HTTP, and
+a TLS terminator in front of it owns port 443 and the one certificate.
+The one deployment so far runs Caddy for this, next to other domains on
+the same port. Set:
 
 ```toml
 [listen]
 https = "127.0.0.1:10443"   # private: these listeners have no TLS
-tls   = "off"
 ```
 
-The proxy then skips ACME and speaks plain HTTP, and the front proxy
-owns the one certificate. Routing is unaffected: the proxy reads the
-hostname from SNI when there is one and the `Host` header otherwise,
-which is what a forwarded request carries.
+The proxy routes on the `Host` header, which is what a forwarded request
+carries. The proxy logs a warning at startup when `listen.https` is not
+a loopback address, because the internet must not reach plain HTTP
+listeners directly.
+
+A configuration from the version that terminated TLS can still hold
+`tls = "off"` under `[listen]` and an `[acme]` table. Bento ignores both
+and logs a warning at startup that asks you to remove them. Any other `tls` value stops
+startup: that file expects TLS from Bento, and Bento no longer gives it.
 
 The port in `listen.https` becomes the proxy's main port, so pick one
 outside the high range. A matching Caddy site:
@@ -357,9 +364,8 @@ Two things about that block:
 
 The high ports stay on whatever `listen.https` binds. On loopback they
 are not reachable from the internet, and a Caddyfile site address cannot
-express a port range, so publishing them through Caddy means either one
-site block per port (narrow the range first) or giving Bento a
-public bind and its own certificate.
+express a port range, so publishing them through Caddy means one site
+block per port. Narrow the range first.
 
 The front proxy must pass the `Origin` header with no change, and users
 must open the dashboard at `https://<base_domain>`. Bento compares the
@@ -383,13 +389,11 @@ front proxy either way. Two things are needed to serve them.
 The alias domain needs **its own certificate**, for the same
 one-label reason as above: `*.bento.example.org` does not cover
 `*.example.net`. If the alias zone sits in a different DNS account, that
-is a second API token, not the one in `[acme]`.
+is a second API token, not the one for the base domain.
 
 The alias name must then be **rewritten to the `base_domain` name it
-stands for** before the request is forwarded. The proxy reads the
-hostname from SNI when there is one and the `Host` header otherwise, and
-the hop to `127.0.0.1:10443` is plaintext — so there is no SNI, and it
-routes on `Host` alone. A `Host` outside `base_domain` fails the suffix
+stands for** before the request is forwarded. The proxy routes on the
+`Host` header alone. A `Host` outside `base_domain` fails the suffix
 strip and answers 404:
 
 ```caddy
@@ -729,7 +733,7 @@ enable, disable, and the journal); **Fleet** reports the deployment, and
 is described below; **Install** reports each step of sections 4 and 6 as
 done, missing, or waiting on an earlier one, and runs the ones that are
 missing; **Config** shows what `/etc/bento/bento.toml` parses to, with
-the ACME and OIDC secrets reported as set or missing but never printed,
+the OIDC secret reported as set or missing but never printed,
 and runs `fetch-images`, `images`, and `reconcile`; **Host** shows the
 SPEC 4.2 requirement checks, processor, memory, swap, free space on the
 image and storage directories, and the libvirt domains.

@@ -340,7 +340,7 @@ mod tests {
         let config = directory.path().join("bento.toml");
         std::fs::write(
             &config,
-            "base_domain = \"example.org\"\n\n[acme]\nemail = \"ops@example.org\"\ncloudflare_token = \"token\"\n",
+            "base_domain = \"example.org\"\n",
         )
         .unwrap();
         // No image file yet, so images-fetched offers fetch-images.

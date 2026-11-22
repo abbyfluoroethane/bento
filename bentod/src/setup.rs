@@ -29,6 +29,14 @@ impl App {
     /// documented path printed at control-plane startup.
     pub(crate) async fn new(config_path: &Path) -> Result<Self> {
         let cfg = Config::load(config_path)?;
+        // Bento no longer terminates TLS (SPEC 8). These keys still load so
+        // that an upgrade does not stop a running deployment.
+        for key in &cfg.retired_keys {
+            tracing::warn!(
+                key,
+                "retired configuration key has no effect: Bento does not terminate TLS (SPEC 8); remove it"
+            );
+        }
         let plan = Plan::from_prefix(cfg.private_range)?;
         let store = Store::open(&cfg.db_path)
             .await
@@ -248,8 +256,8 @@ pub(crate) fn bind_host(listen: &str) -> String {
 }
 
 /// Extracts the proxy's main port. An unusable address leaves SPEC 9's
-/// default of 443 in place. The port moves when another TLS terminator fronts
-/// Bento and forwards to it privately.
+/// default of 443 in place. The port is where the TLS terminator in front of
+/// Bento forwards (SPEC 8).
 pub(crate) fn main_port(listen: &str) -> u16 {
     if let Some(port) = listen.strip_prefix(':') {
         return port.parse().unwrap_or(0);

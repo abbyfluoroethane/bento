@@ -18,8 +18,9 @@ Bento calls libvirt. Bento implements the parts that libvirt does not provide. T
 | the control plane | The Bento server process. The binary is `bentod`. |
 | the dashboard | The web interface of Bento. The control plane serves the dashboard at the base domain. |
 | the command line interface | The text interface of Bento. The SSH frontend serves the command line interface. |
-| the HTTP proxy | The component that terminates TLS and forwards HTTP requests to an instance. |
+| the HTTP proxy | The component that receives HTTP requests from the TLS terminator and forwards them to an instance. |
 | the SSH frontend | The component that accepts SSH connections and forwards them to an instance. |
+| the TLS terminator | A reverse proxy in front of Bento, such as Caddy. It is not part of Bento. It holds the certificate, terminates TLS, and forwards plain HTTP to the HTTP proxy. |
 | an image | A named entry in the operator allowlist, such as `debian-13`. |
 | an image version | One downloaded file for an image. A checksum identifies an image version. |
 | the base domain | The domain of the control plane. The dashboard, the SSH frontend, and the OIDC callback use this domain. This document uses `bento.foid.space`. |
@@ -62,7 +63,7 @@ Three Bento processes and one libvirt daemon run on the host.
 
 - **libvirtd** owns the domains, the storage, and the bridges. Bento calls the libvirt API at `qemu:///system` over the local socket.
 - **The control plane** holds the database, applies policy, generates domain XML, and serves the dashboard. The control plane is the only component that writes to the database.
-- **The HTTP proxy** listens on port 443 and on ports 3000 to 9999. The HTTP proxy terminates TLS. The HTTP proxy sends a request for the base domain to the control plane. The HTTP proxy sends every other request to an instance.
+- **The HTTP proxy** listens on a main port and on ports 3000 to 9999. The HTTP proxy speaks plain HTTP. The TLS terminator in front of Bento terminates TLS and forwards to the HTTP proxy (section 8). The HTTP proxy sends a request for the base domain to the control plane. The HTTP proxy sends every other request to an instance.
 - **The SSH frontend** listens on port 22. The SSH frontend authenticates the client. The SSH frontend then opens a second SSH connection to the instance. The SSH frontend also serves the command line interface.
 
 Build all three Bento processes as one binary with subcommands.
@@ -373,21 +374,25 @@ A reserved name is public knowledge, so the refusal states the reason. Section 9
 
 ## 8. TLS
 
-Get one wildcard certificate for `*.foid.space` and the base domain. Add `*.bento.foid.space` when the instance domain is not the parent of the base domain. Use the ACME DNS-01 challenge. A wildcard certificate requires the DNS-01 challenge.
+Bento does not terminate TLS. A TLS terminator in front of Bento, such as Caddy, holds the certificate and terminates TLS. The TLS terminator forwards plain HTTP to the HTTP proxy. The HTTP proxy listeners must not be reachable from the internet directly, so bind them to a loopback address. The HTTP proxy logs a warning at startup when it listens on another address.
+
+The reason is operational. A TLS terminator such as Caddy already gets, renews, and serves certificates, and many deployments have one. An earlier version of Bento terminated TLS in the HTTP proxy, with its own ACME client. That code was not tested in production, because the one deployment had Caddy in front. It was removed.
+
+The TLS terminator must get one wildcard certificate for `*.foid.space` and the base domain. Add `*.bento.foid.space` when the instance domain is not the parent of the base domain. Use the ACME DNS-01 challenge. A wildcard certificate requires the DNS-01 challenge.
 
 The first reason is the Certificate Transparency logs. A per-instance certificate publishes the name of every instance to a public log. A wildcard certificate publishes only the base domain.
 
-The second reason is the Let's Encrypt rate limit. Let's Encrypt limits new certificates to 50 per registered domain per 7 days. The limit refills at one certificate every 202 minutes. Bento does not delete instances automatically, so normal use stays under this limit. The limit applies during development. Check the current limit before you build.
+The second reason is the Let's Encrypt rate limit. Let's Encrypt limits new certificates to 50 per registered domain per 7 days. A per-instance certificate uses this limit on each create.
 
 A wildcard certificate also makes `rename` cheap. A per-instance certificate needs a new issuance on every rename.
 
-The control plane needs write access to the DNS zone. Use an API token that is limited to the `_acme-challenge` records, if the DNS provider supports such a limit.
+The TLS terminator needs write access to the DNS zone. Use an API token that is limited to the `_acme-challenge` records, if the DNS provider supports such a limit.
 
-**Renewal.** The proxy runs a renewal task for its full life. When a renewal fails at startup and the stored certificate is not expired, the proxy logs the error and serves the stored certificate. After a failure, the task tries again after 5 minutes, and it doubles the delay after each failure, to a maximum of 6 hours. An order has a deadline of 15 minutes. The DNS-01 record name comes from the domain of each authorization, so a different `instance_domain` gets its own record. A stored key that does not match the stored certificate counts as no certificate. The proxy offers only `http/1.1` in ALPN, because it speaks only HTTP/1.
+**Old keys.** The configuration keys `listen.tls = "off"` and `[acme]` are from the earlier version. Bento loads a file that has them and ignores them. Each process logs a warning at startup that asks the operator to remove them. Any other value of `listen.tls` stops startup, because that file expects TLS from Bento.
 
 ## 9. HTTP proxy
 
-The HTTP proxy reads the TLS Server Name Indication field and extracts the instance name. The HTTP proxy then reads the address from the `instances` table. Section 6.2 makes this address known before the instance boots.
+The HTTP proxy reads the `Host` header and extracts the instance name. The TLS terminator must forward the `Host` header of the client. The HTTP proxy then reads the address from the `instances` table. Section 6.2 makes this address known before the instance boots.
 
 A request for the base domain goes to the control plane. The control plane serves the dashboard and the OIDC login flow. The proxy tests the base domain first, because the base domain can itself be a name under the instance domain.
 
@@ -405,7 +410,7 @@ Set these headers on each forwarded request:
 
 Each instance has one default HTTP port. The default value is 80. A user changes the port with the `port` command.
 
-The HTTP proxy also listens on ports 3000 to 9999. A request to `https://$NAME.foid.space:3456/` goes to port 3456 on the instance. The wildcard certificate covers these ports, because the host name does not change.
+The HTTP proxy also listens on ports 3000 to 9999. A request to `https://$NAME.foid.space:3456/` goes to port 3456 on the instance. The wildcard certificate covers these ports, because the host name does not change. The TLS terminator must listen on each port that it publishes and forward it to the same port of the HTTP proxy.
 
 Do not use a name prefix such as `3456-$NAME.foid.space`. This form needs a certificate for `*.*.foid.space`. Such a certificate does not exist.
 
@@ -822,7 +827,7 @@ A `new` command fails when it names a released name that belongs to another user
 4. Add the per-user network, the address manager, and the nftables table.
 5. Add the desired state column and the host reboot restore in section 11.2.
 6. Write the SSH frontend and the command line interface. The system is usable at this point without HTTP.
-7. Get the wildcard certificate. Write the HTTP proxy with `off` and `public` instances.
+7. Put the TLS terminator in front. Write the HTTP proxy with `off` and `public` instances.
 8. Add OIDC and sessions. Add `private` instances.
 9. Write the dashboard.
 

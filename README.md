@@ -42,9 +42,8 @@ if a requirement is missing (SPEC 4.2). Bootc OCI images also need rootful
 Podman, because Bento builds their disks in a privileged container.
 
 **Config.** Copy [`bento.example.toml`](bento.example.toml) to
-`/etc/bento/bento.toml`. Set `base_domain`, the `[acme]` Cloudflare token
-for the wildcard certificate, the `[oidc]` provider for the dashboard, and
-one `[[images]]` entry. Then download the images:
+`/etc/bento/bento.toml`. Set `base_domain`, the `[oidc]` provider for
+the dashboard, and one `[[images]]` entry. Then download the images:
 
 ```
 bentod fetch-images
@@ -55,9 +54,14 @@ bentod fetch-images
 
 ```
 bentod serve    # control plane: database, policy, restore, dashboard (port 10080)
-bentod proxy    # HTTPS proxy: port 443 and ports 3000-9999
+bentod proxy    # HTTP proxy: the main port and ports 3000-9999
 bentod sshd     # SSH frontend and CLI: port 22
 ```
+
+**TLS** (SPEC 8). Bento does not terminate TLS. Put a TLS terminator such
+as Caddy in front, with a wildcard certificate for the base domain, and
+bind `listen.https` to a private address for it to forward to.
+`DEPLOYING.md` section 5 has a Caddy site.
 
 `serve` owns the database. Back it up with `bentod dump-db`, never with a
 file copy, together with the image and storage directories (SPEC 12.1).
@@ -124,8 +128,7 @@ and arm64.
   C library.
 - `crates/sshfront`, `crates/cli`: SSH frontend and command line (SPEC 10,
   15).
-- `crates/proxy`, `crates/tlscert`: HTTP proxy and wildcard TLS (SPEC 8,
-  9).
+- `crates/proxy`: the HTTP proxy behind the TLS terminator (SPEC 8, 9).
 - `crates/auth`, `crates/api`, `crates/dashboard`: identity, the JSON API,
   the dashboard pages and templates, and the dashboard's static assets
   (SPEC 13, 14).
@@ -135,7 +138,7 @@ and arm64.
 Built to SPEC v0.9. Every crate has unit tests against fakes, and the
 end-to-end suite drives the real binary through the instance lifecycle.
 The system has **not** run against a live libvirtd. No guest has booted
-in a test. The nftables ruleset and ACME issuance run only against fakes.
+in a test. The nftables ruleset runs only against fakes.
 
 Known gaps:
 

@@ -3,8 +3,8 @@
 //!
 //! The proxy resolves the instance name on every request (SPEC 7.1), reads
 //! the instance address assigned at creation (SPEC 6.2), and forwards over
-//! plain HTTP on the private network. TLS termination is optional and is
-//! configured by the caller with a shared [`rustls::ServerConfig`].
+//! plain HTTP on the private network. The listeners speak plain HTTP too:
+//! a TLS terminator in front of Bento owns the certificate (SPEC 8).
 
 use std::convert::Infallible;
 use std::error::Error as StdError;
@@ -32,10 +32,10 @@ use tokio_util::sync::CancellationToken;
 
 pub use listen::{BoxIo, ListenFunc, Listener, listen_fn};
 
-/// The main HTTPS port. A request on this port goes to the instance's
-/// default HTTP port, set with the `port` command (SPEC 9.1). An operator
-/// who terminates TLS in front of Bento can move the listener with
-/// [`ProxyBuilder::with_ports`]; every routing rule follows the listener,
+/// The main port. A request on this port goes to the instance's default
+/// HTTP port, set with the `port` command (SPEC 9.1). The operator moves
+/// the listener with [`ProxyBuilder::with_ports`] to where the TLS
+/// terminator forwards (SPEC 8); every routing rule follows the listener,
 /// not this number.
 pub const DEFAULT_PORT: u16 = 443;
 
@@ -188,8 +188,8 @@ impl ProxyBuilder {
     /// domain and an instance's default HTTP port; `high_min..=high_max`
     /// are always-private extra ports. Zero leaves a setting at its default.
     ///
-    /// The main port moves when something else terminates TLS in front of
-    /// Bento. Everything decided from the listener port — including the
+    /// The main port moves to where the TLS terminator in front of Bento
+    /// forwards (SPEC 8). Everything decided from the listener port — including the
     /// control plane and `public` applying only to the default port — moves
     /// with it (SPEC 9.2).
     pub fn with_ports(mut self, main: u16, high_min: u16, high_max: u16) -> Self {
@@ -311,7 +311,7 @@ impl Proxy {
         remote_addr: SocketAddr,
     ) -> Response<ProxyBody> {
         let tls = request.uri().scheme_str() == Some("https");
-        self.handle_connection(request, listener_port, remote_addr, None, tls)
+        self.handle_connection(request, listener_port, remote_addr, tls)
             .await
     }
 
@@ -320,10 +320,9 @@ impl Proxy {
         mut request: Request<ProxyBody>,
         listener_port: u16,
         remote_addr: SocketAddr,
-        server_name: Option<&str>,
         tls: bool,
     ) -> Response<ProxyBody> {
-        let host = request_host(&request, server_name);
+        let host = request_host(&request);
 
         // The base domain is tested first because it can itself be a name
         // under the instance domain, as `bento.foid.space` is under
@@ -866,13 +865,10 @@ fn internal_error() -> Response<ProxyBody> {
     response
 }
 
-// TLS Server Name Indication wins when present (SPEC 9); the Host header
-// covers plain listeners. Port, case, and one trailing dot are stripped.
-fn request_host(request: &Request<ProxyBody>, server_name: Option<&str>) -> String {
-    let host = server_name
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| original_host(request));
+// The Host header names the instance (SPEC 9). Port, case, and one trailing
+// dot are stripped.
+fn request_host(request: &Request<ProxyBody>) -> String {
+    let host = original_host(request);
     strip_host_port(&host)
         .trim_end_matches('.')
         .to_ascii_lowercase()

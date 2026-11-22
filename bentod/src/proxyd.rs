@@ -1,6 +1,7 @@
-//! The HTTP proxy (SPEC 4, 9): optional TLS termination, hostname routing to
-//! instances, and the base domain forwarded to the control plane. It reads
-//! database state and asks the control plane to authorize sessions.
+//! The HTTP proxy (SPEC 4, 9): plain HTTP behind a TLS terminator, hostname
+//! routing to instances, and the base domain forwarded to the control
+//! plane. It reads database state and asks the control plane to authorize
+//! sessions.
 
 use std::convert::Infallible;
 use std::ffi::OsString;
@@ -8,7 +9,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::Result;
 use bytes::Bytes;
 use http::{Response, StatusCode, Uri};
 use http_body_util::{BodyExt, Empty};
@@ -24,40 +25,14 @@ pub(crate) async fn run_proxy(config: &Path, _args: &[OsString]) -> Result<()> {
 }
 
 async fn proxy_inner(app: &App) -> Result<()> {
-    // SPEC 8 has the proxy own the wildcard certificate. `listen.tls = off`
-    // delegates termination to a private frontend and serves plain HTTP.
-    let mut certificate_manager = None;
-    let tls_config = if app.cfg.listen.tls == bento_config::TlsMode::Off {
+    // The proxy serves plain HTTP. A TLS terminator in front of Bento owns
+    // the certificate and forwards here (SPEC 8).
+    if serves_publicly(&app.cfg.listen.https) {
         tracing::warn!(
-            note = "something else must terminate TLS in front of Bento; bind these listeners privately",
-            "serving plain HTTP: listen.tls is off"
+            listen = %app.cfg.listen.https,
+            "the proxy serves plain HTTP on an address that is not loopback; bind listen.https privately behind the TLS terminator (SPEC 8)"
         );
-        None
-    } else {
-        if app.cfg.acme.cloudflare_token.is_empty() {
-            bail!(
-                "acme.cloudflare_token is required: the wildcard certificate needs the DNS-01 challenge (SPEC 8). Set listen.tls = \"off\" when another proxy terminates TLS"
-            );
-        }
-        let manager = bento_tlscert::new(bento_tlscert::Config {
-            base_domain: app.cfg.base_domain.clone(),
-            instance_domain: app.cfg.instance_domain.clone(),
-            email: app.cfg.acme.email.clone(),
-            provider: Some(bento_tlscert::cloudflare(&app.cfg.acme.cloudflare_token)),
-            storage_dir: Path::new(&app.cfg.db_path)
-                .parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join("acme"),
-            directory: app.cfg.acme.directory.clone(),
-            propagation_timeout: Duration::ZERO,
-        })?;
-        tracing::info!(domains = ?manager.domains(), "obtaining the wildcard certificate");
-        let renewal = start_renewal(&manager).await?;
-        let config = manager.tls_config();
-        certificate_manager = Some((manager, renewal));
-        Some(config)
-    };
-
+    }
     let control = control_url(&app.cfg.listen.http);
     let source = Arc::new(ProxySource(app.store.clone()));
     let sessions = Arc::new(RemoteSession {
@@ -82,54 +57,24 @@ async fn proxy_inner(app: &App) -> Result<()> {
     let ports = proxy.ports();
     tracing::info!(
         bind = %bind_host(&app.cfg.listen.https),
-        tls = %app.cfg.listen.tls.as_str(),
         main_port = ports[0],
         high_ports = %format!("{}-{}", ports[1], ports[ports.len() - 1]),
         control = %control,
         "proxy listening"
     );
     let result = proxy
-        .serve(
-            &bind_host(&app.cfg.listen.https),
-            tls_config,
-            None,
-            shutdown_signal(),
-        )
+        .serve(&bind_host(&app.cfg.listen.https), None, shutdown_signal())
         .await;
-    if let Some((manager, renewal)) = certificate_manager {
-        manager.close();
-        renewal.stop().await;
-    }
     match result {
         Ok(()) | Err(bento_proxy::Error::Shutdown) => Ok(()),
         Err(error) => Err(error.into()),
     }
 }
 
-/// The background task that renews the certificate (SPEC 8).
-struct Renewal {
-    cancellation: bento_tlscert::CancellationToken,
-    task: tokio::task::JoinHandle<()>,
-}
-
-impl Renewal {
-    /// Cancels the task and waits for it, so an order in flight finishes
-    /// and removes its DNS record before the process exits.
-    async fn stop(self) {
-        self.cancellation.cancel();
-        let _ = self.task.await;
-    }
-}
-
-/// Obtains the certificate, then starts the renewal loop. Without the loop
-/// a long-lived proxy lets its certificate expire (SPEC 8). A failed renewal
-/// at startup is fatal only when no valid certificate exists; the loop
-/// retries otherwise.
-async fn start_renewal(manager: &bento_tlscert::Manager) -> Result<Renewal> {
-    manager.manage_sync_tolerant().await?;
-    let cancellation = bento_tlscert::CancellationToken::new();
-    let task = manager.manage(cancellation.clone());
-    Ok(Renewal { cancellation, task })
+/// Whether a plain-HTTP listener on `listen` could be reachable from other
+/// machines (SPEC 8). An address that does not parse is left to the bind.
+fn serves_publicly(listen: &str) -> bool {
+    bento_config::resolve_listen_addr(listen).is_ok_and(|address| !address.ip().is_loopback())
 }
 
 fn control_proxy(base: &str) -> Result<bento_proxy::ControlHandler> {
@@ -184,11 +129,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_wildcard_or_private_bind_is_public_and_loopback_is_not() {
+        assert!(serves_publicly(":443"));
+        assert!(serves_publicly("0.0.0.0:10443"));
+        assert!(serves_publicly("10.0.0.5:10443"));
+        assert!(!serves_publicly("127.0.0.1:10443"));
+        assert!(!serves_publicly("[::1]:10443"));
+    }
+
+    #[test]
     fn control_proxy_builds_without_network_io() {
         let _ = rustls::crypto::ring::default_provider().install_default();
         control_proxy("http://127.0.0.1:10080").unwrap();
         let _client = reqwest::Client::new();
-        let _path = std::path::PathBuf::from("acme");
     }
 
     /// Serves `service` on a loopback port, with upgrades, one connection
@@ -284,24 +237,5 @@ mod tests {
             .expect("the upgraded connection carries bytes")
             .unwrap();
         assert_eq!(&echoed, b"ping");
-    }
-
-    /// With no certificate on disk, an unreachable CA stops startup (SPEC 8).
-    #[tokio::test]
-    async fn start_renewal_fails_without_a_usable_certificate() {
-        let storage = tempfile::tempdir().unwrap();
-        let manager = bento_tlscert::new(bento_tlscert::Config {
-            base_domain: "bento.example.org".into(),
-            instance_domain: String::new(),
-            email: String::new(),
-            provider: Some(bento_tlscert::cloudflare("token")),
-            storage_dir: storage.path().to_path_buf(),
-            // Nothing listens on the discard port, so the order fails.
-            directory: "http://127.0.0.1:9/directory".into(),
-            propagation_timeout: Duration::ZERO,
-        })
-        .unwrap();
-        assert!(start_renewal(&manager).await.is_err());
-        assert!(!manager.has_valid_certificate());
     }
 }

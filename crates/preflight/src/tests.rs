@@ -8,10 +8,6 @@ use super::*;
 const HEALTHY: &str = r#"
 base_domain = "example.org"
 
-[acme]
-email = "ops@example.org"
-cloudflare_token = "token"
-
 [oidc]
 issuer = "https://id.example.org"
 client_id = "bento"
@@ -20,9 +16,17 @@ client_secret = "secret"
 [[images]]
 name = "debian-13"
 url = "https://cloud.example.org/debian-13-genericcloud-amd64.qcow2"
+
+# Private, behind the TLS terminator (SPEC 8). The port stays 443 so the
+# privileged-port checks still apply.
+[listen]
+https = "127.0.0.1:443"
 "#;
 
+/// [`HEALTHY`] plus `extra`. HEALTHY ends in `[listen]`, so an `extra`
+/// that opens with that table continues it.
 fn config(extra: &str) -> Config {
+    let extra = extra.strip_prefix("[listen]\n").unwrap_or(extra);
     Config::parse(&format!("{HEALTHY}\n{extra}")).unwrap()
 }
 
@@ -115,7 +119,7 @@ fn a_healthy_controller_meets_every_requirement() {
             "container-storage",
             "container-storage-writable",
             "base-domain",
-            "tls-settings",
+            "front-proxy",
             "oidc-settings",
             "oidc-discovery",
             "dns",
@@ -764,43 +768,39 @@ fn a_documentation_base_domain_warns() {
 }
 
 #[test]
-fn acme_needs_a_token_and_only_warns_without_an_email() {
-    // The proxy refuses to start without the token.
-    let config = config_from(&HEALTHY.replace("cloudflare_token = \"token\"", ""));
-    let requirement = find(&check(&config, &probe()), "tls-settings").clone();
-    assert_eq!(
-        (requirement.status, requirement.fatal),
-        (Status::Unmet, true)
-    );
-    assert!(requirement.detail.contains("acme.cloudflare_token"));
-    assert!(!requirement.detail.contains("acme.email"));
-
-    // Nothing refuses to start without the email.
-    let config = config_from(&HEALTHY.replace("email = \"ops@example.org\"", ""));
-    let report = check(&config, &probe());
-    let requirement = find(&report, "tls-settings");
-    assert_eq!(
-        (requirement.status, requirement.fatal),
-        (Status::Warn, false)
-    );
-    assert!(requirement.detail.contains("acme.email"));
-    assert!(report.ok());
-}
-
-#[test]
 fn plain_http_on_a_public_address_warns() {
-    let public = config("[listen]\ntls = \"off\"\n");
-    let requirement = find(&check(&public, &probe()), "tls-settings").clone();
+    let public = config_from(&HEALTHY.replace("https = \"127.0.0.1:443\"", "https = \":443\""));
+    let report = check(&public, &probe());
+    let requirement = find(&report, "front-proxy");
     assert_eq!(
         (requirement.status, requirement.fatal),
         (Status::Warn, false)
     );
+    assert!(requirement.detail.contains("not a loopback address"));
+    assert!(report.ok());
 
-    let loopback = config("[listen]\ntls = \"off\"\nhttps = \"127.0.0.1:10443\"\n");
     assert_eq!(
-        find(&check(&loopback, &probe()), "tls-settings").status,
+        find(&check(&config(""), &probe()), "front-proxy").status,
         Status::Met
     );
+}
+
+/// Keys from the Bento that terminated TLS still load (SPEC 8), and the
+/// check asks for their removal without stopping startup.
+#[test]
+fn retired_tls_keys_warn() {
+    let retired = config(
+        "[listen]\ntls = \"off\"\n\n[acme]\nemail = \"ops@example.org\"\ncloudflare_token = \"token\"\n",
+    );
+    let report = check(&retired, &probe());
+    let requirement = find(&report, "front-proxy");
+    assert_eq!(
+        (requirement.status, requirement.fatal),
+        (Status::Warn, false)
+    );
+    assert!(requirement.detail.contains("listen.tls and [acme]"));
+    assert!(!requirement.detail.contains("loopback"));
+    assert!(report.ok());
 }
 
 #[test]
