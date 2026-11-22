@@ -51,8 +51,9 @@ pub mod defaults {
     /// control plane inside it would take a port from the proxy and one
     /// of the two would fail to start.
     pub const LISTEN_HTTP: &str = "127.0.0.1:10080";
-    /// HTTP proxy, SPEC 4.
-    pub const LISTEN_HTTPS: &str = ":443";
+    /// HTTP proxy main listener, SPEC 4 and 8. Loopback, because it speaks
+    /// plain HTTP and the TLS terminator in front forwards to it.
+    pub const LISTEN_HTTPS: &str = "127.0.0.1:10443";
     /// SSH frontend, SPEC 4.
     pub const LISTEN_SSH: &str = ":22";
     /// SPEC 9.1.
@@ -159,7 +160,8 @@ pub struct Config {
     /// Keys an older Bento read and this one ignores, as written in the
     /// file. Bento no longer terminates TLS (SPEC 8): `listen.tls = "off"`
     /// and `[acme]` still load, so an upgrade does not stop a running
-    /// deployment, and `bentod check` asks the operator to remove them.
+    /// deployment that had already turned TLS off, and each process warns
+    /// at startup. `[acme]` without `tls = "off"` stops startup instead.
     pub retired_keys: Vec<&'static str>,
 }
 
@@ -611,6 +613,7 @@ impl RawConfig {
         cfg.instance_domain = self
             .instance_domain
             .unwrap_or_else(|| cfg.base_domain.clone());
+        let mut tls_off = false;
         if let Some(listen) = self.listen {
             macro_rules! set_listen {
                 ($($field:ident),* $(,)?) => {
@@ -618,6 +621,7 @@ impl RawConfig {
                 };
             }
             set_listen!(http, https, ssh, proxy_port_min, proxy_port_max);
+            tls_off = listen.tls.as_deref() == Some("off");
             match listen.tls.as_deref() {
                 None => {}
                 // "off" described what is now the only mode (SPEC 8).
@@ -634,6 +638,16 @@ impl RawConfig {
             }
         }
         if self.acme.is_some() {
+            // `tls` defaulted to "acme", so a file with `[acme]` and no
+            // `tls = "off"` expects the proxy to terminate TLS. Loading it
+            // would serve plain HTTP where it asked for TLS (SPEC 8).
+            if !tls_off {
+                return Err(invalid(
+                    "[acme] is no longer supported: Bento serves plain HTTP behind a TLS \
+                     terminator such as Caddy (SPEC 8, DEPLOYING.md section 5). Put one in \
+                     front, bind listen.https to a loopback address, and remove [acme]",
+                ));
+            }
             cfg.retired_keys.push("[acme]");
         }
         Ok(cfg)
@@ -937,7 +951,7 @@ mod tests {
         assert_eq!(cfg.runner.max_clock_skew.std(), Duration::from_secs(60));
         assert!(cfg.runners.is_empty());
         assert_eq!(cfg.listen.http, "127.0.0.1:10080");
-        assert_eq!(cfg.listen.https, ":443");
+        assert_eq!(cfg.listen.https, "127.0.0.1:10443");
         assert_eq!(cfg.listen.ssh, ":22");
         assert_eq!(cfg.listen.proxy_port_min, 3000);
         assert_eq!(cfg.listen.proxy_port_max, 9999);
@@ -1431,6 +1445,30 @@ endpoint = "http://10.0.0.97:10443"
             "base_domain = \"b.example\"\n[listen]\ntls = \"acme\"",
             "listen.tls = \"acme\" is no longer supported",
         );
+    }
+
+    /// The usual ACME file has `[acme]` and no `listen.tls`, because `tls`
+    /// defaulted to "acme". It expects TLS from the proxy, so it must not
+    /// load as a plain-HTTP listener on the old public default (SPEC 8).
+    #[test]
+    fn acme_without_tls_off_stops_startup() {
+        let acme = "[acme]\nemail = \"ops@example.org\"\ncloudflare_token = \"token\"\n";
+        parse_err(
+            &format!("base_domain = \"b.example\"\n{acme}"),
+            "[acme] is no longer supported",
+        );
+        parse_err(
+            &format!("base_domain = \"b.example\"\n[listen]\nhttps = \":443\"\n{acme}"),
+            "[acme] is no longer supported",
+        );
+    }
+
+    /// The proxy listener speaks plain HTTP, so its default is loopback.
+    #[test]
+    fn the_proxy_listener_defaults_to_loopback() {
+        let cfg = Config::parse("base_domain = \"b.example\"").unwrap();
+        let address = resolve_listen_addr(&cfg.listen.https).unwrap();
+        assert!(address.ip().is_loopback(), "{address}");
     }
 
     /// `[listen]` keys left out keep their defaults one by one.

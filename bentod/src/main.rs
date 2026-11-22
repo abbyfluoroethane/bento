@@ -32,7 +32,7 @@ const COMMANDS: [(&str, &str); 11] = [
     ("runner", "run the host runner service on the underlay"),
     (
         "proxy",
-        "run the HTTP proxy on port 443 and ports 3000-9999",
+        "run the HTTP proxy behind the TLS terminator: main port and 3000-9999",
     ),
     ("sshd", "run the SSH frontend on port 22"),
     (

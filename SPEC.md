@@ -374,7 +374,7 @@ A reserved name is public knowledge, so the refusal states the reason. Section 9
 
 ## 8. TLS
 
-Bento does not terminate TLS. A TLS terminator in front of Bento, such as Caddy, holds the certificate and terminates TLS. The TLS terminator forwards plain HTTP to the HTTP proxy. The HTTP proxy listeners must not be reachable from the internet directly, so bind them to a loopback address. The HTTP proxy logs a warning at startup when it listens on another address.
+Bento does not terminate TLS. A TLS terminator in front of Bento, such as Caddy, holds the certificate and terminates TLS. The TLS terminator forwards plain HTTP to the HTTP proxy. The HTTP proxy listeners must not be reachable from the internet directly, so bind them to a loopback address. The default address is `127.0.0.1:10443`. The HTTP proxy logs a warning at startup when it listens on another address.
 
 The reason is operational. A TLS terminator such as Caddy already gets, renews, and serves certificates, and many deployments have one. An earlier version of Bento terminated TLS in the HTTP proxy, with its own ACME client. That code was not tested in production, because the one deployment had Caddy in front. It was removed.
 
@@ -388,7 +388,7 @@ A wildcard certificate also makes `rename` cheap. A per-instance certificate nee
 
 The TLS terminator needs write access to the DNS zone. Use an API token that is limited to the `_acme-challenge` records, if the DNS provider supports such a limit.
 
-**Old keys.** The configuration keys `listen.tls = "off"` and `[acme]` are from the earlier version. Bento loads a file that has them and ignores them. Each process logs a warning at startup that asks the operator to remove them. Any other value of `listen.tls` stops startup, because that file expects TLS from Bento.
+**Old keys.** The configuration keys `listen.tls = "off"` and `[acme]` are from the earlier version. Bento loads a file that has `listen.tls = "off"`, with or without `[acme]`, and ignores them. Each process logs a warning at startup that asks the operator to remove them. Any other value of `listen.tls` stops startup, because that file expects TLS from Bento. An `[acme]` table without `listen.tls = "off"` also stops startup: the earlier default of `listen.tls` was `acme`, so that file also expects TLS from Bento.
 
 ## 9. HTTP proxy
 

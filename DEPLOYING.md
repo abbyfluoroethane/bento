@@ -36,7 +36,7 @@ OCI image that Bento supplies to a privileged container with host container
 storage mounted read-write. This is an inherent trust boundary of the
 image-builder workflow, not ordinary image-view permission.
 
-Bento needs root: it runs `nft`, and by default binds ports 22 and 443.
+Bento needs root: it runs `nft`, and by default binds port 22.
 Bento does not terminate TLS. A TLS terminator such as Caddy goes in
 front of the proxy (section 5, SPEC 8).
 
@@ -98,8 +98,8 @@ Bento binds three things:
 | What | Default | Notes |
 |------|---------|-------|
 | control plane | `127.0.0.1:10080` | must be **outside** the proxy range |
-| proxy, main port | `:443` | plain HTTP; carries the base domain and instances' default HTTP port. Bind it privately, for example `127.0.0.1:10443` (section 5) |
-| proxy, high ports | `:3000-9999` | SPEC 9.1; port N goes to port N on the guest |
+| proxy, main port | `127.0.0.1:10443` | plain HTTP; carries the base domain and instances' default HTTP port. The TLS terminator forwards here (section 5) |
+| proxy, high ports | `3000-9999` | on the address of the main port; SPEC 9.1; port N goes to port N on the guest |
 | SSH frontend | `:22` | |
 
 **The proxy binds every port of the high range and fails if any one is
@@ -334,8 +334,11 @@ listeners directly.
 
 A configuration from the version that terminated TLS can still hold
 `tls = "off"` under `[listen]` and an `[acme]` table. Bento ignores both
-and logs a warning at startup that asks you to remove them. Any other `tls` value stops
-startup: that file expects TLS from Bento, and Bento no longer gives it.
+and logs a warning at startup that asks you to remove them. Any other `tls`
+value stops startup, and so does an `[acme]` table without `tls = "off"`:
+that file expects TLS from Bento, and Bento no longer gives it. Before the
+upgrade, put the TLS terminator in front, set `listen.https` to a loopback
+address, and remove `[acme]`.
 
 The port in `listen.https` becomes the proxy's main port, so pick one
 outside the high range. A matching Caddy site:
