@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use bento_types::{Instance, State, Visibility};
 use bytes::Bytes;
 use http::header::{self, HeaderName, HeaderValue};
-use http::{Request, Response, StatusCode, Uri};
+use http::{HeaderMap, Request, Response, StatusCode, Uri};
 use http_body_util::combinators::BoxBody;
 use http_body_util::{BodyExt, Full};
 use hyper_util::client::legacy::Client;
@@ -27,6 +27,8 @@ use hyper_util::rt::TokioExecutor;
 
 mod listen;
 mod pages;
+
+use tokio_util::sync::CancellationToken;
 
 pub use listen::{BoxIo, ListenFunc, Listener, listen_fn};
 
@@ -42,6 +44,12 @@ pub const DEFAULT_PORT: u16 = 443;
 /// 9.2).
 pub const HIGH_PORT_MIN: u16 = 3000;
 pub const HIGH_PORT_MAX: u16 = 9999;
+
+/// How often an upgraded connection, such as a WebSocket, is authorized
+/// again (SPEC 9.2, 13). The upgrade request is checked once; without this
+/// the tunnel would outlive a visibility change, a removed share, or a
+/// revoked session.
+pub const TUNNEL_REVALIDATE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// An error that can cross a proxy integration seam.
 pub type BoxError = Box<dyn StdError + Send + Sync>;
@@ -122,6 +130,7 @@ pub struct ProxyBuilder {
     login_url: Option<String>,
     transport: Option<Arc<dyn Transport>>,
     last_seen: Option<Arc<dyn LastSeenRecorder>>,
+    tunnel_interval: Duration,
     main_port: u16,
     high_min: u16,
     high_max: u16,
@@ -165,6 +174,13 @@ impl ProxyBuilder {
     /// Records every forwarded request against the instance (SPEC 12).
     pub fn with_last_seen(mut self, recorder: Arc<dyn LastSeenRecorder>) -> Self {
         self.last_seen = Some(recorder);
+        self
+    }
+
+    /// Sets how often an upgraded connection is authorized again. The
+    /// default is [`TUNNEL_REVALIDATE_INTERVAL`].
+    pub fn with_tunnel_revalidation(mut self, interval: Duration) -> Self {
+        self.tunnel_interval = interval;
         self
     }
 
@@ -228,6 +244,7 @@ impl ProxyBuilder {
             login_url,
             transport: self.transport.unwrap_or_else(default_transport),
             last_seen: self.last_seen,
+            tunnel_interval: self.tunnel_interval,
             main_port: self.main_port,
             high_min: self.high_min,
             high_max: self.high_max,
@@ -245,6 +262,7 @@ pub struct Proxy {
     login_url: String,
     transport: Arc<dyn Transport>,
     last_seen: Option<Arc<dyn LastSeenRecorder>>,
+    tunnel_interval: Duration,
     main_port: u16,
     high_min: u16,
     high_max: u16,
@@ -267,6 +285,7 @@ impl Proxy {
             login_url: None,
             transport: None,
             last_seen: None,
+            tunnel_interval: TUNNEL_REVALIDATE_INTERVAL,
             main_port: DEFAULT_PORT,
             high_min: HIGH_PORT_MIN,
             high_max: HIGH_PORT_MAX,
@@ -333,42 +352,27 @@ impl Proxy {
             Ok(None) => return pages::not_found(),
             Err(_) => return internal_error(),
         };
-        if instance.visibility == Visibility::Off {
-            // A name that does not exist, a name in the release cooldown,
-            // and an instance with visibility off answer byte-identically,
-            // so a visitor cannot probe which names exist (SPEC 9.2, 7.3).
-            return pages::not_found();
+        let verdict = authorize(
+            self.sessions.as_ref(),
+            self.main_port,
+            &instance,
+            listener_port,
+            &request,
+        )
+        .await;
+        match verdict {
+            Verdict::Allowed => {}
+            Verdict::NotFound => return pages::not_found(),
+            Verdict::Login => return self.redirect_to_login(&request),
+            // Answer at once; never hold the request until the instance is
+            // up (SPEC 9.3).
+            Verdict::Unavailable => return pages::unavailable(&instance),
         }
-
-        // Ports 3000-9999 are always private; `public` applies only to the
-        // default HTTP port (SPEC 9.2). A private request is authorized
-        // against the owner and shares on every request (SPEC 13). An
-        // authenticated user without access gets the same 404 as a missing
-        // name.
-        let private = instance.visibility == Visibility::Private || listener_port != self.main_port;
-        if private {
-            let access = match &self.sessions {
-                Some(sessions) => sessions.access(&request, &instance.uuid).await,
-                None => Access::Unauthenticated,
-            };
-            match access {
-                Access::Granted => {}
-                Access::Unauthenticated => return self.redirect_to_login(&request),
-                Access::Forbidden => return pages::not_found(),
-            }
-        }
-
         let target_port = if listener_port == self.main_port {
             instance.effective_http_port()
         } else {
             listener_port
         };
-
-        if instance.state != State::Running {
-            // Answer at once; never hold the request until the instance is
-            // up (SPEC 9.3).
-            return pages::unavailable(&instance);
-        }
 
         // SPEC 12: last_seen_at records the last HTTP request. A recording
         // failure must not take a healthy instance offline.
@@ -376,8 +380,73 @@ impl Proxy {
             let _ = last_seen.touch_last_seen(&instance.uuid).await;
         }
 
-        self.forward(&mut request, &instance, target_port, remote_addr, tls)
-            .await
+        let guard = self.tunnel_guard(&request, &instance, name, listener_port);
+        self.forward(
+            &mut request,
+            &instance,
+            target_port,
+            remote_addr,
+            tls,
+            guard,
+        )
+        .await
+    }
+
+    /// Builds the hook that authorizes an upgraded connection again, with
+    /// the headers of the request that opened it. The instance is found by
+    /// name and must still have the same UUID: the name is a label (SPEC 7.1).
+    /// A lookup failure keeps the tunnel, because a database blip is not a
+    /// revoked grant.
+    fn tunnel_guard(
+        &self,
+        request: &Request<ProxyBody>,
+        instance: &Instance,
+        name: &str,
+        listener_port: u16,
+    ) -> TunnelGuard {
+        let mut guard = TunnelGuard {
+            interval: self.tunnel_interval,
+            shutdown: request.extensions().get::<Shutdown>().map(|s| s.0.clone()),
+            ..TunnelGuard::default()
+        };
+        if upgrade_protocol(request.headers()).is_none() {
+            return guard;
+        }
+        let instances = self.instances.clone();
+        let sessions = self.sessions.clone();
+        let main_port = self.main_port;
+        let name = name.to_owned();
+        let uuid = instance.uuid.clone();
+        let method = request.method().clone();
+        let uri = request.uri().clone();
+        let headers = request.headers().clone();
+        guard.revalidate = Some(Arc::new(move || {
+            let instances = instances.clone();
+            let sessions = sessions.clone();
+            let (name, uuid) = (name.clone(), uuid.clone());
+            let (method, uri, headers) = (method.clone(), uri.clone(), headers.clone());
+            Box::pin(async move {
+                let instance = match instances.instance_by_name(&name).await {
+                    Ok(Some(instance)) if instance.uuid == uuid => instance,
+                    Ok(_) => return false,
+                    Err(_) => return true,
+                };
+                let mut original = Request::new(full_body(Bytes::new()));
+                *original.method_mut() = method;
+                *original.uri_mut() = uri;
+                *original.headers_mut() = headers;
+                authorize(
+                    sessions.as_ref(),
+                    main_port,
+                    &instance,
+                    listener_port,
+                    &original,
+                )
+                .await
+                    == Verdict::Allowed
+            })
+        }));
+        guard
     }
 
     fn redirect_to_login(&self, request: &Request<ProxyBody>) -> Response<ProxyBody> {
@@ -404,6 +473,7 @@ impl Proxy {
         target_port: u16,
         remote_addr: SocketAddr,
         tls: bool,
+        guard: TunnelGuard,
     ) -> Response<ProxyBody> {
         let original_host = original_host(request);
         let path = request
@@ -421,30 +491,38 @@ impl Proxy {
             return pages::unavailable(instance);
         };
 
-        let prepared = send_upgradable(self.transport.as_ref(), take_request(request), |request| {
-            *request.uri_mut() = uri;
-            // Forwarding headers are trust-boundary data. Discard anything the
-            // client supplied before writing the values observed by this proxy.
-            for name in [
-                HeaderName::from_static("forwarded"),
-                HeaderName::from_static("x-forwarded-for"),
-                HeaderName::from_static("x-forwarded-host"),
-                HeaderName::from_static("x-forwarded-proto"),
-            ] {
-                request.headers_mut().remove(name);
-            }
-            if let Ok(host) = HeaderValue::from_str(&original_host) {
-                request.headers_mut().insert(header::HOST, host.clone());
-                request
-                    .headers_mut()
-                    .insert(HeaderName::from_static("x-forwarded-host"), host);
-            }
-            request.headers_mut().insert(
-                HeaderName::from_static("x-forwarded-proto"),
-                HeaderValue::from_static(if tls { "https" } else { "http" }),
-            );
-            set_forwarded_for(request.headers_mut(), remote_addr.ip());
-        })
+        let prepared = send_guarded(
+            self.transport.as_ref(),
+            take_request(request),
+            guard,
+            |request| {
+                *request.uri_mut() = uri;
+                // Forwarding headers are trust-boundary data. Discard anything the
+                // client supplied before writing the values observed by this proxy.
+                for name in [
+                    HeaderName::from_static("forwarded"),
+                    HeaderName::from_static("x-forwarded-for"),
+                    HeaderName::from_static("x-forwarded-host"),
+                    HeaderName::from_static("x-forwarded-proto"),
+                ] {
+                    request.headers_mut().remove(name);
+                }
+                if let Ok(host) = HeaderValue::from_str(&original_host) {
+                    request.headers_mut().insert(header::HOST, host.clone());
+                    request
+                        .headers_mut()
+                        .insert(HeaderName::from_static("x-forwarded-host"), host);
+                }
+                request.headers_mut().insert(
+                    HeaderName::from_static("x-forwarded-proto"),
+                    HeaderValue::from_static(if tls { "https" } else { "http" }),
+                );
+                set_forwarded_for(request.headers_mut(), remote_addr.ip());
+                // Only the forwarded copy loses the credentials. The session
+                // check and the tunnel revalidation hold the originals.
+                strip_bento_credentials(request.headers_mut());
+            },
+        )
         .await;
         match prepared {
             Ok(response) => response,
@@ -462,7 +540,88 @@ impl Proxy {
 /// sets cannot be named away by the client's `Connection` header.
 pub async fn send_upgradable(
     transport: &dyn Transport,
+    request: Request<ProxyBody>,
+    prepare: impl FnOnce(&mut Request<ProxyBody>),
+) -> Result<Response<ProxyBody>, BoxError> {
+    send_guarded(transport, request, TunnelGuard::default(), prepare).await
+}
+
+/// The future that answers whether an upgraded connection may stay open.
+pub type Revalidate = Arc<dyn Fn() -> Pin<Box<dyn Future<Output = bool> + Send>> + Send + Sync>;
+
+/// Limits the life of an upgraded connection (SPEC 9.2, 13).
+#[derive(Clone)]
+pub struct TunnelGuard {
+    /// Called every `interval`. The tunnel ends when it answers `false`.
+    /// `None` leaves the tunnel open until a side closes it, which is the
+    /// trust model of the control plane: the handler authorized the
+    /// request itself.
+    pub revalidate: Option<Revalidate>,
+    pub interval: Duration,
+    /// Ends the tunnel when cancelled, for example on shutdown.
+    pub shutdown: Option<CancellationToken>,
+}
+
+impl Default for TunnelGuard {
+    fn default() -> Self {
+        Self {
+            revalidate: None,
+            interval: TUNNEL_REVALIDATE_INTERVAL,
+            shutdown: None,
+        }
+    }
+}
+
+/// Marks a request that arrived on a listener with a shutdown signal.
+#[derive(Clone)]
+pub(crate) struct Shutdown(pub(crate) CancellationToken);
+
+/// Joins two upgraded connections until one side closes, `guard` ends the
+/// tunnel, or the shutdown signal fires.
+async fn run_tunnel(
+    mut inbound: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    mut outbound: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    guard: TunnelGuard,
+) {
+    let copy = tokio::io::copy_bidirectional(&mut inbound, &mut outbound);
+    tokio::pin!(copy);
+    let shutdown = async {
+        match &guard.shutdown {
+            Some(token) => token.cancelled().await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(shutdown);
+    loop {
+        let Some(revalidate) = &guard.revalidate else {
+            tokio::select! {
+                _ = &mut copy => {}
+                () = &mut shutdown => {}
+            }
+            return;
+        };
+        tokio::select! {
+            _ = &mut copy => return,
+            () = &mut shutdown => return,
+            () = tokio::time::sleep(guard.interval) => {}
+        }
+        // The data keeps flowing while the check runs.
+        tokio::select! {
+            _ = &mut copy => return,
+            () = &mut shutdown => return,
+            allowed = revalidate() => {
+                if !allowed {
+                    return;
+                }
+            }
+        }
+    }
+}
+
+async fn send_guarded(
+    transport: &dyn Transport,
     mut request: Request<ProxyBody>,
+    guard: TunnelGuard,
     prepare: impl FnOnce(&mut Request<ProxyBody>),
 ) -> Result<Response<ProxyBody>, BoxError> {
     let requested_upgrade = upgrade_protocol(request.headers()).cloned();
@@ -502,13 +661,125 @@ pub async fn send_upgradable(
     if let (Some(inbound), Some(outbound)) = (request_upgrade, response_upgrade) {
         tokio::spawn(async move {
             if let (Ok(inbound), Ok(outbound)) = (inbound.await, outbound.await) {
-                let mut inbound = hyper_util::rt::TokioIo::new(inbound);
-                let mut outbound = hyper_util::rt::TokioIo::new(outbound);
-                let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                run_tunnel(
+                    hyper_util::rt::TokioIo::new(inbound),
+                    hyper_util::rt::TokioIo::new(outbound),
+                    guard,
+                )
+                .await;
             }
         });
     }
     Ok(response)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Verdict {
+    Allowed,
+    /// The uniform 404 (SPEC 9.2).
+    NotFound,
+    Login,
+    Unavailable,
+}
+
+/// The per-request decision (SPEC 9.2, 13), shared by a new request and by
+/// the later checks of an upgraded connection.
+async fn authorize(
+    sessions: Option<&Arc<dyn SessionChecker>>,
+    main_port: u16,
+    instance: &Instance,
+    listener_port: u16,
+    request: &Request<ProxyBody>,
+) -> Verdict {
+    if instance.visibility == Visibility::Off {
+        // A name that does not exist, a name in the release cooldown,
+        // and an instance with visibility off answer byte-identically,
+        // so a visitor cannot probe which names exist (SPEC 9.2, 7.3).
+        return Verdict::NotFound;
+    }
+
+    // Ports 3000-9999 are always private; `public` applies only to the
+    // default HTTP port (SPEC 9.2). A private request is authorized
+    // against the owner and shares on every request (SPEC 13). An
+    // authenticated user without access gets the same 404 as a missing
+    // name.
+    let private = instance.visibility == Visibility::Private || listener_port != main_port;
+    if private {
+        let access = match sessions {
+            Some(sessions) => sessions.access(request, &instance.uuid).await,
+            None => Access::Unauthenticated,
+        };
+        match access {
+            Access::Granted => {}
+            Access::Unauthenticated => return Verdict::Login,
+            Access::Forbidden => return Verdict::NotFound,
+        }
+    }
+    if instance.state != State::Running {
+        return Verdict::Unavailable;
+    }
+    Verdict::Allowed
+}
+
+/// Every Bento cookie name and API token starts with this. The proxy must
+/// not depend on the auth crate, so the prefix is repeated here. It is
+/// `bento_auth::TOKEN_PREFIX` and the start of `SESSION_COOKIE_NAME` and of
+/// the OIDC flow cookies (`bento_oauth_state`, `bento_oauth_nonce`,
+/// `bento_login_next`). Keep the four in step (SPEC 9.2, 13).
+const BENTO_CREDENTIAL_PREFIX: &str = "bento_";
+
+/// Removes what Bento issued from a request bound for a guest, so a guest
+/// app cannot read or replay a visitor's Bento session (SPEC 9.2, 13).
+/// This drops every cookie whose name starts with `bento_`, and the
+/// `Authorization` header when it carries a Bento API token. The guest's own
+/// cookies and its own `Authorization` (Basic auth, for example) pass.
+fn strip_bento_credentials(headers: &mut HeaderMap) {
+    let mut removed = false;
+    let mut kept: Vec<String> = Vec::new();
+    let mut opaque: Vec<HeaderValue> = Vec::new();
+    for value in headers.get_all(header::COOKIE) {
+        match value.to_str() {
+            Ok(text) => {
+                for pair in text
+                    .split(';')
+                    .map(str::trim)
+                    .filter(|pair| !pair.is_empty())
+                {
+                    let name = pair.split_once('=').map_or(pair, |(name, _)| name).trim();
+                    if name.starts_with(BENTO_CREDENTIAL_PREFIX) {
+                        removed = true;
+                    } else {
+                        kept.push(pair.to_owned());
+                    }
+                }
+            }
+            // Not text, so it cannot name a Bento cookie. Leave it be.
+            Err(_) => opaque.push(value.clone()),
+        }
+    }
+    if removed {
+        headers.remove(header::COOKIE);
+        for value in opaque {
+            headers.append(header::COOKIE, value);
+        }
+        if !kept.is_empty() {
+            // Built from parts of valid header values joined by `; `.
+            if let Ok(value) = HeaderValue::from_str(&kept.join("; ")) {
+                headers.append(header::COOKIE, value);
+            }
+        }
+    }
+    let bento_token = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split_once(char::is_whitespace))
+        .is_some_and(|(scheme, token)| {
+            scheme.eq_ignore_ascii_case("bearer")
+                && token.trim_start().starts_with(BENTO_CREDENTIAL_PREFIX)
+        });
+    if bento_token {
+        headers.remove(header::AUTHORIZATION);
+    }
 }
 
 fn take_request(request: &mut Request<ProxyBody>) -> Request<ProxyBody> {

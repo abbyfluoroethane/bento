@@ -244,14 +244,18 @@ async fn run_http<IO>(
 ) where
     IO: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
+    let tunnels = cancel.clone();
     let service = service_fn(move |request: Request<Incoming>| {
         let proxy = proxy.clone();
         let server_name = server_name.clone();
+        let tunnels = tunnels.clone();
         async move {
-            let request = request.map(|body| {
+            let mut request = request.map(|body| {
                 body.map_err(|error| -> BoxError { Box::new(error) })
                     .boxed()
             });
+            // Upgraded tunnels end with the listener (SPEC 9).
+            request.extensions_mut().insert(crate::Shutdown(tunnels));
             Ok::<_, std::convert::Infallible>(
                 proxy
                     .handle_connection(request, port, peer, server_name.as_deref(), tls)

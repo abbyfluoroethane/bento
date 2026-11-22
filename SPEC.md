@@ -383,6 +383,8 @@ A wildcard certificate also makes `rename` cheap. A per-instance certificate nee
 
 The control plane needs write access to the DNS zone. Use an API token that is limited to the `_acme-challenge` records, if the DNS provider supports such a limit.
 
+**Renewal.** The proxy runs a renewal task for its full life. When a renewal fails at startup and the stored certificate is not expired, the proxy logs the error and serves the stored certificate. After a failure, the task tries again after 5 minutes, and it doubles the delay after each failure, to a maximum of 6 hours. An order has a deadline of 15 minutes. The DNS-01 record name comes from the domain of each authorization, so a different `instance_domain` gets its own record. A stored key that does not match the stored certificate counts as no certificate. The proxy offers only `http/1.1` in ALPN, because it speaks only HTTP/1.
+
 ## 9. HTTP proxy
 
 The HTTP proxy reads the TLS Server Name Indication field and extracts the instance name. The HTTP proxy then reads the address from the `instances` table. Section 6.2 makes this address known before the instance boots.
@@ -396,6 +398,8 @@ Set these headers on each forwarded request:
 - `X-Forwarded-Proto`
 - `X-Forwarded-Host`
 - `X-Forwarded-For`
+
+**Credentials.** The proxy does not forward Bento credentials to a guest. It removes each cookie whose name starts with `bento_` (the session cookie and the OIDC flow cookies) and an `Authorization: Bearer bento_...` token. The cookies and the `Authorization` values of the guest application pass.
 
 ### 9.1 Port selection
 
@@ -420,6 +424,8 @@ The `off` value binds nothing to the name. A user who runs a database in an inst
 The HTTP 404 response for `off` matches the response for a name that does not exist. The response also matches the response for a name in the cooldown from section 7.2. This hides the existence of the instance.
 
 Ports 3000 to 9999 are always private. The `public` value applies only to the default HTTP port.
+
+**Upgraded connections.** The proxy does the visibility and access check for an upgraded connection (WebSocket) again every 30 seconds. It closes the connection when the instance is no longer visible to that visitor, when the instance is not running, or when the name now belongs to a different instance. It also closes upgraded connections at shutdown.
 
 ### 9.3 Unavailable instance
 

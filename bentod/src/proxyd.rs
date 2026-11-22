@@ -52,9 +52,9 @@ async fn proxy_inner(app: &App) -> Result<()> {
             propagation_timeout: Duration::ZERO,
         })?;
         tracing::info!(domains = ?manager.domains(), "obtaining the wildcard certificate");
-        manager.manage_sync().await?;
+        let renewal = start_renewal(&manager).await?;
         let config = manager.tls_config();
-        certificate_manager = Some(manager);
+        certificate_manager = Some((manager, renewal));
         Some(config)
     };
 
@@ -96,13 +96,40 @@ async fn proxy_inner(app: &App) -> Result<()> {
             shutdown_signal(),
         )
         .await;
-    if let Some(manager) = certificate_manager {
+    if let Some((manager, renewal)) = certificate_manager {
         manager.close();
+        renewal.stop().await;
     }
     match result {
         Ok(()) | Err(bento_proxy::Error::Shutdown) => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+/// The background task that renews the certificate (SPEC 8).
+struct Renewal {
+    cancellation: bento_tlscert::CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Renewal {
+    /// Cancels the task and waits for it, so an order in flight finishes
+    /// and removes its DNS record before the process exits.
+    async fn stop(self) {
+        self.cancellation.cancel();
+        let _ = self.task.await;
+    }
+}
+
+/// Obtains the certificate, then starts the renewal loop. Without the loop
+/// a long-lived proxy lets its certificate expire (SPEC 8). A failed renewal
+/// at startup is fatal only when no valid certificate exists; the loop
+/// retries otherwise.
+async fn start_renewal(manager: &bento_tlscert::Manager) -> Result<Renewal> {
+    manager.manage_sync_tolerant().await?;
+    let cancellation = bento_tlscert::CancellationToken::new();
+    let task = manager.manage(cancellation.clone());
+    Ok(Renewal { cancellation, task })
 }
 
 fn control_proxy(base: &str) -> Result<bento_proxy::ControlHandler> {
@@ -257,5 +284,24 @@ mod tests {
             .expect("the upgraded connection carries bytes")
             .unwrap();
         assert_eq!(&echoed, b"ping");
+    }
+
+    /// With no certificate on disk, an unreachable CA stops startup (SPEC 8).
+    #[tokio::test]
+    async fn start_renewal_fails_without_a_usable_certificate() {
+        let storage = tempfile::tempdir().unwrap();
+        let manager = bento_tlscert::new(bento_tlscert::Config {
+            base_domain: "bento.example.org".into(),
+            instance_domain: String::new(),
+            email: String::new(),
+            provider: Some(bento_tlscert::cloudflare("token")),
+            storage_dir: storage.path().to_path_buf(),
+            // Nothing listens on the discard port, so the order fails.
+            directory: "http://127.0.0.1:9/directory".into(),
+            propagation_timeout: Duration::ZERO,
+        })
+        .unwrap();
+        assert!(start_renewal(&manager).await.is_err());
+        assert!(!manager.has_valid_certificate());
     }
 }

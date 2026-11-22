@@ -552,6 +552,116 @@ async fn forwarded_headers_are_set() {
     assert_eq!(headers[header::HOST], format!("box.{TEST_BASE}"));
 }
 
+/// What the guest receives for these request headers.
+async fn forwarded_with(headers: &[(&str, &str)]) -> http::HeaderMap {
+    let (transport, seen) = ok_transport();
+    let proxy = builder(FakeSource::with(running_instance(
+        "box",
+        Visibility::Public,
+    )))
+    .with_transport(transport)
+    .build()
+    .unwrap();
+    let mut request = request(&format!("box.{TEST_BASE}"));
+    for (name, value) in headers {
+        request.headers_mut().append(
+            HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            HeaderValue::from_str(value).unwrap(),
+        );
+    }
+    proxy.handle(request, DEFAULT_PORT, REMOTE).await;
+    let seen = seen.lock().unwrap();
+    seen[0].headers.clone()
+}
+
+#[tokio::test]
+async fn the_guest_gets_its_own_cookies_and_not_the_bento_ones() {
+    let headers = forwarded_with(&[("cookie", "a=1; bento_session=x; b=2")]).await;
+    assert_eq!(headers[header::COOKIE], "a=1; b=2");
+    // Spacing, several headers, and the OIDC flow cookies.
+    let headers = forwarded_with(&[
+        ("cookie", "a=1;bento_oauth_state=s ;  b=2"),
+        ("cookie", "bento_login_next=/x; c=3"),
+    ])
+    .await;
+    let all: Vec<_> = headers.get_all(header::COOKIE).iter().collect();
+    assert_eq!(all, ["a=1; b=2; c=3"]);
+}
+
+#[tokio::test]
+async fn a_lone_bento_cookie_removes_the_header() {
+    let headers = forwarded_with(&[("cookie", "bento_session=x")]).await;
+    assert!(!headers.contains_key(header::COOKIE));
+    let headers = forwarded_with(&[("cookie", "a=1")]).await;
+    assert_eq!(headers[header::COOKIE], "a=1");
+}
+
+#[tokio::test]
+async fn a_bento_token_is_not_forwarded_but_a_guest_authorization_is() {
+    let headers = forwarded_with(&[("authorization", "Bearer bento_abc123")]).await;
+    assert!(!headers.contains_key(header::AUTHORIZATION));
+    let headers = forwarded_with(&[("authorization", "bearer  bento_abc123")]).await;
+    assert!(!headers.contains_key(header::AUTHORIZATION));
+    for own in ["Basic dXNlcjpwYXNz", "Bearer guest-token"] {
+        let headers = forwarded_with(&[("authorization", own)]).await;
+        assert_eq!(headers[header::AUTHORIZATION], own);
+    }
+}
+
+struct HeaderSpy(Mutex<Vec<(Option<String>, Option<String>)>>);
+
+#[async_trait]
+impl SessionChecker for HeaderSpy {
+    async fn access(&self, request: &Request<ProxyBody>, _: &str) -> Access {
+        let get = |name| {
+            request
+                .headers()
+                .get(name)
+                .map(|value| value.to_str().unwrap().to_owned())
+        };
+        self.0
+            .lock()
+            .unwrap()
+            .push((get(header::COOKIE), get(header::AUTHORIZATION)));
+        Access::Granted
+    }
+}
+
+#[tokio::test]
+async fn the_session_check_sees_the_original_headers() {
+    let (transport, seen) = ok_transport();
+    let spy = Arc::new(HeaderSpy(Mutex::new(Vec::new())));
+    let proxy = builder(FakeSource::with(running_instance(
+        "box",
+        Visibility::Private,
+    )))
+    .with_transport(transport)
+    .with_sessions(spy.clone())
+    .build()
+    .unwrap();
+    let mut request = request(&format!("box.{TEST_BASE}"));
+    request.headers_mut().insert(
+        header::COOKIE,
+        HeaderValue::from_static("a=1; bento_session=x"),
+    );
+    request.headers_mut().insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_static("Bearer bento_t"),
+    );
+    proxy.handle(request, DEFAULT_PORT, REMOTE).await;
+    let checked = spy.0.lock().unwrap();
+    assert_eq!(
+        checked[0],
+        (
+            Some("a=1; bento_session=x".to_owned()),
+            Some("Bearer bento_t".to_owned())
+        )
+    );
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen[0].headers[header::COOKIE], "a=1");
+    assert!(!seen[0].headers.contains_key(header::AUTHORIZATION));
+}
+
 /// A real ephemeral loopback backend proves the complete streaming path,
 /// rather than only the injected transport seam.
 #[tokio::test]
@@ -946,4 +1056,217 @@ async fn serve_stops_when_shutdown_is_cancelled() {
         .unwrap()
         .expect_err("serve returned success after shutdown");
     assert!(matches!(error, Error::Shutdown));
+}
+
+/// Lets a test change an instance while a tunnel is open.
+struct SwitchSource(Mutex<Instance>);
+
+#[async_trait]
+impl InstanceSource for SwitchSource {
+    async fn instance_by_name(&self, name: &str) -> Result<Option<Instance>, BoxError> {
+        let instance = self.0.lock().unwrap().clone();
+        Ok((instance.name == name).then_some(instance))
+    }
+}
+
+struct SwitchSessions(Mutex<Access>);
+
+#[async_trait]
+impl SessionChecker for SwitchSessions {
+    async fn access(&self, _: &Request<ProxyBody>, _: &str) -> Access {
+        *self.0.lock().unwrap()
+    }
+}
+
+/// An upstream that agrees to an `echo` upgrade and then echoes bytes.
+async fn echo_upstream() -> SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                while !head.ends_with(b"\r\n\r\n") {
+                    let mut byte = [0_u8; 1];
+                    if stream.read_exact(&mut byte).await.is_err() {
+                        return;
+                    }
+                    head.push(byte[0]);
+                }
+                let reply = "HTTP/1.1 101 Switching Protocols\r\nConnection: upgrade\r\n\
+                             Upgrade: echo\r\n\r\n";
+                if stream.write_all(reply.as_bytes()).await.is_err() {
+                    return;
+                }
+                let (mut read, mut write) = stream.split();
+                let _ = tokio::io::copy(&mut read, &mut write).await;
+            });
+        }
+    });
+    address
+}
+
+/// A listener that hands each connection to `proxy`, with upgrades enabled.
+async fn serve_front(proxy: Arc<Proxy>) -> SocketAddr {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let address = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let proxy = proxy.clone();
+            tokio::spawn(async move {
+                let service = service_fn(move |request: Request<hyper::body::Incoming>| {
+                    let proxy = proxy.clone();
+                    async move {
+                        let request = request.map(|body| {
+                            body.map_err(|error| -> BoxError { Box::new(error) })
+                                .boxed()
+                        });
+                        Ok::<_, Infallible>(
+                            proxy
+                                .handle_connection(request, DEFAULT_PORT, REMOTE, None, false)
+                                .await,
+                        )
+                    }
+                });
+                let _ = http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
+                    .with_upgrades()
+                    .await;
+            });
+        }
+    });
+    address
+}
+
+/// Opens an `echo` upgrade through the proxy and proves it carries bytes.
+async fn open_tunnel(front: SocketAddr, name: &str) -> tokio::net::TcpStream {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut client = tokio::net::TcpStream::connect(front).await.unwrap();
+    let head = format!(
+        "GET /socket HTTP/1.1\r\nHost: {name}.{TEST_BASE}\r\n\
+         Connection: upgrade\r\nUpgrade: echo\r\n\r\n"
+    );
+    client.write_all(head.as_bytes()).await.unwrap();
+    let mut reply = Vec::new();
+    while !reply.ends_with(b"\r\n\r\n") {
+        let mut byte = [0_u8; 1];
+        client.read_exact(&mut byte).await.unwrap();
+        reply.push(byte[0]);
+    }
+    let reply = String::from_utf8(reply).unwrap();
+    assert!(reply.starts_with("HTTP/1.1 101"), "{reply}");
+    echo_once(&mut client).await;
+    client
+}
+
+async fn echo_once(client: &mut tokio::net::TcpStream) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    client.write_all(b"ping").await.unwrap();
+    let mut echoed = [0_u8; 4];
+    tokio::time::timeout(Duration::from_secs(5), client.read_exact(&mut echoed))
+        .await
+        .expect("the tunnel carries bytes")
+        .unwrap();
+    assert_eq!(&echoed, b"ping");
+}
+
+async fn assert_tunnel_closes(client: &mut tokio::net::TcpStream) {
+    use tokio::io::AsyncReadExt;
+    let mut byte = [0_u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(5), client.read(&mut byte))
+        .await
+        .expect("the proxy must end the tunnel");
+    assert!(matches!(read, Ok(0) | Err(_)), "{read:?}");
+}
+
+fn instance_at(upstream: SocketAddr, visibility: Visibility) -> Instance {
+    let mut instance = running_instance("box", visibility);
+    instance.address = upstream.ip().to_string();
+    instance.http_port = upstream.port();
+    instance
+}
+
+/// The upgrade request is authorized once, so the tunnel must be checked
+/// again: an owner who turns visibility off cuts the open connection
+/// (SPEC 9.2).
+#[tokio::test]
+async fn tunnel_ends_when_visibility_turns_off() {
+    let upstream = echo_upstream().await;
+    let source = Arc::new(SwitchSource(Mutex::new(instance_at(
+        upstream,
+        Visibility::Public,
+    ))));
+    let proxy = builder(source.clone())
+        .with_tunnel_revalidation(Duration::from_millis(50))
+        .build()
+        .unwrap();
+    let front = serve_front(Arc::new(proxy)).await;
+
+    let mut client = open_tunnel(front, "box").await;
+    // Still allowed after several checks.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    echo_once(&mut client).await;
+
+    source.0.lock().unwrap().visibility = Visibility::Off;
+    assert_tunnel_closes(&mut client).await;
+}
+
+/// A revoked session or a removed share cuts a private tunnel (SPEC 13).
+#[tokio::test]
+async fn tunnel_ends_when_access_is_revoked() {
+    let upstream = echo_upstream().await;
+    let source = Arc::new(SwitchSource(Mutex::new(instance_at(
+        upstream,
+        Visibility::Private,
+    ))));
+    let sessions = Arc::new(SwitchSessions(Mutex::new(Access::Granted)));
+    let proxy = builder(source)
+        .with_sessions(sessions.clone())
+        .with_tunnel_revalidation(Duration::from_millis(50))
+        .build()
+        .unwrap();
+    let front = serve_front(Arc::new(proxy)).await;
+
+    let mut client = open_tunnel(front, "box").await;
+    *sessions.0.lock().unwrap() = Access::Forbidden;
+    assert_tunnel_closes(&mut client).await;
+}
+
+/// The UUID is the key: a name that now belongs to another instance does
+/// not keep the old tunnel.
+#[tokio::test]
+async fn tunnel_ends_when_the_name_changes_hands() {
+    let upstream = echo_upstream().await;
+    let source = Arc::new(SwitchSource(Mutex::new(instance_at(
+        upstream,
+        Visibility::Public,
+    ))));
+    let proxy = builder(source.clone())
+        .with_tunnel_revalidation(Duration::from_millis(50))
+        .build()
+        .unwrap();
+    let front = serve_front(Arc::new(proxy)).await;
+
+    let mut client = open_tunnel(front, "box").await;
+    source.0.lock().unwrap().uuid = "uuid-other".to_owned();
+    assert_tunnel_closes(&mut client).await;
+}
+
+/// Shutdown ends a tunnel that no longer belongs to any connection task.
+#[tokio::test]
+async fn tunnel_ends_on_shutdown() {
+    let (inbound, _inbound_peer) = tokio::io::duplex(64);
+    let (outbound, _outbound_peer) = tokio::io::duplex(64);
+    let shutdown = CancellationToken::new();
+    let guard = TunnelGuard {
+        shutdown: Some(shutdown.clone()),
+        ..TunnelGuard::default()
+    };
+    let tunnel = tokio::spawn(run_tunnel(inbound, outbound, guard));
+    shutdown.cancel();
+    tokio::time::timeout(Duration::from_secs(5), tunnel)
+        .await
+        .expect("shutdown ends the tunnel")
+        .unwrap();
 }

@@ -10,6 +10,7 @@
 
 use std::error::Error as StdError;
 use std::fmt;
+use std::future::Future;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,6 +44,12 @@ const PRIVATE_KEY_FILE: &str = "certificate-key.pem";
 const DEFAULT_PROPAGATION_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const RENEW_BEFORE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const RETRY_AFTER_ERROR: Duration = Duration::from_secs(5 * 60);
+/// Each retry is a new ACME order, so a permanent failure must not reach the
+/// CA rate limits (SPEC 8). The retry delay doubles up to this cap.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(6 * 60 * 60);
+/// A hung HTTP call must not hold `issue_lock` or block startup for ever
+/// (SPEC 8). The DNS records are still cleaned up after the deadline.
+const ISSUE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 fn install_ring_provider() {
     // The HTTP clients use rustls without an implicit provider. Bento selects
@@ -119,6 +126,14 @@ pub trait DnsProvider: Send + Sync + fmt::Debug + 'static {
     async fn cleanup(&self, record: &DnsRecord) -> Result<(), ProviderError>;
 }
 
+/// Runs one ACME order and returns the certificate chain and the private key,
+/// both as PEM. `Manager` uses the real ACME flow unless a test supplies a
+/// fake, so the renewal logic runs without a CA.
+#[async_trait]
+trait Issuer: Send + Sync + 'static {
+    async fn issue(&self) -> Result<(String, String), Error>;
+}
+
 /// Returns the Cloudflare DNS provider. Use a scoped API token
 /// (`Zone.DNS:Write` on the one zone), never the global API key.
 pub fn cloudflare(api_token: impl Into<String>) -> Arc<dyn DnsProvider> {
@@ -180,6 +195,8 @@ pub enum Error {
     Acme(#[from] instant_acme::Error),
     #[error("tlscert: certificate: {0}")]
     Certificate(String),
+    #[error("tlscert: the certificate does not match the private key")]
+    KeyMismatch,
     #[error("tlscert: DNS provider: {0}")]
     Provider(#[source] ProviderError),
     #[error("tlscert: DNS cleanup failed: {0}")]
@@ -256,7 +273,6 @@ pub struct Manager {
 }
 
 struct ManagerInner {
-    base_domain: String,
     domains: Vec<String>,
     email: String,
     provider: Arc<dyn DnsProvider>,
@@ -266,6 +282,8 @@ struct ManagerInner {
     resolver: Arc<LiveResolver>,
     tls_config: Arc<ServerConfig>,
     expires_at: RwLock<Option<OffsetDateTime>>,
+    /// Replaces the ACME flow in tests.
+    issuer: Option<Arc<dyn Issuer>>,
     issue_lock: Mutex<()>,
     shutdown: CancellationToken,
 }
@@ -291,6 +309,10 @@ impl Manager {
     /// loaded immediately, but ACME issuance starts only with `manage` or
     /// `manage_sync`.
     pub fn new(config: Config) -> Result<Self, Error> {
+        Self::build(config, None)
+    }
+
+    fn build(config: Config, issuer: Option<Arc<dyn Issuer>>) -> Result<Self, Error> {
         install_ring_provider();
         let base_domain = config
             .base_domain
@@ -354,7 +376,6 @@ impl Manager {
         Ok(Self {
             inner: Arc::new(ManagerInner {
                 domains: domains(&base_domain, &instance_domain),
-                base_domain,
                 email: config.email,
                 provider,
                 storage_dir: config.storage_dir,
@@ -363,6 +384,7 @@ impl Manager {
                 resolver,
                 tls_config,
                 expires_at: RwLock::new(expires_at),
+                issuer,
                 issue_lock: Mutex::new(()),
                 shutdown: CancellationToken::new(),
             }),
@@ -376,16 +398,18 @@ impl Manager {
 
     /// Returns the shared server configuration for every proxy listener.
     /// Its live resolver observes renewals without rebuilding listeners. Only
-    /// TLS 1.2 and 1.3 are enabled, with ALPN preference `h2`, then
-    /// `http/1.1`.
+    /// TLS 1.2 and 1.3 are enabled, and ALPN offers `http/1.1` only because
+    /// the proxy speaks HTTP/1.
     pub fn tls_config(&self) -> Arc<ServerConfig> {
         self.inner.tls_config.clone()
     }
 
     /// Obtains a certificate when absent or near expiry, then keeps renewing
     /// until `cancellation` or [`Manager::close`] fires. The returned task
-    /// logs transient errors and retries. Cancellation lets an in-flight
-    /// issuance finish so its DNS record is always cleaned up.
+    /// logs transient errors and retries with a growing delay. Cancellation
+    /// lets an in-flight issuance finish so its DNS record is always cleaned
+    /// up. Without this task a long-lived process lets its certificate
+    /// expire (SPEC 8).
     pub fn manage(&self, cancellation: CancellationToken) -> JoinHandle<()> {
         let manager = self.clone();
         tokio::spawn(async move { manager.renewal_loop(cancellation).await })
@@ -397,12 +421,40 @@ impl Manager {
         self.ensure_certificate().await
     }
 
+    /// Like [`Manager::manage_sync`], but a failed renewal is only logged
+    /// while the loaded certificate has not expired: a restart during a DNS
+    /// or CA outage must not take the proxy down (SPEC 8). The renewal task
+    /// from [`Manager::manage`] retries. With no usable certificate the
+    /// error is returned.
+    pub async fn manage_sync_tolerant(&self) -> Result<(), Error> {
+        match self.ensure_certificate().await {
+            Err(error) if self.has_valid_certificate() => {
+                tracing::error!(
+                    %error,
+                    "certificate renewal failed; serving the certificate that is still valid"
+                );
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    /// Returns true when a loaded certificate has not expired.
+    pub fn has_valid_certificate(&self) -> bool {
+        self.inner
+            .expires_at
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some_and(|expiry| expiry > OffsetDateTime::now_utc())
+    }
+
     /// Stops background renewal tasks created by this manager.
     pub fn close(&self) {
         self.inner.shutdown.cancel();
     }
 
     async fn renewal_loop(&self, cancellation: CancellationToken) {
+        let mut failures: u32 = 0;
         loop {
             if cancellation.is_cancelled() || self.inner.shutdown.is_cancelled() {
                 return;
@@ -410,10 +462,18 @@ impl Manager {
             let delay = match self.renewal_delay() {
                 Some(delay) if !delay.is_zero() => delay,
                 _ => match self.ensure_certificate().await {
-                    Ok(()) => self.renewal_delay().unwrap_or(RETRY_AFTER_ERROR),
+                    Ok(()) => {
+                        failures = 0;
+                        // A certificate that is already inside the renewal
+                        // window would order again at once; keep a floor.
+                        self.renewal_delay()
+                            .filter(|delay| !delay.is_zero())
+                            .unwrap_or(RETRY_AFTER_ERROR)
+                    }
                     Err(error) => {
                         tracing::error!(%error, "certificate issuance or renewal failed");
-                        RETRY_AFTER_ERROR
+                        failures = failures.saturating_add(1);
+                        retry_delay(failures)
                     }
                 },
             };
@@ -462,18 +522,13 @@ impl Manager {
     }
 
     async fn issue(&self) -> Result<(String, String), Error> {
-        let account = self.load_or_create_account().await?;
-        let identifiers = self
-            .inner
-            .domains
-            .iter()
-            .cloned()
-            .map(Identifier::Dns)
-            .collect::<Vec<_>>();
-        let mut order = account.new_order(&NewOrder::new(&identifiers)).await?;
+        if let Some(issuer) = &self.inner.issuer {
+            return issuer.issue().await;
+        }
         let mut records = Vec::new();
-
-        let result = self.complete_order(&mut order, &mut records).await;
+        // The deadline covers the order only. The records are cleaned up
+        // after it, so a timeout never leaves a TXT record behind.
+        let result = within(ISSUE_TIMEOUT, "ACME order", self.order(&mut records)).await;
         let cleanup = self.cleanup_records(&records).await;
         match (result, cleanup) {
             (Ok(certificate), Ok(())) => Ok(certificate),
@@ -483,6 +538,19 @@ impl Manager {
                 "{cleanup}; issuance also failed: {error}"
             ))),
         }
+    }
+
+    async fn order(&self, records: &mut Vec<DnsRecord>) -> Result<(String, String), Error> {
+        let account = self.load_or_create_account().await?;
+        let identifiers = self
+            .inner
+            .domains
+            .iter()
+            .cloned()
+            .map(Identifier::Dns)
+            .collect::<Vec<_>>();
+        let mut order = account.new_order(&NewOrder::new(&identifiers)).await?;
+        self.complete_order(&mut order, records).await
     }
 
     async fn complete_order(
@@ -510,14 +578,20 @@ impl Manager {
                 .ok_or_else(|| {
                     Error::Certificate("ACME server offered no DNS-01 challenge".into())
                 })?;
+            // Each authorization proves one domain, and the TXT record
+            // belongs under that domain. The instance domain can differ
+            // from the base domain (SPEC 8), so the name comes from the
+            // authorization and not from `base_domain`.
+            let Identifier::Dns(domain) = challenge.identifier().identifier else {
+                return Err(Error::Certificate(
+                    "ACME authorization is not for a DNS name".into(),
+                ));
+            };
+            let name = challenge_record_name(domain);
             let record = self
                 .inner
                 .provider
-                .present(
-                    &self.inner.base_domain,
-                    &format!("_acme-challenge.{}", self.inner.base_domain),
-                    &challenge.key_authorization().dns_value(),
-                )
+                .present(domain, &name, &challenge.key_authorization().dns_value())
                 .await
                 .map_err(Error::Provider)?;
             records.push(record);
@@ -608,6 +682,34 @@ impl Manager {
     }
 }
 
+/// The name of the DNS-01 TXT record for an authorized domain. ACME reports a
+/// wildcard authorization under the bare name, so `*.example.org` and
+/// `example.org` share one record name (RFC 8555 8.4).
+fn challenge_record_name(domain: &str) -> String {
+    format!("_acme-challenge.{}", domain.trim_start_matches("*."))
+}
+
+/// Returns the delay before retry number `failures` (1 for the first
+/// failure): 5 minutes, doubling, capped at [`MAX_RETRY_DELAY`].
+fn retry_delay(failures: u32) -> Duration {
+    let doublings = failures.saturating_sub(1).min(16);
+    (RETRY_AFTER_ERROR * 2u32.pow(doublings)).min(MAX_RETRY_DELAY)
+}
+
+async fn within<T>(
+    limit: Duration,
+    what: &str,
+    future: impl Future<Output = Result<T, Error>>,
+) -> Result<T, Error> {
+    tokio::time::timeout(limit, future)
+        .await
+        .unwrap_or_else(|_| {
+            Err(Error::Certificate(format!(
+                "{what} timed out after {limit:?}"
+            )))
+        })
+}
+
 #[derive(Debug)]
 struct LiveResolver {
     key: RwLock<Option<Arc<CertifiedKey>>>,
@@ -652,11 +754,27 @@ fn load_certificate(storage_dir: &Path) -> Result<Option<LoadedCertificate>, Err
                 .map_err(|_| Error::Certificate("stored certificate is not UTF-8 PEM".into()))?;
             let private_key = String::from_utf8(private_key)
                 .map_err(|_| Error::Certificate("stored private key is not UTF-8 PEM".into()))?;
-            parse_certificate(&certificate, &private_key).map(Some)
+            match parse_certificate(&certificate, &private_key) {
+                Err(Error::KeyMismatch) => {
+                    // A crash between the two writes in `ensure_certificate`
+                    // leaves a key and a certificate from different orders.
+                    // Issuing a new pair repairs it; failing here would
+                    // fail every start (SPEC 8).
+                    tracing::warn!(
+                        "stored certificate and private key do not match; ignoring both and issuing a new certificate"
+                    );
+                    Ok(None)
+                }
+                result => result.map(Some),
+            }
         }
-        _ => Err(Error::Certificate(
-            "stored certificate and private key are incomplete".to_string(),
-        )),
+        // The same crash window, on the first issuance: only the key exists.
+        (None, Some(_)) | (Some(_), None) => {
+            tracing::warn!(
+                "stored certificate and private key are incomplete; issuing a new certificate"
+            );
+            Ok(None)
+        }
     }
 }
 
@@ -676,7 +794,14 @@ fn parse_certificate(
         .ok_or_else(|| Error::Certificate("private key PEM contains no private key".into()))?;
     let provider = rustls::crypto::ring::default_provider();
     let key = CertifiedKey::from_der(certificates, private_key, &provider).map_err(|error| {
-        Error::Certificate(format!("load certificate and private key: {error}"))
+        if matches!(
+            error,
+            rustls::Error::InconsistentKeys(rustls::InconsistentKeys::KeyMismatch)
+        ) {
+            Error::KeyMismatch
+        } else {
+            Error::Certificate(format!("load certificate and private key: {error}"))
+        }
     })?;
     Ok(LoadedCertificate {
         key: Arc::new(key),
@@ -691,7 +816,10 @@ fn make_tls_config(resolver: Arc<LiveResolver>) -> Result<ServerConfig, Error> {
         .map_err(|error| Error::Certificate(format!("configure TLS versions: {error}")))?
         .with_no_client_auth()
         .with_cert_resolver(resolver);
-    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    // The proxy serves HTTP/1 only (`bento-proxy` runs hyper's HTTP/1
+    // connection). Offering `h2` would let a browser negotiate a protocol
+    // that the server cannot speak.
+    config.alpn_protocols = vec![b"http/1.1".to_vec()];
     Ok(config)
 }
 
@@ -733,10 +861,205 @@ mod tests {
     use rcgen::{CertificateParams, KeyPair, date_time_ymd};
     use tempfile::TempDir;
 
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::{
-        CERTIFICATE_FILE, Config, DnsProvider, DnsRecord, Manager, PRIVATE_KEY_FILE, ProviderError,
-        cloudflare, domains, storage,
+        CERTIFICATE_FILE, CancellationToken, Config, DnsProvider, DnsRecord, Error, Issuer,
+        MAX_RETRY_DELAY, Manager, PRIVATE_KEY_FILE, ProviderError, RETRY_AFTER_ERROR, cloudflare,
+        domains, retry_delay, storage, within,
     };
+
+    /// Returns a self-signed certificate and its key as PEM, with `days`
+    /// left until expiry.
+    fn pem_pair(days: i64) -> (String, String) {
+        let key = KeyPair::generate().unwrap();
+        let mut params =
+            CertificateParams::new(domains("bento.example.org", "bento.example.org")).unwrap();
+        params.not_after = time::OffsetDateTime::now_utc() + time::Duration::days(days);
+        let certificate = params.self_signed(&key).unwrap();
+        (certificate.pem(), key.serialize_pem())
+    }
+
+    fn persist(directory: &TempDir, certificate: &str, key: &str) {
+        storage::atomic_write(&directory.path().join(PRIVATE_KEY_FILE), key.as_bytes()).unwrap();
+        storage::atomic_write(
+            &directory.path().join(CERTIFICATE_FILE),
+            certificate.as_bytes(),
+        )
+        .unwrap();
+    }
+
+    /// Stands in for the ACME order: it issues a certificate with `days`
+    /// left, or fails.
+    struct FakeIssuer {
+        days: i64,
+        fail: bool,
+        calls: AtomicUsize,
+    }
+
+    impl FakeIssuer {
+        fn new(days: i64, fail: bool) -> Arc<Self> {
+            Arc::new(Self {
+                days,
+                fail,
+                calls: AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Issuer for FakeIssuer {
+        async fn issue(&self) -> Result<(String, String), Error> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.fail {
+                return Err(Error::Certificate("the CA is unreachable".into()));
+            }
+            Ok(pem_pair(self.days))
+        }
+    }
+
+    fn manager_with(config: Config, issuer: &Arc<FakeIssuer>) -> Manager {
+        Manager::build(config, Some(issuer.clone())).unwrap()
+    }
+
+    /// A renewal task must run next to the proxy, or a long-lived process
+    /// lets its certificate expire (SPEC 8).
+    #[tokio::test]
+    async fn renewal_loop_replaces_a_certificate_inside_the_window() {
+        let (directory, config) = valid_config();
+        let (certificate, key) = pem_pair(10);
+        persist(&directory, &certificate, &key);
+        let issuer = FakeIssuer::new(90, false);
+        let manager = manager_with(config, &issuer);
+        let before = manager.inner.resolver.key.read().unwrap().clone().unwrap();
+        // Ten days left is inside the 30-day window.
+        assert!(manager.renewal_delay().unwrap().is_zero());
+
+        let cancellation = CancellationToken::new();
+        let task = manager.manage(cancellation.clone());
+        for _ in 0..500 {
+            if issuer.calls.load(Ordering::SeqCst) > 0
+                && manager
+                    .renewal_delay()
+                    .is_some_and(|delay| delay > Duration::from_secs(30 * 24 * 60 * 60))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(issuer.calls.load(Ordering::SeqCst), 1);
+        assert!(manager.renewal_delay().unwrap() > Duration::from_secs(30 * 24 * 60 * 60));
+        let after = manager.inner.resolver.key.read().unwrap().clone().unwrap();
+        assert_ne!(before.cert, after.cert);
+
+        cancellation.cancel();
+        task.await.unwrap();
+    }
+
+    /// A restart during a DNS or CA outage keeps serving a certificate that
+    /// is still valid (SPEC 8).
+    #[tokio::test]
+    async fn startup_serves_a_valid_certificate_when_renewal_fails() {
+        let (directory, config) = valid_config();
+        let (certificate, key) = pem_pair(5);
+        persist(&directory, &certificate, &key);
+        let issuer = FakeIssuer::new(90, true);
+        let manager = manager_with(config, &issuer);
+
+        assert!(manager.has_valid_certificate());
+        assert!(manager.manage_sync().await.is_err());
+        manager.manage_sync_tolerant().await.unwrap();
+        assert!(manager.has_valid_certificate());
+        assert!(manager.inner.resolver.key.read().unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn startup_fails_when_issuance_fails_and_no_certificate_exists() {
+        let (_directory, config) = valid_config();
+        let issuer = FakeIssuer::new(90, true);
+        let manager = manager_with(config, &issuer);
+
+        assert!(!manager.has_valid_certificate());
+        assert!(manager.manage_sync_tolerant().await.is_err());
+    }
+
+    /// A crash between the key write and the certificate write leaves a
+    /// mismatched pair. The manager must start and issue a new one (SPEC 8).
+    #[tokio::test]
+    async fn mismatched_key_and_certificate_count_as_no_certificate() {
+        let (directory, config) = valid_config();
+        let (certificate, _) = pem_pair(60);
+        let (_, other_key) = pem_pair(60);
+        persist(&directory, &certificate, &other_key);
+        let issuer = FakeIssuer::new(90, false);
+        let manager = manager_with(config, &issuer);
+
+        assert!(!manager.has_valid_certificate());
+        manager.manage_sync_tolerant().await.unwrap();
+        assert_eq!(issuer.calls.load(Ordering::SeqCst), 1);
+        assert!(manager.has_valid_certificate());
+    }
+
+    #[test]
+    fn a_key_without_a_certificate_counts_as_no_certificate() {
+        let (directory, config) = valid_config();
+        let (_, key) = pem_pair(60);
+        storage::atomic_write(&directory.path().join(PRIVATE_KEY_FILE), key.as_bytes()).unwrap();
+        let manager = Manager::new(config).unwrap();
+        assert!(!manager.has_valid_certificate());
+    }
+
+    /// Each authorization needs its TXT record under its own domain, so a
+    /// wildcard for an instance domain that differs from the base domain is
+    /// not validated against the base domain's name.
+    #[test]
+    fn challenge_record_follows_the_authorized_domain() {
+        // ACME reports `*.example.org` as the bare name `example.org`.
+        assert_eq!(
+            super::challenge_record_name("example.org"),
+            "_acme-challenge.example.org"
+        );
+        assert_eq!(
+            super::challenge_record_name("bento.example.org"),
+            "_acme-challenge.bento.example.org"
+        );
+        // A subject written with its wildcard maps to the same record.
+        for (base, instance) in [
+            ("bento.example.org", "bento.example.org"),
+            ("bento.example.org", "example.org"),
+            ("bento.example.org", "example.net"),
+        ] {
+            let names = domains(base, instance)
+                .iter()
+                .map(|subject| super::challenge_record_name(subject))
+                .collect::<Vec<_>>();
+            assert!(names.contains(&format!("_acme-challenge.{instance}")));
+            assert!(names.contains(&format!("_acme-challenge.{base}")));
+        }
+    }
+
+    #[test]
+    fn retry_delay_doubles_up_to_a_cap() {
+        let minutes = |count: u64| Duration::from_secs(count * 60);
+        assert_eq!(retry_delay(1), RETRY_AFTER_ERROR);
+        assert_eq!(retry_delay(2), minutes(10));
+        assert_eq!(retry_delay(3), minutes(20));
+        assert_eq!(retry_delay(4), minutes(40));
+        assert_eq!(retry_delay(7), minutes(320));
+        assert_eq!(retry_delay(8), MAX_RETRY_DELAY);
+        assert_eq!(retry_delay(u32::MAX), MAX_RETRY_DELAY);
+    }
+
+    #[tokio::test]
+    async fn an_order_that_hangs_hits_the_deadline() {
+        let result = within(
+            Duration::from_millis(20),
+            "ACME order",
+            std::future::pending::<Result<(), Error>>(),
+        )
+        .await;
+        assert!(result.unwrap_err().to_string().contains("timed out"));
+    }
 
     #[derive(Debug)]
     struct FakeProvider;
@@ -860,13 +1183,10 @@ mod tests {
     }
 
     #[test]
-    fn tls_config_has_required_alpn_order() {
+    fn tls_config_offers_only_the_protocol_the_proxy_speaks() {
         let (_directory, config) = valid_config();
         let manager = Manager::new(config).unwrap();
-        assert_eq!(
-            manager.tls_config().alpn_protocols,
-            [b"h2".to_vec(), b"http/1.1".to_vec()]
-        );
+        assert_eq!(manager.tls_config().alpn_protocols, [b"http/1.1".to_vec()]);
     }
 
     #[test]
