@@ -10,7 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 
-use crate::{Envelope, Fence, Host, Outcome, serve_one};
+use crate::{Envelope, Fence, Host, HostError, Outcome, serve_one};
 
 #[derive(Clone)]
 struct RunnerState {
@@ -37,7 +37,17 @@ async fn rpc(
         Err(_) => return StatusCode::BAD_REQUEST.into_response(),
     };
 
-    match serve_one(&state.fence, state.host.as_ref(), envelope).await {
+    // The work runs in its own task. The controller drops a request on a
+    // timeout, and axum then drops this future; a change cut off between
+    // the host act and its record would leak files or run again on the
+    // retry (MULTI-NODE 11.3, 14.2).
+    let task =
+        tokio::spawn(async move { serve_one(&state.fence, state.host.as_ref(), envelope).await });
+    let served = match task.await {
+        Ok(served) => served,
+        Err(error) => Err(HostError::new(format!("the request task failed: {error}"))),
+    };
+    match served {
         Ok(Outcome::Done(reply)) => (StatusCode::OK, Json(reply)).into_response(),
         Ok(Outcome::Replayed(recorded)) => Response::builder()
             .status(StatusCode::OK)
@@ -225,5 +235,111 @@ mod tests {
     async fn malformed_json_returns_bad_request() {
         let response = post("{not json").await;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    /// A host whose start waits for a release, so a test can drop the
+    /// request while the host acts.
+    struct Gated {
+        gate: tokio::sync::Notify,
+        finished: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl Host for Gated {
+        async fn health(&self) -> Result<Health, HostError> {
+            FakeHost.health().await
+        }
+        async fn capabilities(&self) -> Result<Capabilities, HostError> {
+            FakeHost.capabilities().await
+        }
+        async fn sample(&self) -> Result<crate::Samples, HostError> {
+            FakeHost.sample().await
+        }
+        async fn ensure_image(&self, i: &crate::ImageRequest) -> Result<crate::Reply, HostError> {
+            FakeHost.ensure_image(i).await
+        }
+        async fn provision(&self, p: &crate::ProvisionRequest) -> Result<crate::Reply, HostError> {
+            FakeHost.provision(p).await
+        }
+        async fn apply_network(
+            &self,
+            n: &bento_network::MachineNetwork,
+        ) -> Result<crate::Reply, HostError> {
+            FakeHost.apply_network(n).await
+        }
+        async fn start(&self, _: &InstanceRef) -> Result<bento_types::State, HostError> {
+            self.gate.notified().await;
+            self.finished
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(bento_types::State::Running)
+        }
+        async fn stop(&self, i: &InstanceRef) -> Result<bento_types::State, HostError> {
+            FakeHost.stop(i).await
+        }
+        async fn reboot(&self, i: &InstanceRef) -> Result<bento_types::State, HostError> {
+            FakeHost.reboot(i).await
+        }
+        async fn remove(&self, i: &InstanceRef) -> Result<bento_types::State, HostError> {
+            FakeHost.remove(i).await
+        }
+        async fn redefine(&self, r: &RedefineRequest) -> Result<bento_types::State, HostError> {
+            FakeHost.redefine(r).await
+        }
+        async fn resize_disk(
+            &self,
+            i: &InstanceRef,
+            g: u64,
+        ) -> Result<bento_types::State, HostError> {
+            FakeHost.resize_disk(i, g).await
+        }
+        async fn inventory(&self) -> Result<Inventory, HostError> {
+            FakeHost.inventory().await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_change_finishes_and_is_recorded_when_the_controller_goes_away() {
+        // The controller drops a request on a timeout. The host act and
+        // its record must not stop half-way (MULTI-NODE 11.3).
+        let at = OffsetDateTime::UNIX_EPOCH + Duration::from_secs(1_000);
+        let fence = Arc::new(
+            Fence::new(MACHINE, Box::new(SqliteFence::in_memory().unwrap())).with_clock(move || at),
+        );
+        let host = Arc::new(Gated {
+            gate: tokio::sync::Notify::new(),
+            finished: std::sync::atomic::AtomicBool::new(false),
+        });
+        let app = router(fence.clone(), host.clone());
+
+        let mut change = envelope(MACHINE);
+        change.request_id = "request-gone".into();
+        change.object = Some(crate::ObjectFence {
+            object_id: "uuid-web".into(),
+            generation: 1,
+            digest: "digest-a".into(),
+        });
+        change.op = Operation::StartInstance {
+            instance: InstanceRef {
+                uuid: "uuid-web".into(),
+                name: "web".into(),
+            },
+        };
+        let request = Request::post("/rpc")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&change).unwrap()))
+            .unwrap();
+
+        let gone = tokio::time::timeout(Duration::from_millis(100), app.oneshot(request)).await;
+        assert!(gone.is_err(), "the host must still be waiting");
+
+        host.gate.notify_one();
+        for _ in 0..100 {
+            if fence.outcome("request-gone").unwrap().is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(host.finished.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(fence.outcome("request-gone").unwrap().is_some());
     }
 }

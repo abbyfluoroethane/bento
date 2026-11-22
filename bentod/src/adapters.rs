@@ -1244,6 +1244,17 @@ impl bento_sshfront::Starter for Starter {
     }
 }
 
+/// Restores the instances of one runner through the lifecycle manager
+/// (MULTI-NODE 14.3).
+pub(crate) struct RunnerRestore(pub(crate) Arc<bento_lifecycle::Manager>);
+
+#[async_trait]
+impl crate::runners::HostRestore for RunnerRestore {
+    async fn restore_host(&self, host_id: i64) -> anyhow::Result<()> {
+        Ok(self.0.restore_host(host_id).await?)
+    }
+}
+
 /// The web terminal (SPEC 14.6) takes the SSH frontend's own path to the
 /// guest, so the two cannot drift: the same start, the same wait for sshd,
 /// the same frontend key, and the same join (SPEC 10 steps 7 to 10).

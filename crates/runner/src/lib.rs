@@ -18,7 +18,7 @@ pub mod server;
 pub mod store;
 
 pub use client::{ClientError, RunnerClient};
-pub use fence::{Admission, Fence, FenceStore};
+pub use fence::{Admission, Fence, FenceStore, ObjectGuard};
 pub use protocol::{
     Capabilities, CpuTimeSample, Domain, DomainUsage, Envelope, Health, HostSample, ImageRequest,
     InstanceRef, Inventory, ObjectFence, Operation, PROTOCOL_VERSION, ProvisionRequest,
@@ -87,6 +87,12 @@ pub async fn serve_one(
     host: &dyn Host,
     envelope: Envelope,
 ) -> Result<Outcome, HostError> {
+    // One change at a time for each object, from admission to the record
+    // of its outcome (MULTI-NODE 11.3). A read has no object to wait for.
+    let _guard = match (&envelope.object, envelope.op.mutates()) {
+        (Some(object), true) => Some(fence.lock_object(&object.object_id).await),
+        _ => None,
+    };
     match fence.admit(&envelope).map_err(HostError::new)? {
         Admission::Refused(refusal) => Ok(Outcome::Refused(refusal)),
         Admission::AlreadyDone(recorded) => Ok(Outcome::Replayed(recorded)),

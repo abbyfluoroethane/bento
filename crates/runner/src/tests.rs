@@ -559,3 +559,160 @@ fn the_envelope_is_json_both_ways() {
         "an envelope must survive the wire unchanged"
     );
 }
+
+/// A host that logs when a change starts and ends. `stop` waits for a
+/// release and `start` takes a moment, so overlap would show in the log.
+struct Recording {
+    log: std::sync::Mutex<Vec<&'static str>>,
+    stop_gate: tokio::sync::Notify,
+}
+
+impl Recording {
+    fn new() -> Self {
+        Recording {
+            log: Default::default(),
+            stop_gate: tokio::sync::Notify::new(),
+        }
+    }
+    fn note(&self, what: &'static str) {
+        self.log.lock().unwrap().push(what);
+    }
+    fn log(&self) -> Vec<&'static str> {
+        self.log.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl Host for Recording {
+    async fn health(&self) -> Result<Health, HostError> {
+        FakeHost.health().await
+    }
+    async fn capabilities(&self) -> Result<Capabilities, HostError> {
+        FakeHost.capabilities().await
+    }
+    async fn inventory(&self) -> Result<Inventory, HostError> {
+        FakeHost.inventory().await
+    }
+    async fn sample(&self) -> Result<crate::Samples, HostError> {
+        FakeHost.sample().await
+    }
+    async fn ensure_image(&self, i: &crate::ImageRequest) -> Result<crate::Reply, HostError> {
+        FakeHost.ensure_image(i).await
+    }
+    async fn provision(&self, p: &crate::ProvisionRequest) -> Result<crate::Reply, HostError> {
+        FakeHost.provision(p).await
+    }
+    async fn apply_network(
+        &self,
+        n: &bento_network::MachineNetwork,
+    ) -> Result<crate::Reply, HostError> {
+        FakeHost.apply_network(n).await
+    }
+    async fn start(&self, _: &InstanceRef) -> Result<bento_types::State, HostError> {
+        self.note("start begins");
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        self.note("start ends");
+        Ok(bento_types::State::Running)
+    }
+    async fn stop(&self, _: &InstanceRef) -> Result<bento_types::State, HostError> {
+        self.note("stop begins");
+        self.stop_gate.notified().await;
+        self.note("stop ends");
+        Ok(bento_types::State::Stopped)
+    }
+    async fn reboot(&self, i: &InstanceRef) -> Result<bento_types::State, HostError> {
+        FakeHost.reboot(i).await
+    }
+    async fn remove(&self, i: &InstanceRef) -> Result<bento_types::State, HostError> {
+        FakeHost.remove(i).await
+    }
+    async fn redefine(&self, r: &RedefineRequest) -> Result<bento_types::State, HostError> {
+        FakeHost.redefine(r).await
+    }
+    async fn resize_disk(&self, i: &InstanceRef, g: u64) -> Result<bento_types::State, HostError> {
+        FakeHost.resize_disk(i, g).await
+    }
+}
+
+#[tokio::test]
+async fn two_changes_to_one_object_run_one_after_the_other() {
+    // Admission records the generation before the host acts. Without a
+    // lock for the object, a stop at generation 5 and a start at 6 would
+    // run together and the last state would depend on timing
+    // (MULTI-NODE 11.3).
+    let fence = fence();
+    let host = Recording::new();
+    let mut stop = change(5, "digest-stop", "r-stop");
+    stop.op = Operation::StopInstance {
+        instance: instance(),
+    };
+    let start = change(6, "digest-start", "r-start");
+
+    let both = async {
+        tokio::join!(
+            serve_one(&fence, &host, stop),
+            serve_one(&fence, &host, start)
+        )
+    };
+    let release = async {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            host.log(),
+            vec!["stop begins"],
+            "the start must wait for the stop"
+        );
+        host.stop_gate.notify_one();
+    };
+    let ((first, second), ()) = tokio::join!(both, release);
+    first.unwrap();
+    second.unwrap();
+    assert_eq!(
+        host.log(),
+        vec!["stop begins", "stop ends", "start begins", "start ends"]
+    );
+    assert_eq!(fence.locked_objects(), 0, "a finished object keeps no lock");
+}
+
+#[tokio::test]
+async fn one_request_id_delivered_twice_at_once_runs_one_time() {
+    let fence = fence();
+    let host = Recording::new();
+    let request = change(1, "digest-a", "r-twice");
+
+    let (first, second) = tokio::join!(
+        serve_one(&fence, &host, request.clone()),
+        serve_one(&fence, &host, request)
+    );
+    let outcomes = [first.unwrap(), second.unwrap()];
+
+    assert_eq!(host.log(), vec!["start begins", "start ends"]);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|o| matches!(o, Outcome::Replayed(_)))
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn changes_to_different_objects_do_not_wait_for_each_other() {
+    let fence = fence();
+    let host = Recording::new();
+    let mut stop = change(1, "digest-stop", "r-stop");
+    stop.op = Operation::StopInstance {
+        instance: instance(),
+    };
+    let mut other = change(1, "digest-a", "r-other");
+    other.object.as_mut().unwrap().object_id = "uuid-db".into();
+
+    // The stop never ends until released; the other object must finish.
+    let stopped = serve_one(&fence, &host, stop);
+    tokio::pin!(stopped);
+    tokio::select! {
+        _ = &mut stopped => panic!("the stop is gated"),
+        done = serve_one(&fence, &host, other) => { done.unwrap(); }
+    }
+    host.stop_gate.notify_one();
+    stopped.await.unwrap();
+}

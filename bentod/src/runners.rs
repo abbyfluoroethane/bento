@@ -18,6 +18,13 @@ use tokio::task::JoinSet;
 /// How often the controller checks each configured runner (MULTI-NODE 20).
 pub(crate) const INTERVAL: Duration = Duration::from_secs(30);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long an acknowledged network apply counts as current. Kernel state
+/// can change with no restart: a flushed ruleset, a deleted route, a
+/// destroyed bridge. Applying is idempotent, so after this bound the
+/// controller sends again even when the digest is the same, as it does
+/// for its own machine on every tick (MULTI-NODE 8.2).
+const NETWORK_RESEND_AFTER: Duration = Duration::from_secs(5 * 60);
 pub(crate) const IMAGE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
 /// The network seam for one runner call. Tests use an in-memory fake.
@@ -200,6 +207,22 @@ fn preferred_version(image: &Image, held: &[(String, String)]) -> Option<String>
         .map(|(_, checksum)| checksum.clone())
 }
 
+/// What `NetworkSync` did for one machine.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Applied {
+    /// The machine acknowledged an apply.
+    Sent,
+    /// Nothing was sent: the same state was acknowledged a short time ago.
+    Unchanged,
+}
+
+/// Restores the instances of one runner after a restart (MULTI-NODE 14.3).
+/// Tests use a recording fake.
+#[async_trait]
+pub(crate) trait HostRestore: Send + Sync {
+    async fn restore_host(&self, host_id: i64) -> Result<()>;
+}
+
 /// Sends each machine the network it should have (MULTI-NODE 8).
 ///
 /// The state is a full description, not a set of increments, and applying
@@ -216,10 +239,12 @@ pub(crate) struct NetworkSync {
     /// The machine running the frontends. Every other machine permits it
     /// to reach a guest's published ports (MULTI-NODE 8.4).
     controller_host_id: i64,
-    /// The last state each machine acknowledged, by digest. It saves a
-    /// call and a log line when nothing changed; it is not correctness,
-    /// because applying the same state again is harmless.
-    applied: Arc<Mutex<HashMap<i64, String>>>,
+    /// The last state each machine acknowledged, by digest, and when. It
+    /// saves a call and a log line when nothing changed; it is not
+    /// correctness, because applying the same state again is harmless.
+    /// An entry older than [`NETWORK_RESEND_AFTER`] is not trusted.
+    applied: Arc<Mutex<HashMap<i64, (String, std::time::Instant)>>>,
+    clock: Arc<dyn Fn() -> std::time::Instant + Send + Sync>,
     /// The last kernel boot ID each machine reported (MULTI-NODE 8.2).
     boots: Arc<Mutex<HashMap<i64, String>>>,
     request_timeout: Duration,
@@ -241,6 +266,7 @@ impl NetworkSync {
             high_ports,
             controller_host_id,
             applied: Arc::new(Mutex::new(HashMap::new())),
+            clock: Arc::new(std::time::Instant::now),
             boots: Arc::new(Mutex::new(HashMap::new())),
             request_timeout: REQUEST_TIMEOUT,
         }
@@ -255,18 +281,23 @@ impl NetworkSync {
     /// new boot ID is the evidence of the restart, so it drops the cached
     /// digest and the next sync resends (MULTI-NODE 8.2). An empty ID
     /// means the runner does not report one, so nothing is inferred.
-    pub(crate) async fn note_boot(&self, host_id: i64, boot_id: &str) {
+    ///
+    /// Returns true when the ID differs from the last known one. The
+    /// caller then restores the runner's instances (MULTI-NODE 14.3).
+    pub(crate) async fn note_boot(&self, host_id: i64, boot_id: &str) -> bool {
         if boot_id.is_empty() {
-            return;
+            return false;
         }
         let previous = self.boots.lock().await.insert(host_id, boot_id.to_owned());
-        if previous.is_some_and(|previous| previous != boot_id) {
+        let changed = previous.is_some_and(|previous| previous != boot_id);
+        if changed {
             self.applied.lock().await.remove(&host_id);
             tracing::info!(
                 runner_id = host_id,
                 "runner rebooted, so its network is resent"
             );
         }
+        changed
     }
 
     #[cfg(test)]
@@ -275,8 +306,66 @@ impl NetworkSync {
         self
     }
 
-    /// Brings one machine's network to what the database says it is.
-    pub(crate) async fn sync_host(&self, host: &Host) -> Result<()> {
+    #[cfg(test)]
+    fn with_clock(
+        mut self,
+        clock: impl Fn() -> std::time::Instant + Send + Sync + 'static,
+    ) -> Self {
+        self.clock = Arc::new(clock);
+        self
+    }
+
+    /// Brings one machine's network to what the database says it is, and
+    /// records whether that worked (MULTI-NODE 15).
+    ///
+    /// Returns true when the machine's network is converged: the apply
+    /// worked, or it was skipped because the last apply of the same state
+    /// worked. A skipped send writes no result, so it never clears an
+    /// error. A failed apply writes the error, and it also drops the
+    /// cached digest, so the next tick sends again.
+    pub(crate) async fn converge(&self, host: &Host) -> bool {
+        match self.sync_host(host).await {
+            Ok(Applied::Unchanged) => true,
+            Ok(Applied::Sent) => {
+                self.record(host, Ok(())).await;
+                true
+            }
+            Err(error) => {
+                tracing::warn!(
+                    runner_id = host.id,
+                    runner = %host.name,
+                    %error,
+                    "runner network sync failed"
+                );
+                self.record(host, Err(format!("{error:#}"))).await;
+                false
+            }
+        }
+    }
+
+    /// A failure to write the result is logged and nothing more: the poll
+    /// must go on.
+    async fn record(&self, host: &Host, result: std::result::Result<(), String>) {
+        if let Err(error) = self.store.record_network_result(host.id, result).await {
+            tracing::warn!(
+                runner_id = host.id,
+                runner = %host.name,
+                %error,
+                "could not record the network result"
+            );
+        }
+    }
+
+    async fn sync_host(&self, host: &Host) -> Result<Applied> {
+        let result = self.apply(host).await;
+        if result.is_err() {
+            // The digest of a failed send must not count as sent.
+            self.applied.lock().await.remove(&host.id);
+        }
+        result
+    }
+
+    async fn apply(&self, host: &Host) -> Result<Applied> {
         if host.machine_id.is_none() {
             anyhow::bail!("runner {} has not reported its machine identity", host.name);
         }
@@ -294,8 +383,17 @@ impl NetworkSync {
 
         let body = serde_json::to_string(&network)?;
         let digest = digest_of(&body);
-        if self.applied.lock().await.get(&host.id) == Some(&digest) {
-            return Ok(());
+        let now = (self.clock)();
+        if self
+            .applied
+            .lock()
+            .await
+            .get(&host.id)
+            .is_some_and(|(applied, at)| {
+                *applied == digest && now.saturating_duration_since(*at) < NETWORK_RESEND_AFTER
+            })
+        {
+            return Ok(Applied::Unchanged);
         }
 
         let current = self.lease.borrow().clone();
@@ -322,7 +420,10 @@ impl NetworkSync {
         else {
             anyhow::bail!("runner answered {reply:?} to a network request");
         };
-        self.applied.lock().await.insert(host.id, digest);
+        self.applied
+            .lock()
+            .await
+            .insert(host.id, (digest, (self.clock)()));
         if routes_added + routes_removed > 0 {
             tracing::info!(
                 runner_id = host.id,
@@ -334,7 +435,7 @@ impl NetworkSync {
                 "runner network changed"
             );
         }
-        Ok(())
+        Ok(Applied::Sent)
     }
 
     async fn object_fence(&self, host_id: i64, digest: &str, epoch: i64) -> Result<ObjectFence> {
@@ -649,16 +750,34 @@ impl RunnerHypervisor {
         &self,
         op: impl Fn(bento_runner::InstanceRef) -> Operation,
         name: &str,
+        removing: bool,
     ) -> std::result::Result<bento_types::State, bento_hypervisor::Error> {
         // A missing domain is `DomainNotFound`, as from a local libvirt.
         // The lifecycle relies on that to remove a row whose domain is
         // already gone (SPEC 11.1).
-        let uuid = bento_hypervisor::Hypervisor::list(self)
+        let listed = bento_hypervisor::Hypervisor::list(self)
             .await?
             .into_iter()
             .find(|domain| domain.name == name)
-            .map(|domain| domain.uuid)
-            .ok_or_else(|| bento_hypervisor::Error::DomainNotFound(name.to_owned()))?;
+            .map(|domain| domain.uuid);
+        let uuid = match listed {
+            Some(uuid) => uuid,
+            // A remove whose domain is gone may still have files to
+            // delete: an earlier attempt can stop between the undefine
+            // and the unlink. The row names the instance, so the request
+            // still goes out and the machine removes what is left
+            // (MULTI-NODE 14.2). With no row there is nothing to name.
+            None if removing => self
+                .sync
+                .store
+                .instance_by_name(name)
+                .await
+                .ok()
+                .filter(|row| row.host_id == self.host.id)
+                .map(|row| row.uuid)
+                .ok_or_else(|| bento_hypervisor::Error::DomainNotFound(name.to_owned()))?,
+            None => return Err(bento_hypervisor::Error::DomainNotFound(name.to_owned())),
+        };
         let instance = bento_runner::InstanceRef {
             uuid,
             name: name.to_owned(),
@@ -682,9 +801,13 @@ impl bento_hypervisor::Hypervisor for RunnerHypervisor {
     }
 
     async fn start(&self, name: &str) -> std::result::Result<(), bento_hypervisor::Error> {
-        self.act(|instance| Operation::StartInstance { instance }, name)
-            .await
-            .map(|_| ())
+        self.act(
+            |instance| Operation::StartInstance { instance },
+            name,
+            false,
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn stop(
@@ -694,21 +817,29 @@ impl bento_hypervisor::Hypervisor for RunnerHypervisor {
         // The machine reports the state it observed, not the manner of
         // the stop. The controller stores observed state (SPEC 11.2), so
         // a graceful answer is the honest one to give here.
-        self.act(|instance| Operation::StopInstance { instance }, name)
+        self.act(|instance| Operation::StopInstance { instance }, name, false)
             .await
             .map(|_| bento_hypervisor::StopResult::Graceful)
     }
 
     async fn reboot(&self, name: &str) -> std::result::Result<(), bento_hypervisor::Error> {
-        self.act(|instance| Operation::RebootInstance { instance }, name)
-            .await
-            .map(|_| ())
+        self.act(
+            |instance| Operation::RebootInstance { instance },
+            name,
+            false,
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn remove(&self, name: &str) -> std::result::Result<(), bento_hypervisor::Error> {
-        self.act(|instance| Operation::RemoveInstance { instance }, name)
-            .await
-            .map(|_| ())
+        self.act(
+            |instance| Operation::RemoveInstance { instance },
+            name,
+            true,
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn list(
@@ -760,6 +891,28 @@ pub(crate) struct PollTask {
     /// This machine. Its instances are observed by the lifecycle poller
     /// against local libvirt, so the runner poll leaves them alone.
     local_host_id: Option<i64>,
+    /// Starts the instances of a runner that restarted (MULTI-NODE 14.3).
+    restore: Option<Arc<dyn HostRestore>>,
+    /// Hosts with a restore task now. `observe_instances` keeps a
+    /// `starting` row for a shut-off domain of these hosts.
+    restoring: Arc<std::sync::Mutex<HashSet<i64>>>,
+}
+
+/// What `PollTask::run` keeps between sweeps.
+#[derive(Default)]
+struct Sweep {
+    image_tasks: JoinSet<(i64, Result<()>)>,
+    syncing: HashSet<i64>,
+    /// Which host each image task works for, so a task that panics
+    /// still frees its host (MULTI-NODE 20).
+    running: HashMap<tokio::task::Id, i64>,
+    restore_tasks: JoinSet<(i64, Result<()>)>,
+    restore_running: HashMap<tokio::task::Id, i64>,
+    /// Hosts that still need a restore: a new boot ID or a first healthy
+    /// sight, and no restore has finished since.
+    pending_restore: HashSet<i64>,
+    /// Hosts seen healthy since the controller started.
+    known: HashSet<i64>,
 }
 
 impl PollTask {
@@ -768,6 +921,7 @@ impl PollTask {
         lease: watch::Receiver<Lease>,
         network: NetworkSync,
         local_host_id: i64,
+        restore: Arc<dyn HostRestore>,
     ) -> Self {
         Self {
             store,
@@ -776,6 +930,8 @@ impl PollTask {
             request_timeout: REQUEST_TIMEOUT,
             network: Some(network),
             local_host_id: Some(local_host_id),
+            restore: Some(restore),
+            restoring: Arc::default(),
         }
     }
 
@@ -788,6 +944,8 @@ impl PollTask {
             request_timeout: REQUEST_TIMEOUT,
             network: None,
             local_host_id: None,
+            restore: None,
+            restoring: Arc::default(),
         }
     }
 
@@ -804,8 +962,7 @@ impl PollTask {
             lease: self.lease.clone(),
             request_timeout: IMAGE_TIMEOUT,
         };
-        let mut image_tasks = JoinSet::new();
-        let mut syncing = HashSet::new();
+        let mut sweep = Sweep::default();
         // A late sweep must not cause a burst of calls to every runner.
         // Such a burst adds load but gives no new state (MULTI-NODE 20).
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -813,59 +970,110 @@ impl PollTask {
             tokio::select! {
                 biased;
                 _ = &mut shutdown => {
-                    image_tasks.abort_all();
+                    sweep.image_tasks.abort_all();
+                    sweep.restore_tasks.abort_all();
                     return;
                 },
-                Some(result) = image_tasks.join_next(), if !image_tasks.is_empty() => {
-                    match result {
-                        Ok((host_id, Ok(()))) => {
-                            syncing.remove(&host_id);
-                        }
-                        Ok((host_id, Err(error))) => {
-                            syncing.remove(&host_id);
-                            tracing::warn!(runner_id = host_id, %error, "runner image sync stopped");
-                        }
-                        Err(error) => tracing::warn!(%error, "runner image sync task failed"),
-                    }
+                Some(result) = sweep.image_tasks.join_next_with_id(), if !sweep.image_tasks.is_empty() => {
+                    finish_image_task(result, &mut sweep.running, &mut sweep.syncing);
+                }
+                Some(result) = sweep.restore_tasks.join_next_with_id(), if !sweep.restore_tasks.is_empty() => {
+                    self.finish_restore(result, &mut sweep);
                 }
                 _ = ticker.tick() => {
                     match self.tick().await {
-                        Ok(hosts) => {
-                            for (host, boot_id) in hosts {
-                                // The network is converged before the
-                                // image sync is started, because a slow
-                                // image fetch must not hold back a route
-                                // an existing guest needs
-                                // (MULTI-NODE 8.2).
-                                if let Some(network) = &self.network {
-                                    // A new boot ID drops the cached send
-                                    // so a rebooted runner gets its routes
-                                    // back (MULTI-NODE 8.2).
-                                    network.note_boot(host.id, &boot_id).await;
-                                }
-                                if let Some(network) = &self.network
-                                    && let Err(error) = network.sync_host(&host).await
-                                {
-                                    tracing::warn!(
-                                        runner_id = host.id,
-                                        runner = %host.name,
-                                        %error,
-                                        "runner network sync failed"
-                                    );
-                                }
-                                if syncing.insert(host.id) {
-                                    let sync = image_sync.clone();
-                                    image_tasks.spawn(async move {
-                                        let host_id = host.id;
-                                        (host_id, sync.sync_host(&host).await)
-                                    });
-                                }
-                            }
-                        }
+                        Ok(hosts) => self.sweep(hosts, &image_sync, &mut sweep).await,
                         Err(error) => tracing::warn!(%error, "runner poll failed"),
                     }
                 }
             }
+        }
+    }
+
+    /// Acts on the runners that answered healthy in this tick.
+    async fn sweep(&self, hosts: Vec<(Host, String)>, image_sync: &ImageSync, sweep: &mut Sweep) {
+        for (host, boot_id) in hosts {
+            // A restore is wanted after a reboot and after a controller
+            // start. The local machine has its own restore at start-up.
+            let remote = self.local_host_id != Some(host.id);
+            if remote && sweep.known.insert(host.id) {
+                sweep.pending_restore.insert(host.id);
+            }
+            // The network is converged before the image sync is started,
+            // because a slow image fetch must not hold back a route an
+            // existing guest needs (MULTI-NODE 8.2).
+            let mut converged = true;
+            if let Some(network) = &self.network {
+                // A new boot ID drops the cached send so a rebooted
+                // runner gets its routes back (MULTI-NODE 8.2).
+                if network.note_boot(host.id, &boot_id).await && remote {
+                    sweep.pending_restore.insert(host.id);
+                }
+                converged = network.converge(&host).await;
+            }
+            // The runner is healthy (it is in this list) and its network
+            // is converged, so instances may start (MULTI-NODE 14.3). A
+            // failed apply keeps the restore pending for a later tick.
+            if converged
+                && sweep.pending_restore.contains(&host.id)
+                && !sweep.restore_running.values().any(|id| *id == host.id)
+                && let Some(restore) = &self.restore
+            {
+                sweep.pending_restore.remove(&host.id);
+                self.restoring
+                    .lock()
+                    .expect("restoring set")
+                    .insert(host.id);
+                let restore = Arc::clone(restore);
+                let host_id = host.id;
+                let task = sweep
+                    .restore_tasks
+                    .spawn(async move { (host_id, restore.restore_host(host_id).await) });
+                sweep.restore_running.insert(task.id(), host_id);
+            }
+            if sweep.syncing.insert(host.id) {
+                let sync = image_sync.clone();
+                let host_id = host.id;
+                let task = sweep
+                    .image_tasks
+                    .spawn(async move { (host_id, sync.sync_host(&host).await) });
+                sweep.running.insert(task.id(), host_id);
+            }
+        }
+    }
+
+    /// Frees the host of a finished restore task, also when it panicked.
+    /// A failed restore stays pending, so a later tick tries again.
+    fn finish_restore(
+        &self,
+        result: std::result::Result<(tokio::task::Id, (i64, Result<()>)), tokio::task::JoinError>,
+        sweep: &mut Sweep,
+    ) {
+        let (host_id, failed) = match result {
+            Ok((id, (host_id, outcome))) => {
+                sweep.restore_running.remove(&id);
+                match outcome {
+                    Ok(()) => (host_id, false),
+                    Err(error) => {
+                        tracing::warn!(runner_id = host_id, %error, "runner restore failed");
+                        (host_id, true)
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "runner restore task failed");
+                match sweep.restore_running.remove(&error.id()) {
+                    Some(host_id) => (host_id, true),
+                    None => return,
+                }
+            }
+        };
+        self.restoring
+            .lock()
+            .expect("restoring set")
+            .remove(&host_id);
+        if failed {
+            sweep.pending_restore.insert(host_id);
         }
     }
 
@@ -880,6 +1088,7 @@ impl PollTask {
             let lease = self.lease.clone();
             let request_timeout = self.request_timeout;
             let local = self.local_host_id == Some(host.id);
+            let restoring = Arc::clone(&self.restoring);
             polls.spawn(async move {
                 let before = store
                     .host_observation(host.id)
@@ -906,6 +1115,7 @@ impl PollTask {
                 // with, and a guest that had stopped would read as
                 // running for ever (MULTI-NODE 20).
                 if healthy && !local {
+                    let restoring = restoring.lock().expect("restoring set").contains(&host.id);
                     match observe_instances(
                         client.as_ref(),
                         &endpoint,
@@ -913,6 +1123,7 @@ impl PollTask {
                         &lease,
                         request_timeout,
                         &store,
+                        restoring,
                     )
                     .await
                     {
@@ -962,6 +1173,7 @@ async fn observe_instances(
     lease: &watch::Receiver<Lease>,
     request_timeout: Duration,
     store: &Store,
+    restoring: bool,
 ) -> Result<usize> {
     // A machine that holds no instance has nothing to say about one, so
     // it is not asked. A new machine is polled for health long before it
@@ -997,10 +1209,18 @@ async fn observe_instances(
     // dashboard show the truth.
     let mut states = HashMap::new();
     for instance in rows {
-        let state = seen
-            .get(&instance.uuid)
-            .copied()
-            .unwrap_or(bento_types::State::Stopped);
+        let observed = seen.get(&instance.uuid).copied();
+        let state = observed.unwrap_or(bento_types::State::Stopped);
+        // `restore_host` writes `starting` before each start. A shut-off
+        // domain is the state before the start, so while a restore runs
+        // for this machine the row keeps `starting`, as the local poll
+        // does (MULTI-NODE 14.3). A row with no domain is still fixed.
+        if restoring
+            && instance.state == bento_types::State::Starting
+            && observed == Some(bento_types::State::Stopped)
+        {
+            continue;
+        }
         if state != instance.state {
             states.insert(instance.uuid, state);
         }
@@ -1128,6 +1348,31 @@ fn failed(error: String) -> HostSeen {
     }
 }
 
+/// Frees the host of a finished image task, also when the task panicked
+/// or was cancelled. A host left in `syncing` would never get an image
+/// sync again before a restart (MULTI-NODE 20).
+fn finish_image_task(
+    result: std::result::Result<(tokio::task::Id, (i64, Result<()>)), tokio::task::JoinError>,
+    running: &mut HashMap<tokio::task::Id, i64>,
+    syncing: &mut HashSet<i64>,
+) {
+    match result {
+        Ok((id, (host_id, outcome))) => {
+            running.remove(&id);
+            syncing.remove(&host_id);
+            if let Err(error) = outcome {
+                tracing::warn!(runner_id = host_id, %error, "runner image sync stopped");
+            }
+        }
+        Err(error) => {
+            if let Some(host_id) = running.remove(&error.id()) {
+                syncing.remove(&host_id);
+            }
+            tracing::warn!(%error, "runner image sync task failed");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1228,7 +1473,7 @@ mod tests {
         };
         let hypervisor = RunnerHypervisor::new(sync, host);
 
-        let error = bento_hypervisor::Hypervisor::remove(&hypervisor, "gone")
+        let error = bento_hypervisor::Hypervisor::start(&hypervisor, "gone")
             .await
             .unwrap_err();
 
@@ -1236,8 +1481,182 @@ mod tests {
             matches!(error, bento_hypervisor::Error::DomainNotFound(ref name) if name == "gone"),
             "{error:?}"
         );
-        // Only the inventory read went out; nothing was sent to remove.
+        // Only the inventory read went out; nothing was sent to start.
         assert_eq!(client.calls.lock().unwrap().len(), 1);
+
+        // With no row either, a remove has nothing to name and also
+        // sends nothing.
+        client
+            .replies
+            .lock()
+            .unwrap()
+            .push_back(Ok(Reply::Inventory(bento_runner::Inventory {
+                domains: vec![],
+            })));
+        let error = bento_hypervisor::Hypervisor::remove(&hypervisor, "gone")
+            .await
+            .unwrap_err();
+        assert!(matches!(error, bento_hypervisor::Error::DomainNotFound(_)));
+        assert_eq!(client.calls.lock().unwrap().len(), 2);
+    }
+
+    /// A row for `web` on `host_id`, with the rows it needs.
+    async fn seed_instance(store: &Store, host_id: i64) {
+        use bento_types::{DesiredState, Image, ImageVersion, Instance, State, Visibility};
+        let plan = bento_network::Plan::new("10.100.0.0/16").unwrap();
+        let user = store
+            .register_user("amber", "amber@example.org", None, plan.range())
+            .await
+            .unwrap();
+        store
+            .upsert_image(Image {
+                name: "debian-13".into(),
+                url: "https://example.org/image".into(),
+                kind: Default::default(),
+                pinned_checksum: None,
+                current_checksum: None,
+            })
+            .await
+            .unwrap();
+        store
+            .add_image_version(ImageVersion {
+                checksum: "aa11".into(),
+                image_name: "debian-13".into(),
+                path: "/images/aa11".into(),
+                size: 1,
+                kind: Default::default(),
+                source_digest: None,
+                fetched_at: OffsetDateTime::now_utc(),
+            })
+            .await
+            .unwrap();
+        store
+            .create_instance(
+                Instance {
+                    uuid: "uuid-web".into(),
+                    name: "web".into(),
+                    owner_id: user.id,
+                    host_id,
+                    image_name: "debian-13".into(),
+                    base_checksum: "aa11".into(),
+                    state: State::Stopped,
+                    desired_state: DesiredState::Stopped,
+                    address: "10.100.0.2".into(),
+                    mac: "52:54:00:00:00:01".into(),
+                    vcpu: 2,
+                    memory_mib: 2048,
+                    disk_gib: 20,
+                    nested: false,
+                    ksm: true,
+                    http_port: 0,
+                    visibility: Visibility::Off,
+                    created_at: OffsetDateTime::now_utc(),
+                    last_seen_at: None,
+                    slot: None,
+                },
+                Duration::from_secs(1),
+                bento_types::Capacity::unbounded(),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_remove_with_no_domain_still_reaches_the_runner_to_delete_files() {
+        // An earlier remove may have undefined the domain and stopped
+        // before the unlink. The row is still there, so the retry must
+        // reach the runner (MULTI-NODE 14.2).
+        let (_directory, store) = store().await;
+        let host = store
+            .register_runner("runner-a.example.org", ENDPOINT, UNDERLAY)
+            .await
+            .unwrap();
+        seed_instance(&store, host.id).await;
+        let client = Arc::new(FakeClient::new(vec![
+            Ok(Reply::Inventory(bento_runner::Inventory {
+                domains: vec![],
+            })),
+            Ok(Reply::Changed {
+                state: bento_types::State::Stopped,
+            }),
+        ]));
+        let sync = InstanceSync {
+            client: client.clone(),
+            lease: LeaseSource::Held(lease()),
+            store: store.clone(),
+            request_timeout: REQUEST_TIMEOUT,
+        };
+        let hypervisor = RunnerHypervisor::new(sync, host);
+
+        bento_hypervisor::Hypervisor::remove(&hypervisor, "web")
+            .await
+            .unwrap();
+
+        let calls = client.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "the remove went out after the inventory");
+        assert!(matches!(
+            &calls[1].1.op,
+            Operation::RemoveInstance { instance } if instance.uuid == "uuid-web"
+        ));
+    }
+
+    async fn observe_with_domain(
+        restoring: bool,
+        domains: Vec<bento_runner::protocol::Domain>,
+    ) -> bento_types::State {
+        let (_directory, store) = store().await;
+        let host = store
+            .register_runner("runner-a.example.org", ENDPOINT, UNDERLAY)
+            .await
+            .unwrap();
+        seed_instance(&store, host.id).await;
+        store
+            .set_observed_state("uuid-web", bento_types::State::Starting)
+            .await
+            .unwrap();
+        let client = FakeClient::new(vec![Ok(Reply::Inventory(bento_runner::Inventory {
+            domains,
+        }))]);
+        observe_instances(
+            &client,
+            ENDPOINT,
+            &host,
+            &lease(),
+            REQUEST_TIMEOUT,
+            &store,
+            restoring,
+        )
+        .await
+        .unwrap();
+        store.instance("uuid-web").await.unwrap().state
+    }
+
+    fn web_domain(state: bento_types::State) -> bento_runner::protocol::Domain {
+        bento_runner::protocol::Domain {
+            uuid: "uuid-web".into(),
+            name: "web".into(),
+            state,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_restore_keeps_starting_for_a_shut_off_domain() {
+        // `restore_host` writes `starting` before each start. The poll
+        // must not turn it back into `stopped` (MULTI-NODE 14.3).
+        let state = observe_with_domain(true, vec![web_domain(bento_types::State::Stopped)]).await;
+        assert_eq!(state, bento_types::State::Starting);
+    }
+
+    #[tokio::test]
+    async fn without_a_restore_a_shut_off_domain_reads_stopped() {
+        let state = observe_with_domain(false, vec![web_domain(bento_types::State::Stopped)]).await;
+        assert_eq!(state, bento_types::State::Stopped);
+    }
+
+    #[tokio::test]
+    async fn a_restore_still_corrects_a_starting_row_with_no_domain() {
+        let state = observe_with_domain(true, vec![]).await;
+        assert_eq!(state, bento_types::State::Stopped);
     }
 
     #[tokio::test]
@@ -1541,6 +1960,7 @@ mod tests {
             &lease(),
             REQUEST_TIMEOUT,
             &store,
+            false,
         )
         .await
         .unwrap();
@@ -1644,5 +2064,22 @@ mod tests {
             Operation::EnsureImage { image }
                 if image.name == "debian-13" && image.have.is_none()
         ));
+    }
+
+    #[tokio::test]
+    async fn a_panicked_image_task_frees_its_host() {
+        let mut tasks: JoinSet<(i64, Result<()>)> = JoinSet::new();
+        let mut running = HashMap::new();
+        let mut syncing = HashSet::new();
+        syncing.insert(7);
+        let task = tasks.spawn(async { panic!("image sync broke") });
+        running.insert(task.id(), 7);
+
+        let result = tasks.join_next_with_id().await.unwrap();
+        assert!(result.is_err());
+        finish_image_task(result, &mut running, &mut syncing);
+
+        assert!(syncing.is_empty(), "the host must be free again");
+        assert!(running.is_empty());
     }
 }

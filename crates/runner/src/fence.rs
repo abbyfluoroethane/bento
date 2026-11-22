@@ -12,6 +12,8 @@
 //! SQLite on the runner's own disk. It is small on purpose: the highest
 //! accepted epoch, and the outcome of each request that changed anything.
 
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use time::OffsetDateTime;
@@ -57,6 +59,32 @@ pub struct Fence {
     store: Box<dyn FenceStore>,
     max_skew: Duration,
     now: Box<dyn Fn() -> OffsetDateTime + Send + Sync>,
+    locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+/// Held from admission through the recorded outcome. Dropping it lets the
+/// next change for the same object in, and forgets the lock when nobody
+/// else waits for it, so the map stays as small as the work in flight.
+pub struct ObjectGuard {
+    locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    object_id: String,
+    held: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl Drop for ObjectGuard {
+    fn drop(&mut self) {
+        // Release first, so the count below sees only the map and the
+        // waiters. The map lock makes "count and remove" one step; a
+        // waiter clones the entry under the same lock.
+        self.held = None;
+        let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+        if locks
+            .get(&self.object_id)
+            .is_some_and(|lock| Arc::strong_count(lock) == 1)
+        {
+            locks.remove(&self.object_id);
+        }
+    }
 }
 
 impl Fence {
@@ -66,7 +94,34 @@ impl Fence {
             store,
             max_skew: DEFAULT_MAX_SKEW,
             now: Box::new(OffsetDateTime::now_utc),
+            locks: Arc::default(),
         }
+    }
+
+    /// Waits for every earlier change to one object to finish.
+    ///
+    /// Admission records the generation before the host acts, so without
+    /// this a start and a stop of one instance could run at the same
+    /// time, and one request id delivered twice could run twice. With it,
+    /// admit, act and record are one unit for each object, and a late
+    /// generation that waited is refused when its turn comes
+    /// (MULTI-NODE 11.3).
+    pub async fn lock_object(&self, object_id: &str) -> ObjectGuard {
+        let lock = {
+            let mut locks = self.locks.lock().unwrap_or_else(|e| e.into_inner());
+            locks.entry(object_id.to_owned()).or_default().clone()
+        };
+        ObjectGuard {
+            locks: self.locks.clone(),
+            object_id: object_id.to_owned(),
+            held: Some(lock.lock_owned().await),
+        }
+    }
+
+    /// Number of objects with a lock now. For tests.
+    #[cfg(test)]
+    pub(crate) fn locked_objects(&self) -> usize {
+        self.locks.lock().unwrap().len()
     }
 
     pub fn with_clock(mut self, now: impl Fn() -> OffsetDateTime + Send + Sync + 'static) -> Self {
@@ -203,6 +258,11 @@ impl Fence {
     /// Records what a mutation did, so its retry is answered from memory.
     pub fn finish(&self, request_id: &str, outcome: &str) -> Result<(), Error> {
         self.store.record_outcome(request_id, outcome)
+    }
+
+    /// What a finished request answered, if it finished.
+    pub fn outcome(&self, request_id: &str) -> Result<Option<String>, Error> {
+        self.store.outcome(request_id)
     }
 
     pub fn accepted_epoch(&self) -> Result<i64, Error> {

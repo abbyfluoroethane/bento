@@ -401,20 +401,18 @@ impl Host for LocalHost {
     }
 
     async fn remove(&self, instance: &InstanceRef) -> Result<State, HostError> {
-        self.hypervisor
-            .remove(&instance.name)
-            .await
-            .map_err(HostError::new)?;
         // The disk and the seed image live on this machine, so this is the
         // only place that can delete them. Leaving them behind would fill
         // the machine with the disks of instances that no longer exist.
-        // The overlay goes only after the domain is undefined, so nothing
-        // can still be writing to it.
-        self.unwind_provision(
-            &self.overlay_path(&instance.uuid),
-            Some(&self.seed_iso_path(&instance.uuid)),
+        remove_instance(
+            self.hypervisor.as_ref(),
+            &instance.name,
+            &[
+                self.overlay_path(&instance.uuid),
+                self.seed_iso_path(&instance.uuid),
+            ],
         )
-        .await;
+        .await?;
         // The domain is gone, so there is nothing left to observe. A
         // removed instance reads as stopped, which is what the controller
         // records for a domain that no longer runs.
@@ -548,6 +546,72 @@ fn sha256_hex(checksum: &str) -> Result<String, HostError> {
     Ok(hex)
 }
 
+/// Removes a domain and then its files, and can be run again after any
+/// part of it failed (MULTI-NODE 14.2).
+///
+/// A domain that is already gone is not an error: an earlier attempt may
+/// have removed it and stopped before the unlink. A file that is already
+/// gone is not an error either. Any other unlink failure is returned, so
+/// the controller keeps the row and the delete is retried, instead of
+/// forgetting a disk it can no longer find. The files go only after the
+/// domain is undefined, so nothing can still be writing to them.
+async fn remove_instance(
+    hypervisor: &dyn Hypervisor,
+    name: &str,
+    files: &[PathBuf],
+) -> Result<(), HostError> {
+    match hypervisor.remove(name).await {
+        Ok(()) | Err(bento_hypervisor::Error::DomainNotFound(_)) => {}
+        Err(error) => return Err(HostError::new(error)),
+    }
+    // Try every file even when one fails, so one bad path does not keep
+    // the other file on disk.
+    let mut failures = Vec::new();
+    for path in files {
+        match tokio::fs::remove_file(path).await {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => failures.push(format!("remove {}: {error}", path.display())),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(HostError::new(failures.join("; ")))
+    }
+}
+
+/// A temporary download that goes away with its owner.
+struct PartialFile(Option<PathBuf>);
+
+impl Drop for PartialFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Removes the temporary downloads that a crash left behind.
+///
+/// One runner process owns the image directory, so at start no fetch is
+/// in flight and every `fetch-*.partial` is an orphan (MULTI-NODE 14.2).
+/// Returns how many files went.
+fn sweep_partial_fetches(directory: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("fetch-") && name.ends_with(".partial")
+        })
+        .filter(|entry| std::fs::remove_file(entry.path()).is_ok())
+        .count()
+}
+
 /// Fetches `url` into `directory` and names the result by its content.
 ///
 /// The order here is the whole point. The download lands on a temporary
@@ -566,6 +630,9 @@ async fn fetch_into(url: &str, directory: &Path) -> Result<(String, u64), HostEr
     // One temporary name for each fetch in flight, so two fetches into
     // the same directory cannot write over each other.
     let partial = directory.join(format!("fetch-{}.partial", bento_lifecycle::random_uuid()));
+    // The guard removes the file on every way out, also when this future
+    // is dropped half-way (MULTI-NODE 14.2).
+    let mut guard = PartialFile(Some(partial.clone()));
     let mut response = reqwest::Client::new()
         .get(url)
         .send()
@@ -603,20 +670,19 @@ async fn fetch_into(url: &str, directory: &Path) -> Result<(String, u64), HostEr
     }
     .await;
     drop(file);
-    if let Err(error) = outcome {
-        let _ = tokio::fs::remove_file(&partial).await;
-        return Err(error);
-    }
+    outcome?;
 
     let digest = hex_digest(&hasher.finalize());
     let destination = directory.join(format!("sha256-{digest}.qcow2"));
-    if let Err(error) = tokio::fs::rename(&partial, &destination).await {
-        let _ = tokio::fs::remove_file(&partial).await;
-        return Err(HostError::new(format!(
-            "move image into {}: {error}",
-            destination.display()
-        )));
-    }
+    tokio::fs::rename(&partial, &destination)
+        .await
+        .map_err(|error| {
+            HostError::new(format!(
+                "move image into {}: {error}",
+                destination.display()
+            ))
+        })?;
+    guard.0 = None;
     Ok((format!("sha256-{digest}"), size))
 }
 
@@ -648,6 +714,10 @@ async fn runner_inner(app: &App) -> Result<()> {
     let machine_id = bento_hostinfo::read_machine_id()
         .map_err(|error| anyhow::anyhow!("machine identity: {error}"))?;
     let hostname = bento_hostinfo::read_hostname();
+    let swept = sweep_partial_fetches(Path::new(&app.cfg.image_dir));
+    if swept > 0 {
+        tracing::info!(swept, "runner: removed downloads that an earlier run left");
+    }
 
     let fence_store = SqliteFence::open(&app.cfg.runner.fence_db)
         .with_context(|| format!("open runner fence database {}", app.cfg.runner.fence_db))?;
@@ -792,6 +862,91 @@ mod tests {
 
     fn xml(name: &str) -> String {
         format!("<name>{name}</name><uuid>u-1</uuid>")
+    }
+
+    #[tokio::test]
+    async fn a_remove_with_no_domain_still_removes_the_files() {
+        // A crash between the domain remove and the unlink leaves files
+        // and no domain. The retry must finish the job (MULTI-NODE 14.2).
+        let storage = tempfile::tempdir().unwrap();
+        let overlay = storage.path().join("u-1.qcow2");
+        let seed = storage.path().join("u-1-seed.iso");
+        std::fs::write(&overlay, b"guest data").unwrap();
+        let fake = bento_hypervisor::Fake::default();
+
+        remove_instance(&fake, "web", &[overlay.clone(), seed.clone()])
+            .await
+            .unwrap();
+
+        assert!(!overlay.exists());
+        // A missing seed image is fine: the first boot may have removed it.
+        assert!(!seed.exists());
+    }
+
+    #[tokio::test]
+    async fn a_file_that_cannot_be_removed_fails_the_remove() {
+        let storage = tempfile::tempdir().unwrap();
+        // A directory cannot be unlinked as a file.
+        let overlay = storage.path().join("u-1.qcow2");
+        std::fs::create_dir(&overlay).unwrap();
+        let seed = storage.path().join("u-1-seed.iso");
+        std::fs::write(&seed, b"seed").unwrap();
+        let fake = bento_hypervisor::Fake::default();
+        fake.set_domain(domain("web", State::Stopped));
+
+        let error = remove_instance(&fake, "web", &[overlay.clone(), seed.clone()])
+            .await
+            .unwrap_err();
+
+        assert!(error.0.contains("u-1.qcow2"), "{error}");
+        assert!(fake.domain("web").is_none());
+        // The other file still went.
+        assert!(!seed.exists());
+    }
+
+    #[test]
+    fn the_start_sweep_removes_only_partial_downloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let orphan = directory.path().join("fetch-1234.partial");
+        let image = directory.path().join("sha256-00.qcow2");
+        std::fs::write(&orphan, b"half").unwrap();
+        std::fs::write(&image, b"whole").unwrap();
+
+        assert_eq!(sweep_partial_fetches(directory.path()), 1);
+
+        assert!(!orphan.exists());
+        assert!(image.exists());
+        // A directory that is not there is not an error.
+        assert_eq!(sweep_partial_fetches(&directory.path().join("none")), 0);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_download_leaves_no_partial_file() {
+        // The server sends a header and then stalls, so the fetch is cut
+        // off while the partial file exists.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let _server = tokio::spawn(async move {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut scratch = [0_u8; 1024];
+            let _ = stream.read(&mut scratch).await;
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nabc")
+                .await;
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+        });
+        install_provider();
+        let directory = tempfile::tempdir().unwrap();
+
+        let cut = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            fetch_into(&format!("http://{address}/image.qcow2"), directory.path()),
+        )
+        .await;
+
+        assert!(cut.is_err(), "the fetch must still be waiting");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]

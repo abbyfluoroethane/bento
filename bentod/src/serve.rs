@@ -299,7 +299,13 @@ async fn serve_inner(
             },
             host.id,
         );
-        let task = crate::runners::PollTask::new(app.store.clone(), lease, network_sync, host.id);
+        let task = crate::runners::PollTask::new(
+            app.store.clone(),
+            lease,
+            network_sync,
+            host.id,
+            Arc::new(crate::adapters::RunnerRestore(manager.clone())),
+        );
         let cancellation = cancellation.clone();
         async move {
             task.run(cancellation.cancelled()).await;

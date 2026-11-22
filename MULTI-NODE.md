@@ -353,6 +353,8 @@ maintained routing table, and an external route backend are all outside the
 MVP. This keeps one acknowledgement mechanism on the create path instead of
 one mechanism plus an operator.
 
+**Resend.** The controller sends the network again when the last acknowledgement from a runner is older than 5 minutes, because kernel state can change with no restart of the machine.
+
 ### 8.3 Proxy ARP
 
 IPv4 forwarding is enabled on runners. Proxy ARP is enabled on each Bento user
@@ -667,6 +669,8 @@ This is a deliberate limit, not an omission. Bento is not safe to expose to
 the public internet, and it is not safe on a network the operator shares
 with people they do not trust. The runbook says so plainly.
 
+**One machine, one row.** When a runner reports a machine ID that a different host row holds, the controller records the runner as mismatched, and the error names that host.
+
 ### 11.2 Connection shape
 
 The controller opens every runner connection to a stable runner endpoint
@@ -709,6 +713,8 @@ desired-state digest is equal. It then returns the recorded result or
 continues convergence. It rejects an equal generation with a different
 digest. A higher generation supersedes unfinished older work only at an
 operation-defined safe point.
+
+**One change at a time.** A runner admits, does, and records one change at a time for each object. A request waits for earlier changes to the same object. A second delivery of a request ID then gets the recorded outcome. The work runs to its end and records its outcome, also when the controller drops the request.
 
 ### 11.4 Recovery from an older database
 
@@ -961,6 +967,8 @@ that no domain, overlay, or seed remains. An unreachable runner leaves the row
 and all reservations intact. Bento must not erase the only record of possibly
 existing storage or a domain.
 
+**Kept row.** The row of a create that failed, and that the controller keeps because the runner did not confirm that the domain is absent, is `stopped` with the desired state `stopped`.
+
 ### 14.2 Existing-instance actions
 
 Start, stop, restart, resize, rename, remove, first-boot cleanup, and SSH
@@ -985,6 +993,8 @@ the overlay and seed, then replace the live row with its audit tombstone and
 release resources. An unreachable runner makes delete retryable; it does not
 skip host cleanup.
 
+**Remove.** The remove on a runner is idempotent. A missing domain or a missing file is not an error. Any other failure to delete a file is returned, and the controller keeps the row, so the delete can be done again. The controller sends the remove also when the inventory of the runner does not list the domain, if the row exists.
+
 ### 14.3 Restore after reboot
 
 Runner reboot and controller reboot are independent events. The controller
@@ -1002,6 +1012,8 @@ health report, which is the kernel boot ID. When the value changes, the
 controller forgets the network state that it last sent to that runner
 and sends it again. An empty `boot_id` comes from an older runner. The
 controller then does not assume a reboot.
+
+**Restore of a runner.** The controller restores the instances of a runner in two cases: when the boot ID of the runner changes, and on the first healthy observation of the runner after the controller starts. The restore starts only after the health of the runner is `ok` and the controller applied the network to the runner successfully in the same poll. If the apply fails, the restore stays pending, and the controller tries again after a later apply succeeds. A restore that returns an error also stays pending. The controller runs a maximum of one restore for each runner at a time, and the poll does not wait for it. The restore starts each instance of that machine that has the desired state `running` and the observed state `stopped`. It skips a row with no domain. While a restore runs for a runner, the poll does not change a `starting` row to `stopped` when the domain exists and is shut off.
 
 ## 15. State, health, and partial failure
 
@@ -1054,6 +1066,8 @@ operator may reassign a failed runner's slot only after fencing the old runner
 or otherwise proving it cannot resume its domains on the old network path.
 Stopping a runner's service is not a domain or data-plane fence: its
 guests keep running and its routes keep carrying traffic.
+
+**Record of the network result.** After each network apply, the controller records the result for the runner: a success clears the error, and a failure stores the error text. A send that is skipped because the state did not change writes no result. A health poll does not clear the error. Placement refuses a runner that has a recorded error, with the reason `degraded-network: <error>`. After a failed apply, the controller sends again on the next poll. The host of the controller is not refused for this.
 
 ## 16. Data-model changes
 
