@@ -915,8 +915,17 @@ is still recoverable. It then applies any schema migrations the copy has
 not had, which is what lets an older backup come back on a newer build.
 
 `bento-monitor` has both on the Config tab: `b` copies the database
-beside itself, and `r` offers the newest copy that is there. Take a copy
-before an upgrade that carries a schema migration.
+beside itself, and `r` offers the newest `.backup-` copy that is there.
+`r` refuses while a Bento unit runs: stop the units first. `r` does not
+offer a `.before-restore-` copy; restore that one by hand. After an
+install, `b` refuses until the running units are restarted, because the
+installed `bentod` would migrate the live database. Take a copy before
+an upgrade that carries a schema migration.
+
+On the Install tab, Enter opens a prompt for the selected step. `y` runs
+it, and any other key cancels. A long prompt scrolls, and `y` works only
+after the end was shown. A step that is done does not run again. The
+unit and enable steps wait while the configuration file does not load.
 
 ## Known operator gaps
 

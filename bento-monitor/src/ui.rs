@@ -38,7 +38,7 @@ pub fn draw(frame: &mut Frame, app: &App) {
     draw_footer(frame, app, footer);
 
     if let Some(modal) = &app.modal {
-        draw_modal(frame, modal, frame.area());
+        draw_modal(frame, modal, app.modal_scroll, frame.area());
     }
 }
 
@@ -86,7 +86,7 @@ fn draw_footer(frame: &mut Frame, app: &App, area: Rect) {
         // lease and the slot table (MULTI-NODE 11.3).
         Tab::Fleet if app.role == Role::Runner => "F5 refresh now",
         Tab::Fleet => "s slots  p slot plan for the selected machine  c reconcile",
-        Tab::Install => "enter run step  a run every missing step",
+        Tab::Install => "enter open step  a open every missing step",
         Tab::Config => "e edit  f fetch-images  i images  c reconcile  b backup  r restore",
         Tab::Host => "F5 refresh now",
     };
@@ -906,62 +906,153 @@ fn checks_widget(app: &App) -> Paragraph<'static> {
         .wrap(Wrap { trim: false })
 }
 
-fn draw_modal(frame: &mut Frame, modal: &Modal, area: Rect) {
-    let (title, mut lines, footer) = match modal {
-        Modal::Help => (
-            " Help ".to_string(),
-            help_lines(),
-            "any key closes".to_string(),
-        ),
-        Modal::Message { title, body } => (
-            format!(" {title} "),
-            vec![Line::from(Span::raw(body.clone()))],
-            "any key closes".to_string(),
-        ),
+/// What a modal shows: the wrapped body, which scrolls, and the footer,
+/// which does not.
+struct ModalLayout {
+    popup: Rect,
+    title: String,
+    body: Vec<Line<'static>>,
+    /// How many body lines the popup shows at once.
+    view: u16,
+    /// How far the body scrolls: the first line of the last page.
+    max_scroll: u16,
+}
+
+/// Lays a modal out on `area`.
+///
+/// The body is wrapped here, by hand, rather than by the widget: a
+/// widget that wraps cannot say how many lines it made, and a prompt
+/// that is taller than the screen would then cut off its last commands
+/// with no way to know. With the lines counted, the popup scrolls, and
+/// the caller can tell when the operator has seen the last one.
+fn modal_layout(modal: &Modal, area: Rect) -> ModalLayout {
+    let width = area.width.saturating_sub(8).clamp(20, 96);
+    // Two columns of border and two of padding.
+    let inner = usize::from(width.saturating_sub(4)).max(1);
+    let (title, body) = match modal {
+        Modal::Help => (" Help ".to_string(), plain(&help_text(), inner)),
+        Modal::Message { title, body } => (format!(" {title} "), plain(body, inner)),
         Modal::Confirm { title, commands } => {
-            let mut lines = vec![Line::from(Span::raw(format!("{title}:"))), Line::from("")];
+            let mut lines: Vec<Line<'static>> = plain(&format!("{title}:"), inner);
+            lines.push(Line::from(""));
             for command in commands {
-                lines.push(Line::from(vec![
-                    Span::styled("  $ ", Style::new().fg(MUTED)),
-                    Span::styled(command.display(), Style::new().fg(Color::Cyan)),
-                ]));
+                for (index, part) in wrap(&command.display(), inner.saturating_sub(4).max(1))
+                    .into_iter()
+                    .enumerate()
+                {
+                    let lead = if index == 0 { "  $ " } else { "    " };
+                    lines.push(Line::from(vec![
+                        Span::styled(lead, Style::new().fg(MUTED)),
+                        Span::styled(part, Style::new().fg(Color::Cyan)),
+                    ]));
+                }
                 if let Some(dir) = &command.dir {
-                    lines.push(Line::from(Span::styled(
-                        format!("      in {dir}"),
-                        Style::new().fg(MUTED),
-                    )));
+                    for part in wrap(&format!("      in {dir}"), inner) {
+                        lines.push(Line::from(Span::styled(part, Style::new().fg(MUTED))));
+                    }
                 }
             }
-            (
-                " Run this? ".to_string(),
-                lines,
-                "y or enter runs it in this terminal, any other key cancels".to_string(),
-            )
+            (" Run this? ".to_string(), lines)
         }
     };
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(footer, Style::new().fg(MUTED))));
-
-    let height = (lines.len() as u16 + 2)
+    // Borders, the blank line, and the footer take four rows.
+    let height = (body.len() as u16)
+        .saturating_add(4)
         .min(area.height.saturating_sub(2))
-        .max(3);
-    let width = area.width.saturating_sub(8).clamp(20, 96);
-    let popup = centered(area, width, height);
-    frame.render_widget(Clear, popup);
+        .max(5);
+    let view = height - 4;
+    let max_scroll = (body.len() as u16).saturating_sub(view);
+    ModalLayout {
+        popup: centered(area, width, height),
+        title,
+        body,
+        view,
+        max_scroll,
+    }
+}
+
+/// How far a modal scrolls on a screen of this size, and how many lines
+/// a page is. Zero means it fits.
+pub fn modal_scroll_limit(modal: &Modal, screen: Rect) -> (u16, u16) {
+    let layout = modal_layout(modal, screen);
+    (layout.max_scroll, layout.view.max(1))
+}
+
+fn plain(text: &str, width: usize) -> Vec<Line<'static>> {
+    wrap(text, width).into_iter().map(Line::from).collect()
+}
+
+/// Wraps `text` at `width` characters. Words break at spaces; a word that
+/// is longer than a line breaks where the line ends. Leading spaces carry
+/// to every line made from that one, so an indented command stays
+/// indented.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for line in text.split('\n') {
+        let lead = line.len() - line.trim_start_matches(' ').len();
+        let room = width.saturating_sub(lead).max(1);
+        let mut current = String::new();
+        let mut made = Vec::new();
+        for mut word in line.split_whitespace() {
+            loop {
+                let used = current.chars().count();
+                let size = word.chars().count();
+                if used == 0 && size <= room {
+                    current.push_str(word);
+                    break;
+                } else if used == 0 {
+                    let cut = word.char_indices().nth(room).map_or(word.len(), |(i, _)| i);
+                    made.push(word[..cut].to_string());
+                    word = &word[cut..];
+                } else if used + 1 + size <= room {
+                    current.push(' ');
+                    current.push_str(word);
+                    break;
+                } else {
+                    made.push(std::mem::take(&mut current));
+                }
+            }
+        }
+        if !current.is_empty() || made.is_empty() {
+            made.push(current);
+        }
+        let indent = " ".repeat(lead.min(width.saturating_sub(1)));
+        lines.extend(made.into_iter().map(|part| format!("{indent}{part}")));
+    }
+    lines
+}
+
+fn draw_modal(frame: &mut Frame, modal: &Modal, scroll: u16, area: Rect) {
+    let layout = modal_layout(modal, area);
+    let scroll = scroll.min(layout.max_scroll);
+    let more = scroll < layout.max_scroll;
+    let footer = match (modal, more, layout.max_scroll > 0) {
+        (Modal::Confirm { .. }, true, _) => "more below: j/k or space scrolls. y works at the end",
+        (Modal::Confirm { .. }, false, _) => "y runs it in this terminal, any other key cancels",
+        (_, _, true) => "j/k or space scrolls, any other key closes",
+        _ => "any key closes",
+    };
+    frame.render_widget(Clear, layout.popup);
+    let block = Block::bordered()
+        .title(layout.title)
+        .padding(Padding::horizontal(1))
+        .border_style(Style::new().fg(Color::Cyan));
+    let inner = block.inner(layout.popup);
+    frame.render_widget(block, layout.popup);
+    let [body, _, footer_area] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(1),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
+    frame.render_widget(Paragraph::new(layout.body).scroll((scroll, 0)), body);
     frame.render_widget(
-        Paragraph::new(lines)
-            .block(
-                Block::bordered()
-                    .title(title)
-                    .padding(Padding::horizontal(1))
-                    .border_style(Style::new().fg(Color::Cyan)),
-            )
-            .wrap(Wrap { trim: false }),
-        popup,
+        Paragraph::new(Line::from(Span::styled(footer, Style::new().fg(MUTED)))),
+        footer_area,
     );
 }
 
-fn help_lines() -> Vec<Line<'static>> {
+fn help_text() -> String {
     [
         "bento-monitor drives the systemd units of one Bento machine and",
         "reports the whole deployment. It runs no privileged step by itself:",
@@ -982,14 +1073,16 @@ fn help_lines() -> Vec<Line<'static>> {
         "Fleet     s slots  p slot plan for the selected machine  c reconcile",
         "          It reads what the controller recorded; it never calls a",
         "          runner, because only the controller may hold the lease.",
-        "Install   enter run the selected step  a run every missing step",
+        "Install   enter open the selected step  a open every missing step",
         "Config    e edit  f fetch-images  i images  c reconcile  b backup  r restore",
+        "",
+        "A prompt shows the commands first. y runs them. Any other key",
+        "cancels. A long prompt scrolls (j k space), and y works only after",
+        "its last line was shown. Enter never confirms.",
         "",
         "  q  quit",
     ]
-    .iter()
-    .map(|line| Line::from(Span::raw(*line)))
-    .collect()
+    .join("\n")
 }
 
 fn gauge(frame: &mut Frame, area: Rect, label: &str, ratio: f64, text: String) {
@@ -1214,5 +1307,87 @@ mod tests {
         let popup = centered(area, 96, 40);
         assert!(popup.width <= area.width && popup.height <= area.height);
         assert_eq!(popup.x, 0);
+    }
+
+    fn long_prompt() -> Modal {
+        let commands = (0..11)
+            .map(|index| {
+                crate::run::Cmd::owned(
+                    "sudo",
+                    vec![
+                        "install".to_string(),
+                        "-m".to_string(),
+                        "0644".to_string(),
+                        format!("/tmp/bento-monitor-AbCdEf/unit-{index}.service.staged"),
+                        format!("/etc/systemd/system/unit-{index}.service"),
+                        format!("marker-{index}"),
+                    ],
+                )
+            })
+            .collect();
+        Modal::Confirm {
+            title: "install everything that is missing".to_string(),
+            commands,
+        }
+    }
+
+    fn screen(modal: &Modal, scroll: u16) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).expect("terminal");
+        terminal
+            .draw(|frame| draw_modal(frame, modal, scroll, frame.area()))
+            .expect("draw");
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_long_prompt_scrolls_and_shows_its_last_command_and_footer_at_the_end() {
+        let modal = long_prompt();
+        let (max, page) = modal_scroll_limit(&modal, Rect::new(0, 0, 80, 24));
+        assert!(max > 0, "eleven long commands do not fit on 80x24");
+        assert!(page > 0);
+
+        let top = screen(&modal, 0);
+        assert!(!top.contains("marker-10"), "{top}");
+        assert!(top.contains("more below"), "{top}");
+
+        let end = screen(&modal, max);
+        assert!(end.contains("marker-10"), "{end}");
+        assert!(end.contains("y runs it in this terminal"), "{end}");
+
+        // Every command is on some page.
+        let mut seen = String::new();
+        for scroll in 0..=max {
+            seen.push_str(&screen(&modal, scroll));
+        }
+        for index in 0..11 {
+            assert!(seen.contains(&format!("marker-{index}")), "{index}");
+        }
+    }
+
+    #[test]
+    fn a_prompt_that_fits_has_nothing_to_scroll() {
+        let modal = Modal::Message {
+            title: "x".to_string(),
+            body: "short".to_string(),
+        };
+        assert_eq!(modal_scroll_limit(&modal, Rect::new(0, 0, 80, 24)).0, 0);
+    }
+
+    #[test]
+    fn wrapping_keeps_the_indent_and_breaks_a_word_longer_than_a_line() {
+        assert_eq!(wrap("aaa bbb ccc", 7), ["aaa bbb", "ccc"]);
+        assert_eq!(wrap("  aaa bbb", 6), ["  aaa", "  bbb"]);
+        assert_eq!(wrap("abcdefgh", 3), ["abc", "def", "gh"]);
+        assert_eq!(wrap("a\n\nb", 5), ["a", "", "b"]);
     }
 }

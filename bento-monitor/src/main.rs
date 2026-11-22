@@ -32,6 +32,7 @@ use std::time::Instant;
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::layout::Rect;
 
 use app::{App, Key, Outcome, REFRESH_INTERVAL};
 use install::{DEFAULT_BINARY, DEFAULT_CONFIG, DEFAULT_MONITOR, Paths, UNIT_DIR};
@@ -90,6 +91,11 @@ fn event_loop(
             match event::read()? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     let key = classify(key);
+                    // A prompt taller than the screen scrolls, and where
+                    // it ends depends on the screen's size now.
+                    if let Ok(size) = terminal.size() {
+                        app.screen = Rect::new(0, 0, size.width, size.height);
+                    }
                     if key == Key::Refresh {
                         app.refresh(runtime);
                         last_refresh = Instant::now();
@@ -98,6 +104,7 @@ fn event_loop(
                         Outcome::Quit => return Ok(()),
                         Outcome::Run { title, commands } => {
                             run_commands(terminal, app, &title, &commands)?;
+                            app.finish_run();
                             app.refresh(runtime);
                             last_refresh = Instant::now();
                         }
@@ -183,6 +190,8 @@ fn classify(key: KeyEvent) -> Key {
         KeyCode::Tab => Key::Tab,
         KeyCode::BackTab => Key::BackTab,
         KeyCode::Enter => Key::Enter,
+        KeyCode::PageUp => Key::PageUp,
+        KeyCode::PageDown => Key::PageDown,
         KeyCode::Esc => Key::Esc,
         KeyCode::F(1) => Key::Help,
         KeyCode::F(5) => Key::Refresh,

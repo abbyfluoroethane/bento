@@ -58,6 +58,29 @@ impl Role {
         }
     }
 
+    /// The role for this reading, and the role to remember for the next.
+    ///
+    /// The role comes from the configuration, so a configuration that
+    /// does not parse for a moment (the operator is editing it) must not
+    /// change it: a runner would read as a controller. A configuration
+    /// that loads decides and is remembered. One that does not keeps the
+    /// last role such a configuration decided, and only a machine that
+    /// never had one falls back to the unit files.
+    pub fn next_role(
+        remembered: Option<Role>,
+        config: Option<&Config>,
+        units: &[UnitStatus],
+    ) -> (Role, Option<Role>) {
+        match (config, remembered) {
+            (Some(_), _) => {
+                let role = Role::detect(config, units);
+                (role, Some(role))
+            }
+            (None, Some(role)) => (role, Some(role)),
+            (None, None) => (Role::detect(None, units), None),
+        }
+    }
+
     /// The units this machine is meant to run, in screen order.
     pub fn units(self) -> Vec<&'static Unit> {
         UNITS.iter().filter(|unit| self.wants(unit.name)).collect()
@@ -176,5 +199,26 @@ mod tests {
                 "{listen}"
             );
         }
+    }
+
+    #[test]
+    fn a_configuration_that_stops_loading_keeps_the_role_it_had() {
+        let runner = config("10.0.0.97:10443", 0);
+        let (role, remembered) = Role::next_role(None, Some(&runner), &[]);
+        assert_eq!(role, Role::Runner);
+
+        // The file does not parse for a moment: still a runner.
+        let (role, remembered) = Role::next_role(remembered, None, &[]);
+        assert_eq!(role, Role::Runner);
+        assert_eq!(remembered, Some(Role::Runner));
+
+        // It parses again and says controller: that wins.
+        let controller = config("10.0.0.97:10443", 1);
+        let (role, _) = Role::next_role(remembered, Some(&controller), &[]);
+        assert_eq!(role, Role::Controller);
+
+        // A machine that never had a loaded file reads its unit files.
+        let (role, remembered) = Role::next_role(None, None, &[]);
+        assert_eq!((role, remembered), (Role::Controller, None));
     }
 }

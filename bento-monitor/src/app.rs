@@ -9,14 +9,16 @@ use std::time::Duration;
 
 use bento_config::Config;
 use bento_hypervisor::{CheckConfig, CheckResult};
+use ratatui::layout::Rect;
 
 use crate::fleet::{self, View};
 use crate::host::HostSample;
-use crate::install::{self, HostFacts, Paths, Step, StepKind};
+use crate::install::{self, CONFIG_DOES_NOT_LOAD, HostFacts, Paths, Staging, Step, StepKind};
 use crate::libvirt::{self, Census};
 use crate::role::Role;
 use crate::run::Cmd;
 use crate::systemd::{self, UNITS, UnitAction, UnitStatus};
+use crate::ui;
 
 /// The Fleet screen sits beside Services because both report what is
 /// running rather than what has to be installed (MULTI-NODE 20).
@@ -92,6 +94,10 @@ pub struct App {
     /// Services and Install tabs expect, and which fleet view the Fleet
     /// tab can show.
     pub role: Role,
+    /// The role that the last configuration that loaded decided. A
+    /// configuration that stops loading keeps it (see
+    /// [`Role::next_role`]).
+    settled_role: Option<Role>,
     pub tab: Tab,
     pub units: Vec<UnitStatus>,
     pub systemctl_error: Option<String>,
@@ -105,6 +111,15 @@ pub struct App {
     pub fleet: View,
     pub runner_cursor: usize,
     pub modal: Option<Modal>,
+    /// How many lines the open modal is scrolled down.
+    pub modal_scroll: u16,
+    /// The size of the terminal, set by the caller before each key. A
+    /// modal that is taller than it has to scroll, and what counts as
+    /// "read to the end" depends on it.
+    pub screen: Rect,
+    /// The unit files that the open prompt shows, rendered for `install`
+    /// to copy from. They live as long as the prompt does.
+    pub staging: Staging,
     /// The last thing that happened, shown along the bottom.
     pub status: String,
 }
@@ -116,6 +131,7 @@ impl App {
             euid,
             machine_id: fleet::machine_id(),
             role: Role::Controller,
+            settled_role: None,
             tab: Tab::Services,
             units: merge_units(&[], Role::Controller),
             systemctl_error: None,
@@ -129,6 +145,9 @@ impl App {
             fleet: View::Controller(Err("not read yet".to_string())),
             runner_cursor: 0,
             modal: None,
+            modal_scroll: 0,
+            screen: Rect::new(0, 0, 80, 24),
+            staging: Staging::default(),
             status: if euid == 0 {
                 "running as root".to_string()
             } else {
@@ -164,6 +183,13 @@ impl App {
     /// Rereads everything the screen shows. The libvirt census is the only
     /// asynchronous part, so it borrows the caller's runtime.
     pub fn refresh(&mut self, runtime: &tokio::runtime::Runtime) {
+        // A prompt holds commands that were built from the state it was
+        // opened on: the paths, the role, the staged files. A reread
+        // under it would let the operator confirm commands that no
+        // longer match the screen behind them.
+        if matches!(self.modal, Some(Modal::Confirm { .. })) {
+            return;
+        }
         let parsed = match systemd::show_command().capture() {
             Ok(output) => {
                 self.systemctl_error = None;
@@ -187,7 +213,8 @@ impl App {
         // The role is decided from the configuration and the unit files
         // this machine already carries, so it is read after both and
         // before anything that counts units.
-        self.role = Role::detect(self.config.as_ref().ok(), &parsed);
+        (self.role, self.settled_role) =
+            Role::next_role(self.settled_role, self.config.as_ref().ok(), &parsed);
         self.units = merge_units(&parsed, self.role);
 
         let facts = HostFacts::probe(&self.paths);
@@ -275,22 +302,62 @@ impl App {
     }
 
     fn on_modal_key(&mut self, key: Key, modal: Modal) -> Outcome {
+        // Ctrl-C quits from anywhere, as it does with no modal open.
+        if key == Key::Quit {
+            self.close_modal();
+            return Outcome::Quit;
+        }
+        let (max, page) = ui::modal_scroll_limit(&modal, self.screen);
+        self.modal_scroll = self.modal_scroll.min(max);
+        if max > 0 {
+            let scrolled = match key {
+                Key::Up | Key::Char('k') => Some(self.modal_scroll.saturating_sub(1)),
+                Key::Down | Key::Char('j') => Some(self.modal_scroll.saturating_add(1)),
+                Key::PageUp => Some(self.modal_scroll.saturating_sub(page)),
+                Key::PageDown | Key::Char(' ') => Some(self.modal_scroll.saturating_add(page)),
+                _ => None,
+            };
+            if let Some(scroll) = scrolled {
+                self.modal_scroll = scroll.min(max);
+                return Outcome::None;
+            }
+        }
         match (key, modal) {
-            (Key::Char('y') | Key::Enter, Modal::Confirm { title, commands }) => {
+            // Only `y` confirms. Enter opens the prompt, so a held or
+            // repeated Enter would otherwise run a privileged step that
+            // nobody read. A prompt that does not fit on the screen
+            // confirms only once its last line has been shown.
+            (Key::Char('y'), Modal::Confirm { title, commands }) => {
+                if self.modal_scroll < max {
+                    self.status = "scroll down to the end of the commands first".to_string();
+                    return Outcome::None;
+                }
                 self.modal = None;
+                self.modal_scroll = 0;
                 Outcome::Run { title, commands }
             }
-            (Key::Char('q'), Modal::Help) => {
-                // `q` closes the help rather than the program: an operator
-                // who opened help by accident should not lose the screen.
-                self.modal = None;
-                Outcome::None
-            }
+            // `q` closes the help rather than the program: an operator
+            // who opened help by accident should not lose the screen.
             _ => {
-                self.modal = None;
+                self.close_modal();
                 Outcome::None
             }
         }
+    }
+
+    /// Closes the modal. A cancelled prompt takes its staged files with
+    /// it. A confirmed one does not come through here: the commands still
+    /// need them (see [`App::finish_run`]).
+    fn close_modal(&mut self) {
+        self.modal = None;
+        self.modal_scroll = 0;
+        self.staging.clear();
+    }
+
+    /// Removes what the last run staged. The caller calls it when the
+    /// commands have ended.
+    pub fn finish_run(&mut self) {
+        self.staging.clear();
     }
 
     fn move_cursor(&mut self, delta: isize) {
@@ -341,6 +408,21 @@ impl App {
         };
         let selected = self.selected_unit();
         let unit = selected.name.clone();
+        // A left-over unit file for a unit the role does not run can be
+        // stopped, disabled, and read, but never started: a proxy on a
+        // runner is what DEPLOYING.md 6 rules out (MULTI-NODE 19).
+        if !selected.wanted
+            && matches!(
+                action,
+                UnitAction::Start | UnitAction::Enable | UnitAction::Restart
+            )
+        {
+            self.modal = Some(Modal::Message {
+                title: format!("not a {} unit", self.role.label()),
+                body: self.role.not_here(&unit),
+            });
+            return Outcome::None;
+        }
         if !selected.installed() && !matches!(action, UnitAction::Logs) {
             let (title, body) = if selected.wanted {
                 (
@@ -424,7 +506,7 @@ impl App {
                 let Some(step) = self.selected_step().cloned() else {
                     return Outcome::None;
                 };
-                self.run_step(step.kind, &step.title, step.blocked.as_deref());
+                self.run_step(&step);
             }
             Key::Char('a') => self.run_remaining_steps(),
             _ => {}
@@ -432,17 +514,42 @@ impl App {
         Outcome::None
     }
 
-    fn run_step(&mut self, kind: StepKind, title: &str, blocked: Option<&str>) {
-        if let Some(reason) = blocked {
+    fn run_step(&mut self, step: &Step) {
+        let title = &step.title;
+        if let Some(reason) = &step.blocked {
             self.modal = Some(Modal::Message {
                 title: format!("cannot run: {title}"),
-                body: reason.to_string(),
+                body: reason.clone(),
             });
             return;
         }
-        match install::commands(kind, &self.paths, self.euid, self.role) {
-            Ok(commands) => self.confirm(title.to_string(), commands),
+        // A step that is done does not run again. Each one can replace
+        // what the host has now: the configuration step would put the
+        // example over the live file and its secrets. What a done step
+        // lacks the operator changes on purpose, by hand or from the
+        // Config tab.
+        if step.done {
+            self.modal = Some(Modal::Message {
+                title: format!("already done: {title}"),
+                body: format!(
+                    "{}\n\nThis step does not run again, because it could replace what \
+                     the host has now.",
+                    step.detail
+                ),
+            });
+            return;
+        }
+        self.staging = Staging::default();
+        match install::commands(
+            step.kind,
+            &self.paths,
+            self.euid,
+            self.role,
+            &mut self.staging,
+        ) {
+            Ok(commands) => self.confirm(title.clone(), commands),
             Err(error) => {
+                self.staging.clear();
                 self.modal = Some(Modal::Message {
                     title: format!("cannot run: {title}"),
                     body: error,
@@ -468,11 +575,30 @@ impl App {
             });
             return;
         }
+        // A blocked step normally waits for an earlier one in this list.
+        // One that waits for the configuration to load does not: the role
+        // is not known, so the units are not either.
+        if let Some(step) = self
+            .steps
+            .iter()
+            .find(|step| step.blocked.as_deref() == Some(CONFIG_DOES_NOT_LOAD))
+        {
+            self.modal = Some(Modal::Message {
+                title: "cannot install everything".to_string(),
+                body: format!(
+                    "{}: {CONFIG_DOES_NOT_LOAD}. Fix it on the Config tab first.",
+                    step.title
+                ),
+            });
+            return;
+        }
+        self.staging = Staging::default();
         let mut commands = Vec::new();
         for kind in pending {
-            match install::commands(kind, &self.paths, self.euid, self.role) {
+            match install::commands(kind, &self.paths, self.euid, self.role, &mut self.staging) {
                 Ok(mut list) => commands.append(&mut list),
                 Err(error) => {
+                    self.staging.clear();
                     self.modal = Some(Modal::Message {
                         title: "cannot install everything".to_string(),
                         body: error,
@@ -523,6 +649,21 @@ impl App {
             'i' => self.confirm("list the stored images".to_string(), vec![bentod("images")]),
             'b' => match self.database_path() {
                 Some(db) => {
+                    let stale = self.units_older_than_binary();
+                    if !stale.is_empty() {
+                        self.modal = Some(Modal::Message {
+                            title: "Backup".to_string(),
+                            body: format!(
+                                "The installed bentod is newer than the running {}.\n\n\
+                                 A backup runs the installed bentod, and opening the database \
+                                 applies its migrations under the process that still runs. \
+                                 Restart those units first, or use the copy that the install \
+                                 script made in /var/lib/bento/rollback/ (DEPLOYING.md 6).",
+                                stale.join(", ")
+                            ),
+                        });
+                        return Outcome::None;
+                    }
                     let destination = format!("{db}.backup-{}", timestamp());
                     self.confirm(
                         format!("copy the database to {destination}"),
@@ -537,6 +678,19 @@ impl App {
             // an operator who wants a different file can read the shape
             // and run it themselves.
             'r' => match self.database_path() {
+                Some(_) if !self.running_units().is_empty() => {
+                    // A restore does not coordinate with a writer
+                    // (DEPLOYING.md 8): the units stop first.
+                    self.modal = Some(Modal::Message {
+                        title: "Restore".to_string(),
+                        body: format!(
+                            "Stop these units first: {}.\n\n\
+                             A restore replaces the database under any process that has it \
+                             open. Start them again after it.",
+                            self.running_units().join(", ")
+                        ),
+                    });
+                }
                 Some(db) => match newest_backup(&db) {
                     Some(source) => self.confirm(
                         format!("replace {db} with {source}"),
@@ -560,12 +714,33 @@ impl App {
         Outcome::None
     }
 
+    /// The units that run now, by name. A unit the role does not want
+    /// counts: a left-over one holds the database open all the same.
+    fn running_units(&self) -> Vec<String> {
+        self.units
+            .iter()
+            .filter(|unit| unit.running())
+            .map(|unit| unit.name.clone())
+            .collect()
+    }
+
+    /// The running units that started before the installed `bentod` was
+    /// written (DEPLOYING.md 6, Upgrading).
+    fn units_older_than_binary(&self) -> Vec<String> {
+        let age = std::fs::metadata(&self.paths.binary)
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|time| time.elapsed().ok());
+        units_older_than(&self.units, self.host.uptime, age)
+    }
+
     /// The database the loaded configuration names, if one loaded.
     fn database_path(&self) -> Option<String> {
         self.config.as_ref().ok().map(|c| c.db_path.clone())
     }
 
     fn confirm(&mut self, title: String, commands: Vec<Cmd>) {
+        self.modal_scroll = 0;
         self.modal = Some(Modal::Confirm { title, commands });
     }
 }
@@ -591,34 +766,50 @@ fn timestamp() -> String {
         .expect("fixed UTC timestamp format")
 }
 
-/// The newest copy of `db` beside it.
+/// The newest copy of `db` that the Backup key wrote beside it.
 ///
-/// A copy carries one of two prefixes: `.backup-` is what the Backup key
-/// writes, and `.before-restore-` is what `restore-db` keeps of the
-/// database it replaced. Both then carry the same sortable stamp, and the
-/// stamp is what decides. Comparing whole names would not: the two
-/// prefixes sort against each other, so an older `before-restore` copy
-/// would win over a newer `backup` one.
+/// `restore-db` keeps what it replaced as `.before-restore-<stamp>`. That
+/// file is the way back from a restore, not a source for one: it is the
+/// newest file of the directory right after a restore, and offering it
+/// would let a second `r` undo the first without a word. It is read by
+/// hand, never picked here.
 pub fn newest_backup(db: &str) -> Option<String> {
-    const PREFIXES: [&str; 2] = [".backup-", ".before-restore-"];
     let path = std::path::Path::new(db);
     let directory = path.parent()?;
-    let stem = path.file_name()?.to_str()?;
-    let mut newest: Option<(String, String)> = None;
+    let prefix = format!("{}.backup-", path.file_name()?.to_str()?);
+    let mut newest: Option<String> = None;
     for entry in std::fs::read_dir(directory).ok()? {
         let Ok(entry) = entry else { continue };
         let name = entry.file_name().to_string_lossy().into_owned();
-        let Some(stamp) = PREFIXES.iter().find_map(|prefix| {
-            name.strip_prefix(&format!("{stem}{prefix}"))
-                .map(str::to_owned)
-        }) else {
-            continue;
-        };
-        if newest.as_ref().is_none_or(|(best, _)| stamp > *best) {
-            newest = Some((stamp, name));
+        // The stamp sorts as text, so the largest name is the newest.
+        if name.starts_with(&prefix) && newest.as_ref().is_none_or(|best| name > *best) {
+            newest = Some(name);
         }
     }
-    newest.map(|(_, name)| directory.join(name).display().to_string())
+    newest.map(|name| directory.join(name).display().to_string())
+}
+
+/// The running, wanted units that went active before the binary was
+/// written, which is to say that still run the old build.
+///
+/// `binary_age` is how long ago the installed binary was written, and a
+/// unit's uptime is how long it has been active. A unit that has been
+/// active for longer than the binary has existed started before it.
+/// `None` for either says nothing is known, and then nothing is claimed.
+pub fn units_older_than(
+    units: &[UnitStatus],
+    host_uptime: Option<Duration>,
+    binary_age: Option<Duration>,
+) -> Vec<String> {
+    let (Some(host_uptime), Some(binary_age)) = (host_uptime, binary_age) else {
+        return Vec::new();
+    };
+    units
+        .iter()
+        .filter(|unit| unit.wanted && unit.running())
+        .filter(|unit| unit.uptime(host_uptime).is_some_and(|up| up > binary_age))
+        .map(|unit| unit.name.clone())
+        .collect()
 }
 
 /// One entry per unit of [`UNITS`], in that order, whatever `systemctl`
@@ -665,6 +856,8 @@ pub enum Key {
     Tab,
     BackTab,
     Enter,
+    PageUp,
+    PageDown,
     Esc,
     Help,
     Refresh,
@@ -721,6 +914,19 @@ mod tests {
         );
         app.steps = install::steps(&app.paths, &facts(), &app.units, Some(true), role);
         app
+    }
+
+    fn stop_every_unit(app: &mut App) {
+        for unit in &mut app.units {
+            unit.active_state = "inactive".to_string();
+        }
+    }
+
+    fn message(app: &App) -> (String, String) {
+        let Some(Modal::Message { title, body }) = app.modal.clone() else {
+            panic!("expected a message, got {:?}", app.modal);
+        };
+        (title, body)
     }
 
     #[test]
@@ -784,7 +990,7 @@ mod tests {
             commands[0].display(),
             format!("sudo systemctl restart {}", systemd::SERVE)
         );
-        let outcome = app.on_key(Key::Enter);
+        let outcome = app.on_key(Key::Char('y'));
         assert_eq!(outcome, Outcome::Run { title, commands });
         assert!(app.modal.is_none());
     }
@@ -821,13 +1027,21 @@ mod tests {
     #[test]
     fn the_install_tab_runs_one_step_or_every_missing_step() {
         let mut app = app();
+        // The directory step reads the host, so point it at a tree that
+        // has none of them.
+        let root = tempfile::tempdir().unwrap();
+        app.paths.config = root.path().join("etc/bento.toml");
+        app.paths.image_dir = root.path().join("images");
+        app.paths.storage_dir = root.path().join("storage");
+        app.paths.key_dir = root.path().join("keys");
         app.tab = Tab::Install;
         app.step_cursor = 1; // the directories, which nothing blocks
         app.on_key(Key::Enter);
         let Some(Modal::Confirm { commands, .. }) = app.modal.clone() else {
             panic!("expected a confirmation, got {:?}", app.modal);
         };
-        assert_eq!(commands.len(), 1);
+        // The shared mode 0755 and the private key directory.
+        assert_eq!(commands.len(), 2);
 
         app.modal = None;
         app.on_key(Key::Char('a'));
@@ -879,6 +1093,7 @@ mod tests {
             db_path: db.display().to_string(),
             ..Default::default()
         });
+        stop_every_unit(&mut app);
 
         // With no copy beside it, restore says so rather than offering a
         // command with nothing to run.
@@ -959,5 +1174,226 @@ mod tests {
         assert_eq!(app.on_key(Key::Char('q')), Outcome::None);
         assert!(app.modal.is_none());
         assert_eq!(app.on_key(Key::Char('q')), Outcome::Quit);
+    }
+
+    fn with_config_installed(app: &mut App) {
+        let facts = HostFacts {
+            config_installed: true,
+            ..facts()
+        };
+        app.steps = install::steps(&app.paths, &facts, &app.units, Some(true), app.role);
+    }
+
+    #[test]
+    fn a_step_that_is_done_answers_with_a_message_and_not_a_prompt() {
+        let mut app = app();
+        with_config_installed(&mut app);
+        app.tab = Tab::Install;
+        app.step_cursor = 2; // the configuration file, which the host has
+        assert!(app.steps[2].done);
+        assert_eq!(app.on_key(Key::Enter), Outcome::None);
+        let (title, _) = message(&app);
+        assert!(title.starts_with("already done"), "{title}");
+    }
+
+    #[test]
+    fn enter_opens_a_prompt_and_never_confirms_it() {
+        let mut app = app();
+        app.tab = Tab::Install;
+        app.step_cursor = 1;
+        assert_eq!(app.on_key(Key::Enter), Outcome::None);
+        assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
+        // A repeated Enter must not run the step.
+        assert_eq!(app.on_key(Key::Enter), Outcome::None);
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn control_c_quits_from_inside_a_prompt() {
+        let mut app = app();
+        app.on_key(Key::Char('r'));
+        assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
+        assert_eq!(app.on_key(Key::Quit), Outcome::Quit);
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn a_prompt_that_does_not_fit_confirms_only_after_its_end_was_shown() {
+        let mut app = app();
+        let commands: Vec<Cmd> = (0..11)
+            .map(|index| Cmd::owned("sudo", vec!["install".into(), format!("file-{index}")]))
+            .collect();
+        // Make each command long enough to wrap on 80 columns.
+        let commands: Vec<Cmd> = commands
+            .into_iter()
+            .map(|mut command| {
+                command.args.push("x".repeat(90));
+                command
+            })
+            .collect();
+        app.screen = Rect::new(0, 0, 80, 24);
+        app.confirm("install everything".to_string(), commands);
+        let (max, _) = ui::modal_scroll_limit(app.modal.as_ref().expect("modal"), app.screen);
+        assert!(max > 0);
+
+        // `y` before the end does nothing and keeps the prompt.
+        assert_eq!(app.on_key(Key::Char('y')), Outcome::None);
+        assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
+        for _ in 0..max {
+            assert_eq!(app.on_key(Key::Char('j')), Outcome::None);
+        }
+        assert_eq!(app.modal_scroll, max);
+        assert!(matches!(app.on_key(Key::Char('y')), Outcome::Run { .. }));
+        assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn a_reread_leaves_an_open_prompt_and_its_state_alone() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let mut app = app();
+        app.on_key(Key::Char('r'));
+        let before = app.modal.clone();
+        app.role = Role::Runner;
+        app.refresh(&runtime);
+        assert_eq!(app.modal, before);
+        // Nothing was reread: the configuration is still unread.
+        assert_eq!(
+            app.config.as_ref().err().map(String::as_str),
+            Some("not read yet")
+        );
+        assert_eq!(app.role, Role::Runner);
+    }
+
+    #[test]
+    fn a_unit_the_role_does_not_run_is_not_started_even_with_a_unit_file() {
+        let mut app = app_as(Role::Runner);
+        app.units = merge_units(
+            &[UnitStatus {
+                name: systemd::PROXY.to_string(),
+                load_state: "loaded".to_string(),
+                fragment_path: format!("{UNIT_DIR}/{}", systemd::PROXY),
+                active_state: "inactive".to_string(),
+                ..Default::default()
+            }],
+            Role::Runner,
+        );
+        app.unit_cursor = 1;
+        assert!(app.selected_unit().installed());
+        for key in ['s', 'e', 'r'] {
+            app.on_key(Key::Char(key));
+            let (title, _) = message(&app);
+            assert_eq!(title, "not a runner unit", "{key}");
+            app.modal = None;
+        }
+        // Stopping and reading stay possible.
+        for key in ['t', 'd', 'l'] {
+            app.on_key(Key::Char(key));
+            assert!(matches!(app.modal, Some(Modal::Confirm { .. })), "{key}");
+            app.modal = None;
+        }
+    }
+
+    #[test]
+    fn a_restore_waits_for_the_units_to_stop() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = directory.path().join("bento.db");
+        std::fs::write(
+            directory.path().join("bento.db.backup-20260101-000000"),
+            b"",
+        )
+        .unwrap();
+        let mut app = app();
+        app.tab = Tab::Config;
+        app.config = Ok(Config {
+            db_path: db.display().to_string(),
+            ..Default::default()
+        });
+        // The fixture's serve unit is active.
+        app.on_key(Key::Char('r'));
+        let (title, body) = message(&app);
+        assert_eq!(title, "Restore");
+        assert!(body.contains(systemd::SERVE), "{body}");
+    }
+
+    #[test]
+    fn a_restore_never_offers_the_safety_copy_that_a_restore_left() {
+        let directory = tempfile::tempdir().unwrap();
+        let db = directory.path().join("bento.db");
+        for name in [
+            "bento.db.backup-20260101-000000",
+            "bento.db.before-restore-20260905-120000",
+        ] {
+            std::fs::write(directory.path().join(name), b"").unwrap();
+        }
+        assert_eq!(
+            newest_backup(&db.display().to_string()),
+            Some(
+                directory
+                    .path()
+                    .join("bento.db.backup-20260101-000000")
+                    .display()
+                    .to_string()
+            )
+        );
+    }
+
+    fn running(name: &str, since_seconds: u64) -> UnitStatus {
+        UnitStatus {
+            name: name.to_string(),
+            wanted: true,
+            active_state: "active".to_string(),
+            active_since_monotonic: Some(since_seconds * 1_000_000),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_unit_that_started_before_the_binary_was_written_still_runs_the_old_build() {
+        let host = Some(Duration::from_secs(1000));
+        // Active for 900 s. The binary is 60 s old, so it is newer.
+        let units = vec![running(systemd::SERVE, 100)];
+        assert_eq!(
+            units_older_than(&units, host, Some(Duration::from_secs(60))),
+            [systemd::SERVE]
+        );
+        // Restarted 10 s ago, after the binary: current.
+        let units = vec![running(systemd::SERVE, 990)];
+        assert!(units_older_than(&units, host, Some(Duration::from_secs(60))).is_empty());
+        // Unknown ages claim nothing.
+        assert!(units_older_than(&units, None, Some(Duration::ZERO)).is_empty());
+        assert!(units_older_than(&units, host, None).is_empty());
+    }
+
+    #[test]
+    fn a_backup_after_an_install_and_before_a_restart_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let binary = directory.path().join("bentod");
+        std::fs::write(&binary, b"new build").unwrap();
+        let mut app = app();
+        app.tab = Tab::Config;
+        app.paths.binary = binary;
+        app.config = Ok(Config {
+            db_path: directory.path().join("bento.db").display().to_string(),
+            ..Default::default()
+        });
+        // serve went active 900 s ago; the binary was written just now.
+        app.host.uptime = Some(Duration::from_secs(1000));
+        app.units[0] = UnitStatus {
+            fragment_path: format!("{UNIT_DIR}/{}", systemd::SERVE),
+            load_state: "loaded".to_string(),
+            ..running(systemd::SERVE, 100)
+        };
+        app.on_key(Key::Char('b'));
+        let (title, body) = message(&app);
+        assert_eq!(title, "Backup");
+        assert!(body.contains(systemd::SERVE), "{body}");
+        app.modal = None;
+
+        // After the restart the unit is newer than the binary.
+        app.units[0].active_since_monotonic = Some(1_000_000_000);
+        app.on_key(Key::Char('b'));
+        assert!(matches!(app.modal, Some(Modal::Confirm { .. })));
     }
 }

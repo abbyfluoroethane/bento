@@ -22,6 +22,12 @@ pub const DEFAULT_MONITOR: &str = "/usr/local/bin/bento-monitor";
 pub const DEFAULT_CONFIG: &str = "/etc/bento/bento.toml";
 pub const UNIT_DIR: &str = "/etc/systemd/system";
 
+/// Why the unit and enable steps wait while the configuration file is
+/// there and does not parse. The role, and so the list of units, comes
+/// from that file (MULTI-NODE 4): a runner whose file has a typo would
+/// otherwise read as a controller and be offered the controller units.
+pub const CONFIG_DOES_NOT_LOAD: &str = "configuration does not load";
+
 /// Every path the monitor installs to or reads from. The state
 /// directories come from the configuration when it loads, and from the
 /// SPEC defaults when it does not, so a host with no configuration yet
@@ -213,6 +219,7 @@ pub fn steps(
 ) -> Vec<Step> {
     let wanted = role.units();
     let missing = &facts.missing_directories;
+    let role_unsure = facts.config_installed && config_loaded == Some(false);
     let binaries_done = facts.missing_binaries.is_empty() && facts.stale_binaries.is_empty();
     let installed_units = units
         .iter()
@@ -279,16 +286,28 @@ pub fn steps(
                 format!("{installed_units} of {} installed", wanted.len())
             },
             done: installed_units == wanted.len(),
-            blocked: (installed_units != wanted.len() && !facts.missing_binaries.is_empty())
-                .then(|| "install the binaries first".to_string()),
+            blocked: if installed_units == wanted.len() {
+                None
+            } else if role_unsure {
+                Some(CONFIG_DOES_NOT_LOAD.to_string())
+            } else {
+                (!facts.missing_binaries.is_empty())
+                    .then(|| "install the binaries first".to_string())
+            },
         },
         Step {
             kind: StepKind::Enable,
             title: "enabled at boot".to_string(),
             detail: format!("{enabled_units} of {} enabled", wanted.len()),
             done: enabled_units == wanted.len(),
-            blocked: (enabled_units != wanted.len() && installed_units != wanted.len())
-                .then(|| "install the unit files first".to_string()),
+            blocked: if enabled_units == wanted.len() {
+                None
+            } else if role_unsure {
+                Some(CONFIG_DOES_NOT_LOAD.to_string())
+            } else {
+                (installed_units != wanted.len())
+                    .then(|| "install the unit files first".to_string())
+            },
         },
     ]
 }
@@ -324,7 +343,16 @@ fn binary_detail(paths: &Paths, facts: &HostFacts) -> String {
 /// Writing a unit file needs privilege, so the text is rendered to a
 /// temporary file first and `install` moves it into place. That keeps
 /// every privileged act a command the operator saw.
-pub fn commands(kind: StepKind, paths: &Paths, euid: u32, role: Role) -> Result<Vec<Cmd>, String> {
+///
+/// `staging` holds the rendered unit files until the caller drops it, so
+/// the files live exactly as long as the prompt that shows them.
+pub fn commands(
+    kind: StepKind,
+    paths: &Paths,
+    euid: u32,
+    role: Role,
+    staging: &mut Staging,
+) -> Result<Vec<Cmd>, String> {
     match kind {
         StepKind::Binary => {
             let source = paths
@@ -368,18 +396,29 @@ pub fn commands(kind: StepKind, paths: &Paths, euid: u32, role: Role) -> Result<
             ])
         }
         StepKind::Directories => {
-            let mut args = vec!["-d".to_string(), "-m".to_string(), "0755".to_string()];
-            args.extend(
-                directories(paths)
-                    .iter()
-                    .map(|dir| dir.display().to_string()),
-            );
-            Ok(vec![Cmd::owned("install", args).privileged(euid)])
+            let missing: Vec<PathBuf> = directories(paths)
+                .into_iter()
+                .filter(|dir| !dir.is_dir())
+                .collect();
+            let commands = directory_commands(paths, &missing, euid);
+            if commands.is_empty() {
+                return Err("every state directory exists already".to_string());
+            }
+            Ok(commands)
         }
         StepKind::Config => {
             let example = paths
                 .example_config()
                 .ok_or("no bento.example.toml; pass --source")?;
+            // `install` overwrites. The live file carries the secrets
+            // (DEPLOYING.md 4), so a stale "not done" must never be able
+            // to replace it with the example.
+            if paths.config.symlink_metadata().is_ok() {
+                return Err(format!(
+                    "{} exists already; this step never overwrites it. Edit it on the Config tab.",
+                    paths.config.display()
+                ));
+            }
             Ok(vec![
                 // 0600: the file carries the ACME and OIDC secrets
                 // (DEPLOYING.md 4).
@@ -403,7 +442,8 @@ pub fn commands(kind: StepKind, paths: &Paths, euid: u32, role: Role) -> Result<
                     &paths.binary.display().to_string(),
                     paths.config_flag(),
                 );
-                let staged = stage(&format!("{}.staged", unit.name), &text)
+                let staged = staging
+                    .stage(&format!("{}.staged", unit.name), &text)
                     .map_err(|error| format!("staging {}: {error}", unit.name))?;
                 commands.push(
                     Cmd::owned(
@@ -429,13 +469,73 @@ pub fn commands(kind: StepKind, paths: &Paths, euid: u32, role: Role) -> Result<
     }
 }
 
-/// Writes one rendered file into a private directory under the temporary
-/// directory, for `install` to copy from.
-fn stage(name: &str, text: &str) -> io::Result<PathBuf> {
-    let directory = std::env::temp_dir().join(format!("bento-monitor-{}", std::process::id()));
-    std::fs::create_dir_all(&directory)?;
-    let path = directory.join(name);
-    std::fs::write(&path, text)?;
+/// The commands that create the directories in `missing`, and only
+/// those. `install -d -m` sets the mode of a directory that exists as
+/// well, and `bentod` keeps the key directory at 0700: running the step
+/// again must not widen it. The key directory is created 0700.
+fn directory_commands(paths: &Paths, missing: &[PathBuf], euid: u32) -> Vec<Cmd> {
+    let (keys, others): (Vec<&PathBuf>, Vec<&PathBuf>) =
+        missing.iter().partition(|dir| **dir == paths.key_dir);
+    let mut commands = Vec::new();
+    for (mode, list) in [("0755", others), ("0700", keys)] {
+        if list.is_empty() {
+            continue;
+        }
+        let mut args = vec!["-d".to_string(), "-m".to_string(), mode.to_string()];
+        args.extend(list.iter().map(|dir| dir.display().to_string()));
+        commands.push(Cmd::owned("install", args).privileged(euid));
+    }
+    commands
+}
+
+/// The directory that holds rendered unit files between the moment a
+/// prompt opens and the moment the operator answers it.
+///
+/// The privileged `install` runs later than the write, so the path must
+/// not be one a local user can predict or prepare (DEPLOYING.md 6). The
+/// directory has a random name and mode 0700, and this process creates
+/// it. It is removed when this value is dropped or cleared.
+#[derive(Debug, Default)]
+pub struct Staging {
+    dir: Option<tempfile::TempDir>,
+}
+
+impl Staging {
+    pub fn stage(&mut self, name: &str, text: &str) -> io::Result<PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = match &self.dir {
+            Some(dir) => dir,
+            None => self.dir.insert(
+                tempfile::Builder::new()
+                    .prefix("bento-monitor-")
+                    // Not left to the library's default, which a test
+                    // showed to be 0755 under a usual umask.
+                    .permissions(std::fs::Permissions::from_mode(0o700))
+                    .tempdir()?,
+            ),
+        };
+        stage_in(dir.path(), name, text)
+    }
+
+    /// Removes the directory and what it holds.
+    pub fn clear(&mut self) {
+        self.dir = None;
+    }
+}
+
+/// Writes one rendered file into `base`. The file is new (`O_EXCL`, which
+/// does not follow a symlink at the name) and readable by its owner only.
+fn stage_in(base: &Path, name: &str, text: &str) -> io::Result<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let path = base.join(name);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)?;
+    file.write_all(text.as_bytes())?;
     Ok(path)
 }
 
@@ -456,6 +556,11 @@ mod tests {
             key_dir: PathBuf::from("/var/lib/bento/keys"),
             source,
         }
+    }
+
+    /// A step that stages nothing, so the staging directory has no use.
+    fn cmds(kind: StepKind, paths: &Paths, euid: u32, role: Role) -> Result<Vec<Cmd>, String> {
+        commands(kind, paths, euid, role, &mut Staging::default())
     }
 
     fn ready() -> HostFacts {
@@ -487,23 +592,26 @@ mod tests {
 
     #[test]
     fn the_directory_step_creates_the_configuration_directory_as_well() {
-        let commands =
-            commands(StepKind::Directories, &paths(None), 0, Role::Controller).expect("commands");
+        let commands = directory_commands(&paths(None), &directories(&paths(None)), 0);
         let line = commands[0].display();
         assert!(line.starts_with("install -d -m 0755 "), "{line}");
         for expected in [
             "/etc/bento",
             "/var/lib/bento/images",
             "/var/lib/bento/storage",
-            "/var/lib/bento/keys",
         ] {
             assert!(line.contains(expected), "{line} misses {expected}");
         }
+        // The key directory is the private one.
+        assert_eq!(
+            commands[1].display(),
+            "install -d -m 0700 /var/lib/bento/keys"
+        );
     }
 
     #[test]
     fn the_binary_step_builds_unprivileged_and_installs_through_the_script() {
-        let commands = commands(
+        let commands = cmds(
             StepKind::Binary,
             &paths(Some(PathBuf::from("/srv/src"))),
             1000,
@@ -526,7 +634,7 @@ mod tests {
         let mut paths = paths(Some(PathBuf::from("/srv/src")));
         paths.binary = PathBuf::from("/opt/bento/bentod");
         paths.monitor = PathBuf::from("/opt/bento/bento-monitor");
-        let step = commands(StepKind::Binary, &paths, 1000, Role::Controller).expect("commands");
+        let step = cmds(StepKind::Binary, &paths, 1000, Role::Controller).expect("commands");
         assert_eq!(
             step[1].display(),
             "sudo env BENTO_BIN_DIR=/opt/bento /srv/src/scripts/install.sh /srv/src/target/release"
@@ -534,7 +642,7 @@ mod tests {
 
         // The script cannot put the two binaries in two places.
         paths.monitor = PathBuf::from("/usr/local/bin/bento-monitor");
-        assert!(commands(StepKind::Binary, &paths, 1000, Role::Controller).is_err());
+        assert!(cmds(StepKind::Binary, &paths, 1000, Role::Controller).is_err());
     }
 
     #[test]
@@ -595,8 +703,8 @@ mod tests {
 
     #[test]
     fn a_step_without_a_source_tree_says_so_rather_than_running() {
-        assert!(commands(StepKind::Binary, &paths(None), 0, Role::Controller).is_err());
-        assert!(commands(StepKind::Config, &paths(None), 0, Role::Controller).is_err());
+        assert!(cmds(StepKind::Binary, &paths(None), 0, Role::Controller).is_err());
+        assert!(cmds(StepKind::Config, &paths(None), 0, Role::Controller).is_err());
         let steps = steps(
             &paths(None),
             &HostFacts {
@@ -612,8 +720,15 @@ mod tests {
 
     #[test]
     fn the_unit_step_stages_every_unit_and_reloads() {
-        let commands =
-            commands(StepKind::Units, &paths(None), 0, Role::Controller).expect("commands");
+        let mut staging = Staging::default();
+        let commands = commands(
+            StepKind::Units,
+            &paths(None),
+            0,
+            Role::Controller,
+            &mut staging,
+        )
+        .expect("commands");
         assert_eq!(commands.len(), UNITS.len() + 1);
         for (command, unit) in commands.iter().zip(UNITS) {
             let line = command.display();
@@ -633,12 +748,14 @@ mod tests {
 
     #[test]
     fn a_runner_machine_installs_and_enables_only_the_runner_unit() {
-        let units = commands(StepKind::Units, &paths(None), 0, Role::Runner).expect("commands");
+        let mut staging = Staging::default();
+        let units = commands(StepKind::Units, &paths(None), 0, Role::Runner, &mut staging)
+            .expect("commands");
         // One unit file, then the reload.
         assert_eq!(units.len(), 2);
         assert!(units[0].display().contains(RUNNER), "{:?}", units[0]);
 
-        let enable = commands(StepKind::Enable, &paths(None), 0, Role::Runner).expect("commands");
+        let enable = cmds(StepKind::Enable, &paths(None), 0, Role::Runner).expect("commands");
         assert_eq!(enable[0].display(), format!("systemctl enable {RUNNER}"));
     }
 
@@ -737,5 +854,90 @@ mod tests {
             "{}",
             steps[2].detail
         );
+    }
+
+    #[test]
+    fn the_directory_commands_leave_an_existing_directory_alone() {
+        // Only the storage directory is missing. The key directory exists
+        // and is 0700; naming it would set it to 0755.
+        let paths = paths(None);
+        let missing = vec![PathBuf::from("/var/lib/bento/storage")];
+        let commands = directory_commands(&paths, &missing, 0);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            commands[0].display(),
+            "install -d -m 0755 /var/lib/bento/storage"
+        );
+        assert!(!commands[0].display().contains("keys"));
+        assert!(directory_commands(&paths, &[], 0).is_empty());
+    }
+
+    #[test]
+    fn the_configuration_step_never_overwrites_an_existing_file() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let mut paths = paths(Some(PathBuf::from("/srv/bento")));
+        paths.config = directory.path().join("bento.toml");
+
+        // Absent: the copy is offered.
+        let commands = cmds(StepKind::Config, &paths, 0, Role::Controller).expect("commands");
+        assert!(commands[0].display().starts_with("install -m 0600 "));
+
+        // Present, whatever the step flag says: no command at all.
+        std::fs::write(&paths.config, "secret").expect("write");
+        let error = cmds(StepKind::Config, &paths, 0, Role::Controller).unwrap_err();
+        assert!(error.contains("never overwrites"), "{error}");
+    }
+
+    #[test]
+    fn a_configuration_that_does_not_load_blocks_the_unit_and_enable_steps() {
+        let facts = HostFacts {
+            config_installed: true,
+            ..ready()
+        };
+        let steps = steps(&paths(None), &facts, &[], Some(false), Role::Controller);
+        assert_eq!(steps[3].blocked.as_deref(), Some(CONFIG_DOES_NOT_LOAD));
+        assert_eq!(steps[4].blocked.as_deref(), Some(CONFIG_DOES_NOT_LOAD));
+
+        // A host with no file yet is a fresh host, not a broken one.
+        let fresh = HostFacts {
+            config_installed: false,
+            ..ready()
+        };
+        let steps = super::steps(&paths(None), &fresh, &[], Some(false), Role::Controller);
+        assert_ne!(steps[3].blocked.as_deref(), Some(CONFIG_DOES_NOT_LOAD));
+    }
+
+    #[test]
+    fn staging_uses_a_private_new_directory_and_a_private_new_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut staging = Staging::default();
+        let path = staging.stage("a.staged", "text").expect("stage");
+        let mode = |path: &Path| path.metadata().expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode(&path), 0o600);
+        let directory = path.parent().expect("directory").to_path_buf();
+        assert_eq!(mode(&directory), 0o700);
+        assert_eq!(std::fs::read_to_string(&path).expect("read"), "text");
+
+        // Another stager gets another directory.
+        let mut other = Staging::default();
+        let second = other.stage("a.staged", "text").expect("stage");
+        assert_ne!(second.parent(), path.parent());
+
+        // The files go with the directory.
+        staging.clear();
+        assert!(!directory.exists());
+    }
+
+    #[test]
+    fn staging_does_not_follow_a_symlink_or_replace_a_file() {
+        let base = tempfile::tempdir().expect("tempdir");
+        let target = base.path().join("victim");
+        std::fs::write(&target, "keep").expect("write");
+        std::os::unix::fs::symlink(&target, base.path().join("a.staged")).expect("symlink");
+        assert!(stage_in(base.path(), "a.staged", "evil").is_err());
+        assert_eq!(std::fs::read_to_string(&target).expect("read"), "keep");
+
+        std::fs::write(base.path().join("b.staged"), "old").expect("write");
+        assert!(stage_in(base.path(), "b.staged", "new").is_err());
     }
 }

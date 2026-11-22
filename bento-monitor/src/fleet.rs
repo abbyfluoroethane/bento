@@ -360,11 +360,11 @@ impl Fence {
 }
 
 /// The machine this screen runs on (MULTI-NODE 16). The hostname is a
-/// label and drifts; `/etc/machine-id` is the key.
+/// label and drifts; `/etc/machine-id` is the key. It is read the way
+/// `bentod` reads it, with the D-Bus fallback and the refusal of an empty
+/// or uninitialized file, so that both name one machine the same way.
 pub fn machine_id() -> Option<String> {
-    let text = std::fs::read_to_string("/etc/machine-id").ok()?;
-    let id = text.trim();
-    (!id.is_empty()).then(|| id.to_string())
+    bento_hostinfo::read_machine_id().ok()
 }
 
 /// How long ago something happened, for a screen that redraws every two
@@ -399,6 +399,11 @@ pub fn until(deadline: OffsetDateTime, now: OffsetDateTime) -> String {
 mod tests {
     use super::*;
     use time::macros::datetime;
+
+    #[test]
+    fn this_machine_is_keyed_the_way_bentod_keys_it() {
+        assert_eq!(machine_id(), bento_hostinfo::read_machine_id().ok());
+    }
 
     fn host(id: i64, name: &str, machine_id: Option<&str>) -> Host {
         Host {
