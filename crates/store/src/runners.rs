@@ -402,14 +402,38 @@ impl Store {
                 [host_id],
                 |row| row.get(0),
             )?;
+            let mut conflict: Option<String> = None;
             let health = match (&known, &seen.machine_id) {
                 (_, None) => HostHealth::Unreachable,
                 (None, Some(reported)) => {
-                    tx.execute(
-                        "UPDATE hosts SET machine_id = ? WHERE id = ?",
-                        params![reported, host_id],
-                    )?;
-                    HostHealth::Ok
+                    // The unique index on `machine_id` refuses a second
+                    // row for one machine. That happens when two entries
+                    // name the same runner, or an endpoint points at the
+                    // controller. Check first: a failed UPDATE would roll
+                    // back the whole observation and leave the row
+                    // "never answered" with no text.
+                    let other: Option<String> = tx
+                        .query_row(
+                            "SELECT name FROM hosts WHERE machine_id = ? AND id <> ?",
+                            params![reported, host_id],
+                            |row| row.get(0),
+                        )
+                        .optional()?;
+                    match other {
+                        Some(name) => {
+                            conflict = Some(format!(
+                                "machine id {reported} already belongs to host {name}"
+                            ));
+                            HostHealth::Mismatched
+                        }
+                        None => {
+                            tx.execute(
+                                "UPDATE hosts SET machine_id = ? WHERE id = ?",
+                                params![reported, host_id],
+                            )?;
+                            HostHealth::Ok
+                        }
+                    }
                 }
                 (Some(stored), Some(reported)) if stored == reported => HostHealth::Ok,
                 (Some(_), Some(_)) => HostHealth::Mismatched,
@@ -419,6 +443,22 @@ impl Store {
                 HostHealth::Ok => Some(format_time(now())?),
                 _ => None,
             };
+            // The figures of a machine that is not the recorded one
+            // describe the wrong hardware, so only a good answer writes
+            // them (MULTI-NODE 12). The epoch likewise belongs to the
+            // machine that gave it.
+            let ok = health == HostHealth::Ok;
+            let seen = HostSeen {
+                arch: seen.arch.filter(|_| ok),
+                cpu_count: seen.cpu_count.filter(|_| ok),
+                memory_total_mib: seen.memory_total_mib.filter(|_| ok),
+                storage_total_gib: seen.storage_total_gib.filter(|_| ok),
+                storage_available_gib: seen.storage_available_gib.filter(|_| ok),
+                hypervisor_version: seen.hypervisor_version.filter(|_| ok),
+                accepted_epoch: if ok { seen.accepted_epoch } else { 0 },
+                error: conflict.or(seen.error),
+                ..seen
+            };
             tx.execute(
                 "INSERT INTO host_observations (host_id, health, last_contact_at, \
                    accepted_epoch, arch, cpu_count, memory_total_mib, storage_total_gib, \
@@ -426,7 +466,12 @@ impl Store {
                  VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT(host_id) DO UPDATE SET \
                    health = excluded.health, \
-                   accepted_epoch = excluded.accepted_epoch, \
+                   -- A call that failed or answered as another machine
+                   -- learned no epoch and reports 0, so the last known
+                   -- epoch stays. A good answer replaces it, even with a
+                   -- lower value: a runner may have lost its fence state.
+                   accepted_epoch = CASE WHEN excluded.health = 'ok' \
+                     THEN excluded.accepted_epoch ELSE accepted_epoch END, \
                    arch = COALESCE(excluded.arch, arch), \
                    cpu_count = COALESCE(excluded.cpu_count, cpu_count), \
                    memory_total_mib = COALESCE(excluded.memory_total_mib, memory_total_mib), \
@@ -455,6 +500,56 @@ impl Store {
                 ],
             )?;
             Ok(health)
+        })
+        .await
+    }
+
+    /// Records whether the last network apply to a host worked
+    /// (MULTI-NODE 14.3, 15). `Err(text)` marks the host
+    /// `degraded-network`: placement refuses it until a later call records
+    /// `Ok`. It works for a host that has no observation row yet, and
+    /// `observe_host` never changes it, so a poll that finds the runner
+    /// reachable does not hide a failed apply.
+    pub async fn record_network_result(
+        &self,
+        host_id: i64,
+        result: std::result::Result<(), String>,
+    ) -> Result<()> {
+        let now = self.clock();
+        self.with_tx(move |tx| {
+            tx.execute(
+                "INSERT INTO host_observations (host_id, network_error, network_checked_at) \
+                 VALUES (?, ?, ?) \
+                 ON CONFLICT(host_id) DO UPDATE SET \
+                   network_error = excluded.network_error, \
+                   network_checked_at = excluded.network_checked_at",
+                params![host_id, result.err(), format_time(now())?],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// The last recorded network apply of one host, or `None` when none
+    /// was recorded. It is separate from [`Store::host_observation`]
+    /// because `observe_host` and `record_network_result` write different
+    /// columns.
+    pub async fn host_network(&self, host_id: i64) -> Result<Option<NetworkResult>> {
+        self.with_conn(move |conn| {
+            Ok(conn
+                .query_row(
+                    "SELECT network_error, network_checked_at FROM host_observations \
+                     WHERE host_id = ? AND network_checked_at IS NOT NULL",
+                    [host_id],
+                    |row| {
+                        let checked: String = row.get(1)?;
+                        Ok(NetworkResult {
+                            error: row.get(0)?,
+                            checked_at: parse_time(1, &checked)?,
+                        })
+                    },
+                )
+                .optional()?)
         })
         .await
     }
@@ -520,6 +615,14 @@ impl HostHealth {
     pub fn placeable(self) -> bool {
         matches!(self, HostHealth::Ok)
     }
+}
+
+/// The outcome of the last network apply to a host. `error` is `None`
+/// when it worked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NetworkResult {
+    pub error: Option<String>,
+    pub checked_at: time::OffsetDateTime,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1053,6 +1156,54 @@ mod observation_tests {
         );
         assert_eq!(after.last_error.as_deref(), Some("connection refused"));
         assert!(!after.health.placeable());
+        assert_eq!(
+            after.accepted_epoch, well.accepted_epoch,
+            "the last known epoch is not reset to 0"
+        );
+        assert_eq!(well.accepted_epoch, 3);
+    }
+
+    #[tokio::test]
+    async fn two_rows_for_one_machine_record_a_mismatch_instead_of_an_error() {
+        let store = new_test_store().await;
+        let first = store
+            .register_runner("tsukasa", "http://10.0.0.97:10443", "10.0.0.97")
+            .await
+            .unwrap();
+        let second = store
+            .register_runner("tsukasa-copy", "http://10.0.0.98:10443", "10.0.0.98")
+            .await
+            .unwrap();
+        store.observe_host(first.id, seen(TSUKASA)).await.unwrap();
+
+        let health = store.observe_host(second.id, seen(TSUKASA)).await.unwrap();
+        assert_eq!(health, HostHealth::Mismatched);
+        let observation = store.host_observation(second.id).await.unwrap().unwrap();
+        assert_eq!(observation.health, HostHealth::Mismatched);
+        let text = observation.last_error.unwrap();
+        assert!(text.contains("tsukasa"), "{text}");
+        assert_eq!(store.host(second.id).await.unwrap().machine_id, None);
+    }
+
+    #[tokio::test]
+    async fn a_mismatched_answer_does_not_write_the_wrong_machines_figures() {
+        let store = new_test_store().await;
+        let runner = store
+            .register_runner("tsukasa", "http://10.0.0.97:10443", "10.0.0.97")
+            .await
+            .unwrap();
+        store.observe_host(runner.id, seen(TSUKASA)).await.unwrap();
+
+        let other = HostSeen {
+            memory_total_mib: Some(1),
+            cpu_count: Some(1),
+            ..seen(KONATA)
+        };
+        let health = store.observe_host(runner.id, other).await.unwrap();
+        assert_eq!(health, HostHealth::Mismatched);
+        let after = store.host_observation(runner.id).await.unwrap().unwrap();
+        assert_eq!(after.memory_total_mib, Some(7549));
+        assert_eq!(after.cpu_count, Some(8));
     }
 }
 
@@ -1129,6 +1280,7 @@ struct Weighed {
     memory_total: Option<u64>,
     storage_available: Option<u64>,
     arch: Option<String>,
+    network_error: Option<String>,
 }
 
 /// Decides whether one host can take the request, and how loaded it is.
@@ -1140,7 +1292,8 @@ fn weigh_host(
 ) -> rusqlite::Result<std::result::Result<Weight, String>> {
     let observation = tx
         .query_row(
-            "SELECT health, cpu_count, memory_total_mib, storage_available_gib, arch \
+            "SELECT health, cpu_count, memory_total_mib, storage_available_gib, arch, \
+               network_error \
              FROM host_observations WHERE host_id = ?",
             [host.id],
             |row| {
@@ -1150,6 +1303,7 @@ fn weigh_host(
                     memory_total: get_opt_u64(row, 2)?,
                     storage_available: get_opt_u64(row, 3)?,
                     arch: row.get(4)?,
+                    network_error: row.get(5)?,
                 })
             },
         )
@@ -1160,12 +1314,21 @@ fn weigh_host(
         memory_total,
         storage_available,
         arch,
+        network_error,
     }) = observation
     else {
         return Ok(Err("never answered the controller".to_string()));
     };
     if health != "ok" {
         return Ok(Err(format!("last seen {health}")));
+    }
+    // A runner that answers but has no working network black-holes the
+    // new instance (MULTI-NODE 15). The controller's own host has no
+    // endpoint and applies its network locally, so this never refuses it.
+    if host.endpoint.is_some()
+        && let Some(error) = network_error
+    {
+        return Ok(Err(format!("degraded-network: {error}")));
     }
 
     // A runner with no slot has no address to give the instance
@@ -1279,6 +1442,121 @@ mod placement_tests {
             .await
             .unwrap();
         (store, konata.id, tsukasa.id)
+    }
+
+    #[tokio::test]
+    async fn a_runner_whose_network_apply_failed_is_not_placeable_until_one_works() {
+        let (store, konata, tsukasa) = two_runners().await;
+        // Take the controller's own host out, so tsukasa is the only
+        // candidate.
+        store
+            .observe_host(konata, HostSeen::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            store.choose_host(want(512, 5), 1.0).await.unwrap().host.id,
+            tsukasa
+        );
+
+        store
+            .record_network_result(tsukasa, Err("route add failed".into()))
+            .await
+            .unwrap();
+        let Err(Error::NoPlacement { reasons }) = store.choose_host(want(512, 5), 1.0).await else {
+            panic!("a runner with a network error was chosen");
+        };
+        assert!(
+            reasons.contains("tsukasa: degraded-network: route add failed"),
+            "{reasons}"
+        );
+        let result = store.host_network(tsukasa).await.unwrap().unwrap();
+        assert_eq!(result.error.as_deref(), Some("route add failed"));
+
+        // A poll that finds the runner reachable does not clear it.
+        store
+            .observe_host(tsukasa, seen(TSUKASA, 7549, 153))
+            .await
+            .unwrap();
+        assert!(store.choose_host(want(512, 5), 1.0).await.is_err());
+        assert_eq!(
+            store
+                .host_network(tsukasa)
+                .await
+                .unwrap()
+                .unwrap()
+                .error
+                .as_deref(),
+            Some("route add failed")
+        );
+
+        store.record_network_result(tsukasa, Ok(())).await.unwrap();
+        assert_eq!(
+            store.choose_host(want(512, 5), 1.0).await.unwrap().host.id,
+            tsukasa
+        );
+        assert_eq!(
+            store.host_network(tsukasa).await.unwrap().unwrap().error,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn the_controllers_own_host_is_never_refused_for_its_network() {
+        let (store, konata, tsukasa) = two_runners().await;
+        store
+            .observe_host(tsukasa, HostSeen::default())
+            .await
+            .unwrap();
+        store
+            .record_network_result(konata, Err("local apply failed".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.choose_host(want(512, 5), 1.0).await.unwrap().host.id,
+            konata
+        );
+    }
+
+    #[tokio::test]
+    async fn a_network_result_is_kept_for_a_host_with_no_observation() {
+        let store = new_test_store().await;
+        let runner = store
+            .register_runner("tsukasa", "http://10.0.0.97:10443", "10.0.0.97")
+            .await
+            .unwrap();
+        assert!(store.host_network(runner.id).await.unwrap().is_none());
+        store
+            .record_network_result(runner.id, Err("down".into()))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .host_network(runner.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .error
+                .as_deref(),
+            Some("down")
+        );
+        // The row reads as never observed, not as healthy.
+        let observation = store.host_observation(runner.id).await.unwrap().unwrap();
+        assert!(!observation.health.placeable());
+        // The first real observation keeps the error.
+        store
+            .observe_host(runner.id, seen(TSUKASA, 7549, 153))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .host_network(runner.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .error
+                .as_deref(),
+            Some("down")
+        );
     }
 
     #[tokio::test]

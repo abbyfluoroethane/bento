@@ -22,7 +22,7 @@
 //! A migration never rewrites an earlier migration. To correct one, add
 //! the next number.
 
-use rusqlite::{Connection, Transaction, TransactionBehavior};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::Result;
 
@@ -36,6 +36,14 @@ struct Migration {
     /// The work. It runs inside one immediate transaction with the row
     /// that records it, so a failure leaves neither behind.
     run: fn(&Transaction<'_>) -> rusqlite::Result<()>,
+    /// True when `run` drops a table that other tables reference. With
+    /// `foreign_keys` on, `DROP TABLE` deletes the rows first and fires
+    /// `ON DELETE CASCADE` on the children, which would erase them.
+    /// SQLite ignores `PRAGMA foreign_keys` inside a transaction, so
+    /// `apply_after` switches it off before the transaction begins and
+    /// back to its old value after. Such a migration runs
+    /// `foreign_key_check` itself before it returns.
+    foreign_keys_off: bool,
 }
 
 /// Every migration, in the order they apply.
@@ -44,46 +52,67 @@ const MIGRATIONS: &[Migration] = &[
         version: 1,
         name: "image_source_columns",
         run: image_source_columns,
+        foreign_keys_off: false,
     },
     Migration {
         version: 2,
         name: "host_machine_id",
         run: host_machine_id,
+        foreign_keys_off: false,
     },
     Migration {
         version: 3,
         name: "runners_and_slots",
         run: runners_and_slots,
+        foreign_keys_off: false,
     },
     Migration {
         version: 4,
         name: "host_observations",
         run: host_observations,
+        foreign_keys_off: false,
     },
     Migration {
         version: 5,
         name: "host_images",
         run: host_images,
+        foreign_keys_off: false,
     },
     Migration {
         version: 6,
         name: "host_underlay",
         run: host_underlay,
+        foreign_keys_off: false,
     },
     Migration {
         version: 7,
         name: "dispatch_generations",
         run: dispatch_generations,
+        foreign_keys_off: false,
     },
     Migration {
         version: 8,
         name: "unique_ssh_key_fingerprints",
         run: unique_ssh_key_fingerprints,
+        foreign_keys_off: false,
     },
     Migration {
         version: 9,
         name: "nullable_token_expiry",
         run: nullable_token_expiry,
+        foreign_keys_off: false,
+    },
+    Migration {
+        version: 10,
+        name: "instance_provisioning_state",
+        run: instance_provisioning_state,
+        foreign_keys_off: true,
+    },
+    Migration {
+        version: 11,
+        name: "host_network_result",
+        run: host_network_result,
+        foreign_keys_off: false,
     },
 ];
 
@@ -110,21 +139,93 @@ pub(crate) fn apply(conn: &mut Connection, now: crate::Clock) -> Result<()> {
         "migration versions must start at 1",
     );
 
+    apply_list(conn, MIGRATIONS, now)
+}
+
+/// [`apply`] over an explicit list, so a test can give it a migration
+/// that fails.
+fn apply_list(conn: &mut Connection, list: &[Migration], now: crate::Clock) -> Result<()> {
     conn.execute_batch(MIGRATIONS_TABLE)?;
     let current = current_version(conn)?;
+    refuse_newer(current, list)?;
+    apply_after(conn, list, current, now)
+}
 
-    for migration in MIGRATIONS.iter().filter(|m| m.version > current) {
-        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        (migration.run)(&tx)?;
-        tx.execute(
-            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
-            rusqlite::params![
-                migration.version,
-                migration.name,
-                crate::format_time(now())?
-            ],
-        )?;
-        tx.commit()?;
+/// Runs every migration above `current`. `current` may be stale: another
+/// process that starts at the same time (`serve`, `proxy`, `sshd` each
+/// open the store) can record a version between the read and the write
+/// lock. Each migration therefore asks again inside its own write
+/// transaction and skips a version that is already recorded.
+fn apply_after(
+    conn: &mut Connection,
+    list: &[Migration],
+    current: i64,
+    now: crate::Clock,
+) -> Result<()> {
+    for migration in list.iter().filter(|m| m.version > current) {
+        if migration.foreign_keys_off {
+            let was_on: bool = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0))?;
+            conn.pragma_update(None, "foreign_keys", false)?;
+            let result = apply_one(conn, migration, now.clone());
+            // Restore even when the migration failed: the connection
+            // outlives this call.
+            let restored = conn.pragma_update(None, "foreign_keys", was_on);
+            result?;
+            restored?;
+        } else {
+            apply_one(conn, migration, now.clone())?;
+        }
+    }
+    Ok(())
+}
+
+/// One migration in its own immediate transaction, with the row that
+/// records it.
+fn apply_one(conn: &mut Connection, migration: &Migration, now: crate::Clock) -> Result<()> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let recorded: bool = tx.query_row(
+        "SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE version = ?)",
+        [migration.version],
+        |row| row.get(0),
+    )?;
+    if recorded {
+        return Ok(());
+    }
+    (migration.run)(&tx)?;
+    tx.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?, ?, ?)",
+        rusqlite::params![
+            migration.version,
+            migration.name,
+            crate::format_time(now())?
+        ],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Refuses a database that a later build has migrated. An older binary
+/// would run its old code against a schema it does not know (SPEC 12.1).
+fn refuse_newer(recorded: i64, list: &[Migration]) -> Result<()> {
+    let known = list.last().map_or(0, |m| m.version);
+    if recorded > known {
+        return Err(crate::Error::SchemaTooNew { recorded, known });
+    }
+    Ok(())
+}
+
+/// Checks a database file that is about to replace the live one. It reads
+/// only, and tolerates a copy that has no `schema_migrations` table (a
+/// 0.9 copy).
+pub(crate) fn check_source(source: &Connection) -> Result<()> {
+    let has_table: bool = source.query_row(
+        "SELECT EXISTS (SELECT 1 FROM sqlite_master \
+         WHERE type = 'table' AND name = 'schema_migrations')",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_table {
+        refuse_newer(current_version(source)?, MIGRATIONS)?;
     }
     Ok(())
 }
@@ -455,6 +556,110 @@ fn nullable_token_expiry(tx: &Transaction<'_>) -> rusqlite::Result<()> {
     Ok(())
 }
 
+/// Lets `instances.state` hold `provisioning`: a row that `create` or
+/// `copy` inserted before its domain exists (SPEC 11.2).
+///
+/// SQLite cannot change a CHECK in place, so the table is rebuilt. The
+/// new table is the old table's own SQL with the CHECK widened, so every
+/// column that earlier migrations added (`slot`) comes along, and the
+/// indexes and triggers (migration 3's slot-owner triggers) are read
+/// from `sqlite_master` and created again. Shares reference the table
+/// with `ON DELETE CASCADE`, which is why this migration runs with
+/// `foreign_keys` off (see `Migration::foreign_keys_off`).
+///
+/// A database whose table already accepts `provisioning`, or has no
+/// such CHECK, is left alone and only records the version.
+fn instance_provisioning_state(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    const OLD_CHECK: &str = "'starting')";
+    const NEW_CHECK: &str = "'starting', 'provisioning')";
+
+    let sql: Option<String> = tx
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'instances'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(sql) = sql else {
+        return Ok(());
+    };
+    if sql.contains("'provisioning'") || !sql.contains(OLD_CHECK) {
+        return Ok(());
+    }
+
+    // Indexes and triggers go with the table when it is dropped. Take
+    // their SQL first. Automatic indexes (UNIQUE, PRIMARY KEY) have no
+    // SQL and come back with the new table.
+    let broken_before = broken_references(tx)?;
+    let dependents: Vec<String> = {
+        let mut statement = tx.prepare(
+            "SELECT sql FROM sqlite_master \
+             WHERE tbl_name = 'instances' AND type IN ('index', 'trigger') AND sql IS NOT NULL \
+             ORDER BY type DESC, name",
+        )?;
+        statement
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?
+    };
+
+    // The first "instances" in the stored text is the table name.
+    let rebuilt = sql
+        .replacen("instances", "instances_new", 1)
+        .replacen(OLD_CHECK, NEW_CHECK, 1);
+    tx.execute_batch(&rebuilt)?;
+    tx.execute_batch(
+        "INSERT INTO instances_new SELECT * FROM instances;
+         DROP TABLE instances;
+         ALTER TABLE instances_new RENAME TO instances;",
+    )?;
+    for statement in dependents {
+        tx.execute_batch(&statement)?;
+    }
+
+    // Foreign keys were off, so nothing checked the copy. Only a row the
+    // rebuild itself broke fails it: a violation that the database
+    // already had is not this migration's to refuse.
+    let broken = broken_references(tx)?.saturating_sub(broken_before);
+    if broken > 0 {
+        return Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_FOREIGNKEY),
+            Some(format!(
+                "rebuilding instances left {broken} rows that break a foreign key"
+            )),
+        ));
+    }
+    Ok(())
+}
+
+/// Rows in the two tables that the instances rebuild touches that break
+/// a foreign key: instances (as child) and shares (as the child of
+/// instances).
+fn broken_references(tx: &Transaction<'_>) -> rusqlite::Result<i64> {
+    tx.query_row(
+        "SELECT (SELECT COUNT(*) FROM pragma_foreign_key_check('instances')) \
+              + (SELECT COUNT(*) FROM pragma_foreign_key_check('shares'))",
+        [],
+        |row| row.get(0),
+    )
+}
+
+/// Adds the outcome of the last network apply to a host's observation
+/// (MULTI-NODE 14.3, 15).
+///
+/// This is not a value of `health`: `observe_host` rewrites `health` on
+/// every poll and would erase it. These columns are written only by
+/// `record_network_result`. NULL `network_error` means the last apply
+/// succeeded or none has run.
+fn host_network_result(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    if !has_column(tx, "host_observations", "network_error")? {
+        tx.execute_batch("ALTER TABLE host_observations ADD COLUMN network_error TEXT;")?;
+    }
+    if !has_column(tx, "host_observations", "network_checked_at")? {
+        tx.execute_batch("ALTER TABLE host_observations ADD COLUMN network_checked_at TEXT;")?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,19 +844,80 @@ mod tests {
     }
 
     #[test]
-    fn a_failing_migration_records_nothing() {
-        fn fails(_: &Transaction<'_>) -> rusqlite::Result<()> {
+    fn a_failing_migration_rolls_back_and_records_nothing() {
+        fn adds_a_table_then_fails(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+            tx.execute_batch("CREATE TABLE half_done (id INTEGER);")?;
             Err(rusqlite::Error::InvalidQuery)
         }
+        let list = [Migration {
+            version: 1,
+            name: "fails",
+            run: adds_a_table_then_fails,
+            foreign_keys_off: false,
+        }];
         let mut conn = baseline();
-        conn.execute_batch(MIGRATIONS_TABLE).unwrap();
-        let tx = conn
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .unwrap();
-        let result = fails(&tx);
-        assert!(result.is_err());
-        drop(tx);
+        assert!(apply_list(&mut conn, &list, clock()).is_err());
         assert_eq!(current_version(&conn).unwrap(), 0);
+        let table: bool = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE name = 'half_done')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!table, "the failed migration's change was kept");
+    }
+
+    #[test]
+    fn a_stale_read_does_not_run_a_recorded_migration_again() {
+        fn counts(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+            tx.execute_batch("CREATE TABLE ran (n INTEGER); INSERT INTO ran VALUES (1);")
+        }
+        let list = [Migration {
+            version: 1,
+            name: "once",
+            run: counts,
+            foreign_keys_off: false,
+        }];
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("bento.db");
+        let mut first = Connection::open(&path).unwrap();
+        let mut second = Connection::open(&path).unwrap();
+        first.execute_batch(crate::SCHEMA_SQL).unwrap();
+        first.execute_batch(MIGRATIONS_TABLE).unwrap();
+        // Both processes read version 0, then the first one finishes.
+        let stale = current_version(&second).unwrap();
+        assert_eq!(stale, 0);
+        apply_list(&mut first, &list, clock()).unwrap();
+
+        apply_after(&mut second, &list, stale, clock()).unwrap();
+
+        let rows: i64 = first
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 1);
+        let ran: i64 = first
+            .query_row("SELECT COUNT(*) FROM ran", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(ran, 1, "the migration ran twice");
+    }
+
+    #[test]
+    fn a_database_newer_than_the_binary_is_refused() {
+        let mut conn = baseline();
+        apply(&mut conn, clock()).unwrap();
+        conn.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (999, 'later', 'x')",
+            [],
+        )
+        .unwrap();
+        let error = apply(&mut conn, clock()).unwrap_err();
+        assert!(
+            matches!(error, crate::Error::SchemaTooNew { recorded: 999, .. }),
+            "{error}"
+        );
     }
 
     /// A database at version 7 with the pre-fix, non-unique index and
@@ -774,5 +1040,284 @@ mod tests {
             [],
         )
         .unwrap();
+    }
+
+    /// A database at version 9 with a host, a slot, two users, an image,
+    /// two instances, and a share.
+    fn at_version_9() -> Connection {
+        let mut conn = baseline();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        apply_list(&mut conn, &MIGRATIONS[..9], clock()).unwrap();
+        conn.execute_batch(
+            "INSERT INTO hosts (id, machine_id, name, libvirt_uri, created_at) VALUES
+                 (1, 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa', 'konata', 'qemu:///system', 'x'),
+                 (2, 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb', 'tsukasa', 'qemu:///system', 'x');
+             INSERT INTO runner_slots (slot, owner_host_id) VALUES (0, 1), (1, 2);
+             INSERT INTO users (id, name, email, subnet, created_at) VALUES
+                 (1, 'alice', 'alice@example.org', '10.100.0.0/24', 'x'),
+                 (2, 'bob', 'bob@example.org', '10.100.1.0/24', 'x');
+             INSERT INTO images (name, url) VALUES ('debian-13', 'https://example.org/d.qcow2');
+             INSERT INTO image_versions (checksum, image_name, path, size, fetched_at) VALUES
+                 ('sha256-a', 'debian-13', '/img/a', 1, 'x');
+             INSERT INTO instances (uuid, name, owner_id, host_id, image_name, base_checksum,
+                 state, address, mac, vcpu, memory, disk, created_at, slot) VALUES
+                 ('web', 'web', 1, 1, 'debian-13', 'sha256-a', 'running',
+                  '10.100.0.2', '52:54:00:00:00:01', 1, 512, 10, 'x', 0),
+                 ('db', 'db', 1, 2, 'debian-13', 'sha256-a', 'stopped',
+                  '10.100.0.66', '52:54:00:00:00:02', 2, 1024, 20, 'x', 1);
+             INSERT INTO shares (instance_uuid, user_id, created_at) VALUES ('web', 2, 'x');",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_instance(conn: &Connection, state: &str) -> rusqlite::Result<usize> {
+        conn.execute(
+            "INSERT INTO instances (uuid, name, owner_id, host_id, image_name, base_checksum, \
+             state, address, mac, vcpu, memory, disk, created_at, slot) \
+             VALUES ('new', 'new', 1, 1, 'debian-13', 'sha256-a', ?, '10.100.0.3', \
+             '52:54:00:00:00:03', 1, 512, 10, 'x', 0)",
+            [state],
+        )
+    }
+
+    /// Every index and trigger of one table, as `(type, name, sql)`.
+    fn dependents(conn: &Connection, table: &str) -> Vec<(String, String, String)> {
+        let mut statement = conn
+            .prepare(
+                "SELECT type, name, sql FROM sqlite_master \
+                 WHERE tbl_name = ? AND type IN ('index', 'trigger') AND sql IS NOT NULL \
+                 ORDER BY type, name",
+            )
+            .unwrap();
+        statement
+            .query_map([table], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    }
+
+    fn instance_rows(conn: &Connection) -> Vec<(String, String, i64, i64, String)> {
+        let mut statement = conn
+            .prepare("SELECT uuid, state, slot, memory, address FROM instances ORDER BY uuid")
+            .unwrap();
+        statement
+            .query_map([], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .unwrap()
+            .map(|row| row.unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn provisioning_is_refused_at_version_9_and_accepted_at_10() {
+        let mut conn = at_version_9();
+        assert!(insert_instance(&conn, "provisioning").is_err());
+
+        apply(&mut conn, clock()).unwrap();
+        insert_instance(&conn, "provisioning").unwrap();
+        assert!(insert_instance(&conn, "bogus").is_err());
+    }
+
+    #[test]
+    fn the_instances_rebuild_keeps_rows_shares_indexes_and_triggers() {
+        let mut conn = at_version_9();
+        let rows_before = instance_rows(&conn);
+        let dependents_before = dependents(&conn, "instances");
+        assert!(dependents_before.len() >= 4, "{dependents_before:?}");
+        let columns_before = {
+            let mut s = conn.prepare("PRAGMA table_info(instances)").unwrap();
+            s.query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        apply(&mut conn, clock()).unwrap();
+
+        assert_eq!(instance_rows(&conn), rows_before);
+        assert_eq!(dependents(&conn, "instances"), dependents_before);
+        let columns_after = {
+            let mut s = conn.prepare("PRAGMA table_info(instances)").unwrap();
+            s.query_map([], |r| r.get::<_, String>(1))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(columns_after, columns_before);
+        // The cascade did not run: the share survived the drop.
+        let shares: i64 = conn
+            .query_row("SELECT COUNT(*) FROM shares", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(shares, 1);
+        // Foreign keys are enforced again, and consistent.
+        let enforced: bool = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert!(enforced);
+        let broken: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(broken, 0);
+        assert!(conn.execute("DELETE FROM users WHERE id = 1", []).is_err());
+        // The shares table still resolves to the rebuilt table, and its
+        // cascade still works.
+        conn.execute("DELETE FROM instances WHERE uuid = 'web'", [])
+            .unwrap();
+        let shares: i64 = conn
+            .query_row("SELECT COUNT(*) FROM shares", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(shares, 0);
+    }
+
+    #[test]
+    fn the_rebuilt_instances_table_keeps_refusing_what_it_refused() {
+        let mut conn = at_version_9();
+        apply(&mut conn, clock()).unwrap();
+
+        // Slot-owner triggers (MULTI-NODE 16): host 1 does not own slot 1.
+        let error = conn
+            .execute("UPDATE instances SET slot = 1 WHERE uuid = 'web'", [])
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("does not own its slot"),
+            "{error}"
+        );
+        conn.execute("UPDATE instances SET slot = 1 WHERE uuid = 'db'", [])
+            .unwrap();
+        let error = conn
+            .execute(
+                "INSERT INTO instances (uuid, name, owner_id, host_id, image_name, \
+                 base_checksum, address, mac, vcpu, memory, disk, created_at, slot) \
+                 VALUES ('x', 'x', 1, 1, 'debian-13', 'sha256-a', '10.100.0.9', \
+                 '52:54:00:00:00:09', 1, 512, 10, 'x', 1)",
+                [],
+            )
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("does not own its slot"),
+            "{error}"
+        );
+        // Unique name, address, and MAC.
+        assert!(
+            conn.execute("UPDATE instances SET name = 'web' WHERE uuid = 'db'", [])
+                .is_err()
+        );
+        assert!(
+            conn.execute(
+                "UPDATE instances SET address = '10.100.0.2' WHERE uuid = 'db'",
+                []
+            )
+            .is_err()
+        );
+        assert!(
+            conn.execute(
+                "UPDATE instances SET mac = '52:54:00:00:00:01' WHERE uuid = 'db'",
+                []
+            )
+            .is_err()
+        );
+        // Foreign key to hosts.
+        assert!(
+            conn.execute("UPDATE instances SET host_id = 99 WHERE uuid = 'db'", [])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn the_instances_rebuild_runs_once_and_skips_a_table_that_already_accepts_it() {
+        let mut conn = at_version_9();
+        apply(&mut conn, clock()).unwrap();
+        let sql_after_first: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'instances'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        apply(&mut conn, clock()).unwrap();
+        let sql_after_second: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'instances'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sql_after_first, sql_after_second);
+        assert_eq!(current_version(&conn).unwrap(), 11);
+
+        // A database that has the new CHECK but no record of version 10
+        // only records it: the rows keep their rowid order and the
+        // table is not rebuilt.
+        conn.execute("DELETE FROM schema_migrations WHERE version >= 10", [])
+            .unwrap();
+        let marker = "CREATE TRIGGER marker AFTER DELETE ON instances BEGIN SELECT 1; END;";
+        conn.execute_batch(marker).unwrap();
+        apply(&mut conn, clock()).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 11);
+        // A rebuild would have kept the trigger too, so check the table
+        // SQL is byte for byte the same as before.
+        let sql_after_third: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name = 'instances'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sql_after_first, sql_after_third);
+    }
+
+    #[test]
+    fn a_migration_that_needs_foreign_keys_off_gets_them_back_after_a_failure() {
+        fn fails(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+            // The pragma is off inside the migration.
+            let on: bool = tx.query_row("PRAGMA foreign_keys", [], |r| r.get(0))?;
+            assert!(!on, "foreign_keys was on inside the migration");
+            Err(rusqlite::Error::InvalidQuery)
+        }
+        let list = [Migration {
+            version: 1,
+            name: "fails",
+            run: fails,
+            foreign_keys_off: true,
+        }];
+        let mut conn = baseline();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        assert!(apply_list(&mut conn, &list, clock()).is_err());
+        let on: bool = conn
+            .query_row("PRAGMA foreign_keys", [], |r| r.get(0))
+            .unwrap();
+        assert!(on, "foreign_keys stayed off after a failure");
+        assert_eq!(current_version(&conn).unwrap(), 0);
+    }
+
+    #[test]
+    fn a_foreign_key_violation_the_database_already_had_does_not_block_the_rebuild() {
+        let mut conn = at_version_9();
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
+        conn.execute("UPDATE instances SET owner_id = 99 WHERE uuid = 'db'", [])
+            .unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
+        apply(&mut conn, clock()).unwrap();
+        assert_eq!(instance_rows(&conn).len(), 2);
+    }
+
+    #[test]
+    fn network_result_columns_are_added_once_and_a_present_column_only_records() {
+        let mut conn = at_version_9();
+        apply(&mut conn, clock()).unwrap();
+        let tx = conn.transaction().unwrap();
+        assert!(has_column(&tx, "host_observations", "network_error").unwrap());
+        assert!(has_column(&tx, "host_observations", "network_checked_at").unwrap());
+        drop(tx);
+
+        // The column exists but the version is not recorded.
+        conn.execute("DELETE FROM schema_migrations WHERE version = 11", [])
+            .unwrap();
+        apply(&mut conn, clock()).unwrap();
+        assert_eq!(current_version(&conn).unwrap(), 11);
     }
 }

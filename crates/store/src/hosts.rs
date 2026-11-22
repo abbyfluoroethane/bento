@@ -32,15 +32,17 @@ impl Store {
                 // host, and this is the process that ran it. Claiming the
                 // row keeps its instances; a new row would strand them.
                 //
-                // The row is claimed only when it is the one row in the
-                // table. A runner named in the configuration also has no
-                // machine ID until its own runner service reports one
-                // (MULTI-NODE 19), and this
-                // machine must never claim the row of another machine.
+                // The row is claimed only when it is the one row without a
+                // runner endpoint. A runner named in the configuration
+                // also has no machine ID until its own runner service
+                // reports one (MULTI-NODE 19), and `register_runner` can
+                // add it before the first `serve`. This machine must
+                // never claim the row of another machine. A version 1 row
+                // has no endpoint, because that column came later.
                 let unclaimed: Option<i64> = tx
                     .query_row(
-                        "SELECT id FROM hosts WHERE machine_id IS NULL AND \
-                         (SELECT COUNT(*) FROM hosts) = 1",
+                        "SELECT id FROM hosts WHERE machine_id IS NULL AND endpoint IS NULL AND \
+                         (SELECT COUNT(*) FROM hosts WHERE endpoint IS NULL) = 1",
                         [],
                         |row| row.get(0),
                     )
@@ -161,6 +163,26 @@ mod tests {
             .unwrap();
         assert_eq!(after.id, before.id);
         assert_eq!(after.name, "konata");
+    }
+
+    #[tokio::test]
+    async fn a_configured_runner_row_is_not_claimed_as_the_controller() {
+        // `bentod sync-images` can register the runner before the first
+        // `serve` calls `ensure_host`.
+        let store = new_test_store().await;
+        let runner = store
+            .register_runner("tsukasa", "https://10.0.0.97:10443", "10.0.0.97")
+            .await
+            .unwrap();
+        let own = store
+            .ensure_host(KONATA, "konata", "qemu:///system")
+            .await
+            .unwrap();
+        assert_ne!(own.id, runner.id, "the controller took the runner's row");
+        let after = store.host(runner.id).await.unwrap();
+        assert_eq!(after.machine_id, None);
+        assert_eq!(after.name, "tsukasa");
+        assert_eq!(after.endpoint.as_deref(), Some("https://10.0.0.97:10443"));
     }
 
     #[tokio::test]

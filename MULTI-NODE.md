@@ -1124,6 +1124,8 @@ replace before it replaces it. `bento-monitor` offers both beside the unit
 actions. A migration that goes wrong is then one operator action away from the
 shape it started in.
 
+**Migrations 10 and 11.** Migration 10 adds the instance state `provisioning`. Migration 11 adds `network_error` and `network_checked_at` to `host_observations`.
+
 ## 17. Changing the runner-slot prefix
 
 Changing `/24`-`/27` is an operator maintenance workflow. Bento refuses to

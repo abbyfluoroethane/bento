@@ -546,16 +546,24 @@ The `last_seen_at` column records the last SSH connection or HTTP request. Bento
 
 Poll `virConnectListAllDomains` every 30 seconds and update the `state` column. Subscribe to libvirt lifecycle events as well. A poll misses a short transition.
 
+**Rules for stored state.** The poll records a local row that has no libvirt domain as `stopped`. A database whose recorded schema version is higher than the last migration of this build is refused at open. The controller claims a host row that has no machine ID only when that row has no runner endpoint.
+
+**Migrations 10 and 11.** Migration 10 lets `instances.state` hold `provisioning`. It builds the table again with foreign keys off, and keeps the rows, the indexes, and the triggers. Migration 11 adds `network_error` and `network_checked_at` to `host_observations`.
+
 ### 12.1 Backup
 
 Backup is the responsibility of the operator. Bento does not schedule, rotate, or copy a backup.
 
-Bento does these three things instead:
+Bento does these four things instead:
 
 1. Store the database at one documented path. The default path is `/var/lib/bento/bento.db`. Print this path in the startup log and show it on the dashboard.
 2. Give the operator a "Download database" control on the dashboard and a `dump-db` subcommand. Both write a consistent copy with the SQLite backup API. Do not copy the file directly. A write-ahead log makes a direct copy unsafe.
 3. Document that the instance disks live in the storage directory. The operator backs up that directory. An overlay is useless without its backing file, so the backup must also cover the image directory.
 4. Give the operator a `restore-db` subcommand that puts a copy back. It copies the current database aside before it replaces it, so a restore of the wrong file is still recoverable. It then applies the schema migrations the copy has not had, so a copy taken on an older build comes back usable. The operator stops the three units first: a restore replaces the whole database and does not coordinate with a running writer.
+
+**Restore rules.** A restore does not lower the controller epoch or a dispatch generation. It keeps the higher of the live value and the restored value, and it clears the lease holder. A copy from a newer build is refused before the live database changes. A restored copy gets the baseline schema and then the migrations, the same as a normal open.
+
+**Restore through a copy.** `restore-db` copies the source to a temporary file in the directory of the live database. It migrates that file, applies the epoch rules, and checks it with `integrity_check` and `foreign_key_check`. Then it copies the checked content into the live database in one step. If a step before that copy fails, the live database does not change, and the error says so. The temporary files are always removed.
 
 ## 13. Identity
 

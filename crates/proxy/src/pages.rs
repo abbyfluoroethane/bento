@@ -198,7 +198,8 @@ fn response(status: StatusCode, body: impl Into<Bytes>, retry: bool) -> Response
 fn state_class(state: State) -> &'static str {
     match state {
         State::Running => "running",
-        State::Starting => "starting",
+        // Like `starting`: the instance is not usable yet.
+        State::Starting | State::Provisioning => "starting",
         State::Stopped => "stopped",
     }
 }

@@ -69,7 +69,7 @@ pub async fn census(socket: &Path) -> Result<Census, String> {
         match domain.state {
             State::Running => census.running += 1,
             State::Stopped => census.stopped += 1,
-            State::Starting => census.starting += 1,
+            State::Starting | State::Provisioning => census.starting += 1,
         }
         census.names.push((domain.name, domain.state));
     }

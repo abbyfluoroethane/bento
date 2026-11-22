@@ -225,7 +225,7 @@ async fn views(
     for instance in visible_instances(state, user).await? {
         match instance.state {
             bento_types::State::Running => counts.running += 1,
-            bento_types::State::Starting => counts.starting += 1,
+            bento_types::State::Starting | bento_types::State::Provisioning => counts.starting += 1,
             bento_types::State::Stopped => counts.stopped += 1,
         }
         counts.total += 1;

@@ -207,7 +207,8 @@ impl Store {
     }
 
     /// Lists instances whose desired state is running while observed state
-    /// is stopped (SPEC 11.2). Restore must not act on another host's
+    /// is stopped (SPEC 11.2). A `provisioning` row has no domain yet and
+    /// is not listed. Restore must not act on another host's
     /// instances (MULTI-NODE 21).
     pub async fn instances_to_restore(&self, host_id: i64) -> Result<Vec<Instance>> {
         self.list_instances(
@@ -236,6 +237,59 @@ impl Store {
             .await
     }
 
+    /// Records an observed state only while the row still holds
+    /// `expected`, and says whether a row changed. A caller that read the
+    /// state, acted, and writes the result uses this so that a poll or a
+    /// second process that moved the row in between is not overwritten
+    /// (SPEC 11.1).
+    pub async fn set_observed_state_if(
+        &self,
+        uuid: impl Into<String>,
+        expected: State,
+        new: State,
+    ) -> Result<bool> {
+        let uuid = uuid.into();
+        self.with_tx(move |tx| {
+            let changed = tx.execute(
+                "UPDATE instances SET state = ? WHERE uuid = ? AND state = ?",
+                params![new.as_str(), uuid, expected.as_str()],
+            )?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
+    /// Ends provisioning: records `observed` on a row that still holds
+    /// `provisioning`, and says whether a row changed. It is false for a
+    /// row that is gone or already finished, so the caller can tell that
+    /// someone else (a cleanup) took the row (SPEC 11.2).
+    pub async fn finish_provisioning(
+        &self,
+        uuid: impl Into<String>,
+        observed: State,
+    ) -> Result<bool> {
+        let uuid = uuid.into();
+        self.with_tx(move |tx| {
+            let changed = tx.execute(
+                "UPDATE instances SET state = ? WHERE uuid = ? AND state = 'provisioning'",
+                params![observed.as_str(), uuid],
+            )?;
+            Ok(changed > 0)
+        })
+        .await
+    }
+
+    /// Lists the rows of one host that a `create` or `copy` started and
+    /// did not finish. At startup each is either a crash leftover or a
+    /// create still running in this process, so the caller decides which.
+    pub async fn provisioning_instances(&self, host_id: i64) -> Result<Vec<Instance>> {
+        self.list_instances(
+            "WHERE host_id = ? AND state = 'provisioning' ORDER BY created_at, uuid",
+            vec![Value::Integer(host_id)],
+        )
+        .await
+    }
+
     /// Applies the 30-second domain poll in one transaction (SPEC 12).
     /// UUIDs without rows are skipped; the reconcile report covers them.
     pub async fn update_observed_states(&self, states: HashMap<String, State>) -> Result<()> {
@@ -243,7 +297,12 @@ impl Store {
             return Ok(());
         }
         self.with_tx(move |tx| {
-            let mut statement = tx.prepare("UPDATE instances SET state = ? WHERE uuid = ?")?;
+            // A `provisioning` row belongs to the `create` or `copy` that
+            // inserted it until `finish_provisioning` runs. A poll that
+            // finds no domain must not turn it into `stopped` (SPEC 11.2).
+            let mut statement = tx.prepare(
+                "UPDATE instances SET state = ? WHERE uuid = ? AND state <> 'provisioning'",
+            )?;
             for (uuid, state) in states {
                 statement.execute(params![state.as_str(), uuid])?;
             }
@@ -458,6 +517,34 @@ mod tests {
     use crate::tests::{
         FakeClock, new_test_store, new_test_store_with_clock, seed_store, test_instance, test_range,
     };
+
+    #[tokio::test]
+    async fn set_observed_state_if_changes_only_a_row_in_the_expected_state() {
+        let store = new_test_store().await;
+        let (owner, host) = seed_store(&store).await;
+        let instance = test_instance(1, "web", &owner, &host);
+        store
+            .create_instance(instance.clone(), Duration::ZERO, Capacity::unbounded())
+            .await
+            .unwrap();
+        store
+            .set_observed_state(&instance.uuid, State::Running)
+            .await
+            .unwrap();
+
+        let moved = store
+            .set_observed_state_if(&instance.uuid, State::Stopped, State::Running)
+            .await
+            .unwrap();
+        assert!(!moved, "the row was not stopped");
+        let moved = store
+            .set_observed_state_if(&instance.uuid, State::Running, State::Stopped)
+            .await
+            .unwrap();
+        assert!(moved);
+        let row = store.instance(&instance.uuid).await.unwrap();
+        assert_eq!(row.state, State::Stopped);
+    }
 
     #[tokio::test]
     async fn create_instance_capacity_limits() {
@@ -738,6 +825,97 @@ mod tests {
         assert_eq!(
             store.instance("uuid-002").await.unwrap().state,
             State::Running
+        );
+    }
+
+    #[tokio::test]
+    async fn a_provisioning_row_is_held_by_its_create() {
+        let store = new_test_store().await;
+        let (owner, host) = seed_store(&store).await;
+        let mut row = test_instance(0, "new", &owner, &host);
+        row.state = State::Provisioning;
+        store
+            .create_instance(row, Duration::ZERO, Capacity::unbounded())
+            .await
+            .unwrap();
+        let mut other = test_instance(1, "other", &owner, &host);
+        other.state = State::Stopped;
+        store
+            .create_instance(other, Duration::ZERO, Capacity::unbounded())
+            .await
+            .unwrap();
+
+        // Restore does not start a row with no domain.
+        let restore = store.instances_to_restore(host.id).await.unwrap();
+        assert_eq!(
+            restore.iter().map(|i| i.uuid.as_str()).collect::<Vec<_>>(),
+            vec!["uuid-001"]
+        );
+        // It still holds its resources, its name, and its address.
+        let usage = store.usage_for(owner.id).await.unwrap();
+        assert_eq!(usage.instances, 2);
+        let dup = test_instance(2, "new", &owner, &host);
+        assert!(matches!(
+            store
+                .create_instance(dup, Duration::ZERO, Capacity::unbounded())
+                .await,
+            Err(Error::NameTaken)
+        ));
+        // The poll does not overwrite it; it still updates other rows.
+        store
+            .update_observed_states(HashMap::from([
+                ("uuid-000".into(), State::Stopped),
+                ("uuid-001".into(), State::Running),
+            ]))
+            .await
+            .unwrap();
+        assert_eq!(
+            store.instance("uuid-000").await.unwrap().state,
+            State::Provisioning
+        );
+        assert_eq!(
+            store.instance("uuid-001").await.unwrap().state,
+            State::Running
+        );
+        let listed = store.provisioning_instances(host.id).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].uuid, "uuid-000");
+
+        // finish_provisioning changes only a provisioning row, once.
+        assert!(
+            !store
+                .finish_provisioning("uuid-001", State::Stopped)
+                .await
+                .unwrap()
+        );
+        assert!(
+            store
+                .finish_provisioning("uuid-000", State::Stopped)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !store
+                .finish_provisioning("uuid-000", State::Running)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            store.instance("uuid-000").await.unwrap().state,
+            State::Stopped
+        );
+        assert!(
+            store
+                .provisioning_instances(host.id)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            !store
+                .finish_provisioning("no-such", State::Stopped)
+                .await
+                .unwrap()
         );
     }
 

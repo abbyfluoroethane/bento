@@ -68,6 +68,10 @@ pub enum State {
     Running,
     Stopped,
     Starting,
+    /// The row exists but the domain does not yet. A `create` or `copy`
+    /// owns the row until it finishes; the poll must not overwrite this
+    /// value and restore must not start the row (SPEC 11.2).
+    Provisioning,
 }
 
 impl State {
@@ -77,6 +81,7 @@ impl State {
             State::Running => "running",
             State::Stopped => "stopped",
             State::Starting => "starting",
+            State::Provisioning => "provisioning",
         }
     }
 }
@@ -640,7 +645,12 @@ mod tests {
 
     #[test]
     fn string_enums_round_trip() {
-        for s in [State::Running, State::Stopped, State::Starting] {
+        for s in [
+            State::Running,
+            State::Stopped,
+            State::Starting,
+            State::Provisioning,
+        ] {
             assert_eq!(s.as_str().parse::<State>().unwrap(), s);
         }
         for s in [DesiredState::Running, DesiredState::Stopped] {
@@ -685,7 +695,12 @@ mod tests {
         fn check<T: Serialize>(value: &T, name: &str) {
             assert_eq!(serde_json::to_string(value).unwrap(), format!("\"{name}\""));
         }
-        for v in [State::Running, State::Stopped, State::Starting] {
+        for v in [
+            State::Running,
+            State::Stopped,
+            State::Starting,
+            State::Provisioning,
+        ] {
             check(&v, v.as_str());
         }
         for v in [DesiredState::Running, DesiredState::Stopped] {
@@ -718,6 +733,11 @@ mod tests {
     #[test]
     fn unknown_values_are_rejected() {
         assert!("gone".parse::<State>().is_err());
+        assert_eq!(
+            "provisioning".parse::<State>().unwrap(),
+            State::Provisioning
+        );
+        assert!("provisioning".parse::<DesiredState>().is_err());
         assert!("".parse::<Visibility>().is_err());
     }
 

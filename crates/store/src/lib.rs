@@ -24,7 +24,7 @@ mod sshkeys;
 mod tokens;
 mod users;
 
-pub use runners::{HostHealth, HostSeen, Observation};
+pub use runners::{HostHealth, HostSeen, NetworkResult, Observation};
 pub use users::Usage;
 
 /// The full database schema from SPEC section 12.
@@ -109,6 +109,14 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    /// A restore failed while it prepared the copy, before it touched the
+    /// live database. The live database is unchanged.
+    #[error("store: restore failed before the swap, the live database is unchanged")]
+    RestoreNotApplied(#[source] Box<Error>),
+    /// The prepared copy failed a check. Only seen inside
+    /// [`Error::RestoreNotApplied`].
+    #[error("store: the restored copy failed {0}")]
+    RestoreCheck(String),
     /// The dump destination could not be inspected or created.
     #[error("store: dump destination {path}")]
     DumpDestination {
@@ -116,6 +124,13 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
+    /// The database records a migration that this build does not have. A
+    /// later build wrote it. Running older code on that schema is not
+    /// safe, so the store refuses to open it (SPEC 12.1).
+    #[error(
+        "store: the database is at schema version {recorded} but this build knows up to {known}: run a newer bentod"
+    )]
+    SchemaTooNew { recorded: i64, known: i64 },
     /// The single connection mutex was poisoned by a panic.
     #[error("store: database connection mutex poisoned")]
     MutexPoisoned,
@@ -271,12 +286,20 @@ fn open_connection(path: &Path, now: Clock) -> Result<Connection> {
     conn.pragma_update(None, "journal_mode", "WAL")?;
     conn.pragma_update(None, "foreign_keys", true)?;
     conn.busy_timeout(Duration::from_millis(5000))?;
-    // The baseline creates a new database and leaves an existing one
-    // alone; the numbered migrations carry it the rest of the way
-    // (MULTI-NODE 16).
-    conn.execute_batch(SCHEMA_SQL)?;
-    migrate::apply(&mut conn, now)?;
+    prepare_schema(&mut conn, now)?;
     Ok(conn)
+}
+
+/// Brings a database to the current schema. `open_connection` and
+/// `restore_db` both run it, so a restored old copy takes the same path
+/// as an old database that is opened (SPEC 12.1).
+///
+/// The baseline creates a new database and leaves an existing one
+/// alone; the numbered migrations carry it the rest of the way
+/// (MULTI-NODE 16).
+pub(crate) fn prepare_schema(conn: &mut Connection, now: Clock) -> Result<()> {
+    conn.execute_batch(SCHEMA_SQL)?;
+    migrate::apply(conn, now)
 }
 
 fn format_time(value: OffsetDateTime) -> rusqlite::Result<String> {
