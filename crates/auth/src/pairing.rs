@@ -49,9 +49,25 @@ pub trait PairingStore: Send + Sync {
     ) -> std::result::Result<Option<Pairing>, BoxError>;
 
     /// Attaches the pairing's key to the user and marks the pairing used,
-    /// atomically. `false` means the pairing was claimed or expired
-    /// first, and nothing was written.
-    async fn link_pairing(&self, id: i64, user_id: i64) -> std::result::Result<bool, BoxError>;
+    /// atomically. `Gone` means the pairing was claimed or expired first,
+    /// and `KeyTaken` means the fingerprint is already registered; in both
+    /// cases nothing was written.
+    async fn link_pairing(
+        &self,
+        id: i64,
+        user_id: i64,
+    ) -> std::result::Result<LinkOutcome, BoxError>;
+}
+
+/// How an attempt to claim a pairing ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinkOutcome {
+    /// The key is attached and the pairing is used.
+    Linked,
+    /// The pairing was claimed or expired first.
+    Gone,
+    /// The fingerprint is registered already, by any account (SPEC 13).
+    KeyTaken,
 }
 
 /// What a link token resolved to, once the session and the row are known.
@@ -110,7 +126,7 @@ impl Service {
             return text_response(StatusCode::INTERNAL_SERVER_ERROR, "linking is not wired\n");
         };
         match pairings.link_pairing(pairing.id, user.id).await {
-            Ok(true) => {
+            Ok(LinkOutcome::Linked) => {
                 tracing::info!(
                     user = %user.name,
                     fingerprint = %pairing.fingerprint,
@@ -120,9 +136,15 @@ impl Service {
             }
             // The row was live a moment ago, so this is the losing half of
             // two confirmations, or a link that expired mid-click.
-            Ok(false) => html_response(
+            Ok(LinkOutcome::Gone) => html_response(
                 StatusCode::GONE,
                 dead_page("This link was already used, or it ran out of time."),
+            ),
+            // A second pairing for a key that is registered since: a fingerprint
+            // is unique across accounts, and the answer is 409 (SPEC 13).
+            Ok(LinkOutcome::KeyTaken) => html_response(
+                StatusCode::CONFLICT,
+                dead_page("This key is already linked to an account."),
             ),
             Err(error) => {
                 tracing::error!(error = %error, "linking an ssh key failed");
@@ -326,6 +348,25 @@ mod tests {
 
         let again = service.link_confirm_response(&headers, "tok").await;
         assert_eq!(again.status(), StatusCode::GONE);
+        assert_eq!(pairings.linked().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_second_pairing_for_a_linked_key_answers_409() {
+        let Fixture {
+            service, pairings, ..
+        } = fixture();
+        // Two `ssh` runs with one key leave two live pairings.
+        let expires = TEST_EPOCH + Duration::minutes(3);
+        pairings.insert_for("one", "SHA256:same", expires);
+        pairings.insert_for("two", "SHA256:same", expires);
+        let headers = signed_in(&service, 42).await;
+
+        let first = service.link_confirm_response(&headers, "one").await;
+        assert_eq!(first.status(), StatusCode::OK);
+        let second = service.link_confirm_response(&headers, "two").await;
+        assert_eq!(second.status(), StatusCode::CONFLICT);
+        assert!(second.body().contains("already linked to an account"));
         assert_eq!(pairings.linked().len(), 1);
     }
 

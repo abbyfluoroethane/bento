@@ -1013,6 +1013,35 @@ mod terminal_socket {
     }
 
     #[tokio::test]
+    async fn an_open_terminal_closes_when_the_share_is_removed() {
+        // Alice reads the VM `db` through a share (SPEC 14.6).
+        let fx = fixture();
+        let address = serve(fx.pages.clone()).await;
+        let mut socket = open(&address, "/vm/uuid-db/terminal/ws?start=1").await;
+        read_until(&mut socket, "hello from db").await;
+
+        fx.store.data.lock().unwrap().shares.remove("uuid-db");
+        assert_eq!(
+            close_of(&mut socket).await,
+            (CloseCode::Policy, "access ended".to_owned())
+        );
+    }
+
+    #[tokio::test]
+    async fn an_open_terminal_closes_when_the_session_ends() {
+        let fx = fixture();
+        let address = serve(fx.pages.clone()).await;
+        let mut socket = open(&address, "/vm/uuid-web/terminal/ws").await;
+        read_until(&mut socket, "hello from web").await;
+
+        *fx.auth.0.lock().unwrap() = None;
+        assert_eq!(
+            close_of(&mut socket).await,
+            (CloseCode::Policy, "access ended".to_owned())
+        );
+    }
+
+    #[tokio::test]
     async fn a_stopped_vm_starts_only_when_the_page_asks() {
         // Alice holds a share on the stopped VM `db`.
         let fx = fixture();

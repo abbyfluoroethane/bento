@@ -3,7 +3,7 @@
 //! libvirt, user networks, firewall, reboot restore, then HTTP.
 
 use std::ffi::OsString;
-use std::future::Future;
+use std::future::{Future, IntoFuture};
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::Arc;
@@ -18,6 +18,7 @@ use axum::routing::{get, post};
 use bento_hypervisor::NetworkManager;
 use bento_network::{NftApplier, PortRange};
 use bento_types::Lease;
+use time::OffsetDateTime;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
@@ -52,6 +53,53 @@ where
                     return;
                 }
             }
+        }
+    }
+}
+
+/// How long open connections may delay a shutdown. A web terminal
+/// WebSocket does not end by itself, so a drain without a bound would keep
+/// the process from the lease release (MULTI-NODE 11.3).
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// How often expired dashboard sessions leave memory.
+const SESSION_SWEEP: Duration = Duration::from_secs(300);
+
+/// Removes expired sessions every `SESSION_SWEEP`. A session whose cookie
+/// never comes back is not removed by lookup (SPEC 13).
+async fn sweep_sessions(
+    sessions: Arc<bento_auth::MemorySessionStore>,
+    now: impl Fn() -> OffsetDateTime,
+    shutdown: &CancellationToken,
+) {
+    every(SESSION_SWEEP, shutdown, || async {
+        sessions.delete_expired(now()).await;
+        ControlFlow::Continue(())
+    })
+    .await;
+}
+
+/// Serves until `cancel` fires, then lets open requests finish for `grace`
+/// and stops waiting. Connections still open then end with the process.
+async fn serve_until(
+    listener: tokio::net::TcpListener,
+    router: Router,
+    cancel: CancellationToken,
+    grace: Duration,
+) -> std::io::Result<()> {
+    let drain = cancel.clone();
+    let server = axum::serve(listener, router)
+        .with_graceful_shutdown(async move { drain.cancelled().await })
+        .into_future();
+    tokio::pin!(server);
+    tokio::select! {
+        result = &mut server => result,
+        () = async {
+            cancel.cancelled().await;
+            tokio::time::sleep(grace).await;
+        } => {
+            tracing::warn!(?grace, "connections still open after the grace period; shutting down");
+            Ok(())
         }
     }
 }
@@ -224,7 +272,7 @@ async fn serve_inner(
     // The sampler holds the series the dashboard charts read (SPEC
     // 14.4). The router answers from it, and the task below fills it.
     let sampler = Arc::new(crate::metrics::Sampler::new());
-    let router = control_plane_router(
+    let (router, sessions) = control_plane_router(
         app,
         manager.clone(),
         hypervisor.clone(),
@@ -322,15 +370,24 @@ async fn serve_inner(
         }
     });
 
-    let shutdown = cancellation.clone();
-    let serve_result = axum::serve(listener, router)
-        .with_graceful_shutdown(async move {
+    tasks.spawn({
+        let cancellation = cancellation.clone();
+        async move {
+            sweep_sessions(sessions, OffsetDateTime::now_utc, &cancellation).await;
+        }
+    });
+
+    let signal = tokio::spawn({
+        let shutdown = cancellation.clone();
+        async move {
             tokio::select! {
                 _ = shutdown_signal() => shutdown.cancel(),
                 _ = shutdown.cancelled() => {}
             }
-        })
-        .await;
+        }
+    });
+    let serve_result = serve_until(listener, router, cancellation.clone(), SHUTDOWN_GRACE).await;
+    signal.abort();
     cancellation.cancel();
     restore.abort();
     log_join("restore", restore.await);
@@ -460,13 +517,17 @@ async fn control_plane_router(
     frontend_key: Arc<russh::keys::PrivateKey>,
     host_id: i64,
     sampler: Arc<crate::metrics::Sampler>,
-) -> Result<Router> {
+    // The caller sweeps the session store: lookup removes an expired
+    // session only when its cookie comes back (SPEC 13).
+) -> Result<(Router, Arc<bento_auth::MemorySessionStore>)> {
+    let sessions = Arc::new(bento_auth::MemorySessionStore::new());
     let mut auth = bento_auth::Service::new(
         &app.cfg.base_domain,
         Arc::new(AuthUsers(app.store.clone())),
         Arc::new(AuthAccess(app.store.clone())),
         Arc::new(AuthTokens(app.store.clone())),
     )
+    .with_session_store(sessions.clone())
     .with_pairings(Arc::new(AuthPairings(app.store.clone())))
     .with_instance_domain(&app.cfg.instance_domain)
     .with_instance_names(Arc::new(AuthInstanceNames(app.store.clone())))
@@ -544,7 +605,7 @@ async fn control_plane_router(
     let link_confirm_auth = auth.clone();
     let dashboard_auth = auth.clone();
     let logout_auth = auth;
-    Ok(Router::new()
+    let router = Router::new()
         .merge(api)
         .route(
             "/access/{uuid}",
@@ -624,7 +685,11 @@ async fn control_plane_router(
                         }
                     },
                 )),
-        ))
+        );
+    // One guard over every route, so a route added later is covered
+    // (SPEC 13). It wraps the merged router, not each part.
+    let router = bento_api::guard_origin(router, &app.cfg.base_domain);
+    Ok((router, sessions))
 }
 
 /// The host of the OIDC issuer, for the sign-in button. An issuer that is
@@ -681,6 +746,77 @@ mod tests {
         })
         .await;
         assert_eq!(runs, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_sweep_removes_a_session_that_never_returns() {
+        use bento_auth::{Session, SessionStore};
+        let epoch = OffsetDateTime::UNIX_EPOCH;
+        let sessions = Arc::new(bento_auth::MemorySessionStore::new());
+        for (id, expires_at) in [("dead", epoch), ("live", epoch + time::Duration::DAY)] {
+            sessions
+                .put(Session {
+                    id: id.into(),
+                    user_id: 1,
+                    created_at: epoch,
+                    expires_at,
+                })
+                .await
+                .unwrap();
+        }
+        let shutdown = CancellationToken::new();
+        // The clock stands one hour after the epoch.
+        let task = tokio::spawn({
+            let sessions = sessions.clone();
+            let shutdown = shutdown.clone();
+            async move {
+                sweep_sessions(sessions, || epoch + time::Duration::HOUR, &shutdown).await;
+            }
+        });
+        tokio::time::sleep(SESSION_SWEEP + Duration::from_secs(1)).await;
+        assert!(sessions.get("dead").await.is_none());
+        assert!(sessions.get("live").await.is_some());
+        shutdown.cancel();
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_does_not_wait_for_a_connection_that_never_ends() {
+        use tokio::io::AsyncWriteExt;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let router = Router::new().route(
+            "/hang",
+            get({
+                let entered = entered.clone();
+                move || {
+                    let entered = entered.clone();
+                    async move {
+                        entered.notify_one();
+                        std::future::pending::<&'static str>().await
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        let server = tokio::spawn(serve_until(
+            listener,
+            router,
+            cancel.clone(),
+            Duration::from_secs(10),
+        ));
+        let mut client = tokio::net::TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(b"GET /hang HTTP/1.1\r\nHost: example.org\r\n\r\n")
+            .await
+            .unwrap();
+        entered.notified().await;
+        cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(60), server)
+            .await
+            .expect("serve_until returns after the grace period");
+        result.unwrap().unwrap();
     }
 
     #[tokio::test]

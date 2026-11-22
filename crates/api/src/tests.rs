@@ -1358,3 +1358,44 @@ fn action_names_serialize_in_lowercase() {
         assert_eq!(serde_json::to_value(action).unwrap(), name);
     }
 }
+
+#[tokio::test]
+async fn a_json_handler_refuses_a_body_that_is_not_json() {
+    let fixture = fixture();
+    for content_type in [
+        Some("text/plain"),
+        Some("application/x-www-form-urlencoded"),
+        None,
+    ] {
+        let mut builder = Request::builder()
+            .method(Method::POST)
+            .uri("/api/instances/uuid-web/rename");
+        if let Some(content_type) = content_type {
+            builder = builder.header(header::CONTENT_TYPE, content_type);
+        }
+        let response = fixture
+            .app
+            .clone()
+            .oneshot(
+                builder
+                    .body(Body::from(r#"{"new_name":"renamed"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "{content_type:?}"
+        );
+    }
+    assert!(fixture.lifecycle.calls.lock().unwrap().is_empty());
+    let ok = request(
+        &fixture.app,
+        Method::POST,
+        "/api/instances/uuid-web/rename",
+        r#"{"new_name":"renamed"}"#,
+    )
+    .await;
+    assert_eq!(ok.status, StatusCode::OK);
+}

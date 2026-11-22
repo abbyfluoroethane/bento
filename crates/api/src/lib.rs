@@ -10,12 +10,14 @@
 mod instances;
 mod interfaces;
 mod misc;
+mod origin;
 mod pages;
 mod placeholder;
 
 pub(crate) use instances::*;
 pub use interfaces::*;
 pub(crate) use misc::*;
+pub use origin::guard_origin;
 pub use pages::router as pages;
 pub use placeholder::PlaceholderMetrics;
 
@@ -257,6 +259,25 @@ pub(crate) fn optional_rfc3339(value: Option<OffsetDateTime>) -> String {
 pub(crate) async fn decode_json<T: for<'de> Deserialize<'de>>(
     request: Request<Body>,
 ) -> Result<T, HandlerError> {
+    // A cross-site `text/plain` form post must not parse as JSON. A
+    // browser form cannot send `application/json` without a preflight.
+    let json = request
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .map(str::trim)
+        .is_some_and(|mime| {
+            mime.eq_ignore_ascii_case("application/json")
+                || mime.to_ascii_lowercase().ends_with("+json")
+        });
+    if !json {
+        return Err(StatusError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "the request body must be application/json",
+        )
+        .into());
+    }
     let bytes = to_bytes(request.into_body(), 1 << 20)
         .await
         .map_err(bad_body)?;

@@ -53,3 +53,5 @@ url = { workspace = true }
 hex = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
+# Paused time for the shutdown and sweep tests in serve.rs.
+tokio = { workspace = true, features = ["test-util"] }

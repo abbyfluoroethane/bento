@@ -1,6 +1,8 @@
 //! The web terminal socket (SPEC 14.6). One WebSocket is one guest shell,
 //! with the same access as `ssh $NAME@` the base domain.
 
+use std::time::Duration;
+
 use axum::Extension;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path as AxumPath, Query, State};
@@ -22,6 +24,18 @@ const MAX_MESSAGE: usize = 1 << 20;
 /// The close code for a stopped instance the page did not ask to start.
 /// Codes 4000 to 4999 are free for the application (RFC 6455 7.4.2).
 pub(crate) const CLOSE_NOT_RUNNING: u16 = 4409;
+/// How often an open terminal checks again that its session is valid and
+/// that the user can still read the instance (SPEC 14.6).
+/// Tests cannot pause the clock here (tokio's `test-util` feature is not
+/// enabled), so they run with a short period.
+const RECHECK_EVERY: Duration = if cfg!(test) {
+    Duration::from_millis(50)
+} else {
+    Duration::from_secs(30)
+};
+/// The close code for a socket whose session ended or whose access was
+/// removed: policy violation (RFC 6455 7.4.1).
+pub(crate) const CLOSE_ACCESS_ENDED: u16 = 1008;
 /// A close reason has at most 123 bytes (RFC 6455 5.5).
 const MAX_REASON: usize = 123;
 
@@ -66,7 +80,7 @@ pub(crate) async fn socket(
     // Step 2. A browser sends the session cookie with a WebSocket request
     // from any page on the same site, and an instance subdomain is the same
     // site. Only the `Origin` header tells the dashboard from a guest page.
-    let expected = format!("https://{}", state.0.base_domain);
+    let expected = crate::origin::dashboard_origin(&state.0.base_domain);
     let origin = headers
         .get(header::ORIGIN)
         .and_then(|value| value.to_str().ok());
@@ -90,20 +104,45 @@ pub(crate) async fn socket(
     };
     let size = clamped(params.cols, params.rows);
     let start = params.start.as_deref() == Some("1");
-    let console = state.0.console.clone();
     upgrade
         .max_message_size(MAX_MESSAGE)
-        .on_upgrade(move |socket| run(socket, console, user, instance, size, start))
+        .on_upgrade(move |socket| run(socket, state, headers, user, instance, size, start))
+}
+
+/// Returns when the session has ended or the user may no longer read the
+/// instance. The checks of `socket` happen once, before the upgrade, and a
+/// shell can outlive them by hours: a removed share or a logout must close
+/// it (SPEC 14.6). A store error does not end the shell, because the answer
+/// is unknown; an authentication error does, since the session is gone.
+async fn access_ended(state: &AppState, headers: &HeaderMap, uuid: &str) {
+    let mut ticks =
+        tokio::time::interval_at(tokio::time::Instant::now() + RECHECK_EVERY, RECHECK_EVERY);
+    loop {
+        ticks.tick().await;
+        let user = match state.0.auth.user_from_headers(headers).await {
+            Ok(user) => user,
+            Err(_) => return,
+        };
+        match readable_instance(state, uuid, &user).await {
+            Ok(Some(_)) => {}
+            Ok(None) => return,
+            Err(error) => {
+                tracing::warn!(%uuid, error = %error, "web terminal: access re-check failed");
+            }
+        }
+    }
 }
 
 async fn run(
     socket: WebSocket,
-    console: std::sync::Arc<dyn crate::Console>,
+    state: AppState,
+    headers: HeaderMap,
     user: User,
     instance: Instance,
     size: TerminalSize,
     start: bool,
 ) {
+    let console = state.0.console.clone();
     let uuid = instance.uuid.clone();
     tracing::info!(user = %user.name, %uuid, "web terminal opened");
 
@@ -161,6 +200,7 @@ async fn run(
         end
     };
 
+    let mut ended = false;
     // When the page goes first, dropping the session future closes the
     // guest connection. The server keeps no session (SPEC 14.6).
     tokio::select! {
@@ -170,6 +210,18 @@ async fn run(
         () = from_browser => {
             tracing::info!(user = %user.name, %uuid, "web terminal closed by the page");
         }
+        () = access_ended(&state, &headers, &uuid) => {
+            tracing::info!(user = %user.name, %uuid, "web terminal closed: access ended");
+            ended = true;
+        }
+    }
+    if ended {
+        // The select dropped the guest connection; tell the page why.
+        let frame = CloseFrame {
+            code: CLOSE_ACCESS_ENDED,
+            reason: "access ended".into(),
+        };
+        let _ = sink.send(Message::Close(Some(frame))).await;
     }
 }
 

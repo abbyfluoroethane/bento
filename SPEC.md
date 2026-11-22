@@ -615,6 +615,10 @@ The cookie identifies the user and nothing else. Authorization runs on every req
 
 A token in the `tokens` table gives programmatic access.
 
+**Linked key.** When a user confirms a link for a key that is already registered, the answer is 409 and the page says that the key is already linked to an account.
+
+**Origin of a request.** Each request that changes state (a method other than GET, HEAD, or OPTIONS) must come from the dashboard origin `https://<base_domain>`. A request with an `Origin` header is permitted only when the header is equal to that value. A request with no `Origin` header is permitted when `Sec-Fetch-Site` is `same-origin` or `none`, or when it has no `Cookie` header, because a client with only a Bearer token has no ambient credential. All other requests get 403. One layer on the full control-plane router does this check, and the web terminal uses the same origin function. A JSON API handler requires `Content-Type: application/json` and answers 415 for other types.
+
 ## 14. Dashboard
 
 The dashboard exposes every operation in section 15. The dashboard is not a separate product. A user who prefers a browser must not lose a capability.
@@ -766,13 +770,13 @@ Refuse each failed check with the status that `error_parts` gives. Do not tell a
 | Browser to server | binary | Keyboard input, as raw bytes. |
 | Browser to server | text | One JSON control object: `{"type":"resize","cols":N,"rows":N}`. |
 | Server to browser | binary | Guest output, as raw bytes. |
-| Server to browser | close | Code 1000 with the exit status as the reason, code 1011 with the failure message, or code 4409 when the instance is stopped and the URL has no `start=1`. |
+| Server to browser | close | Code 1000 with the exit status as the reason, code 1011 with the failure message, code 1008 when the access ended, or code 4409 when the instance is stopped and the URL has no `start=1`. |
 
 The WebSocket URL carries the first size as `cols` and `rows` query values. The server requests a PTY of that size with `TERM=xterm-256color`. It then requests a shell. Clamp `cols` and `rows` to 1 through 1000.
 
 **Development server.** The dashboard development server has no guest. Its `Origin` is not the base domain, so the terminal refuses it. Test the terminal with the page tests.
 
-**Lifetime.** One WebSocket is one SSH session. When the WebSocket closes, the server closes the guest session. When the guest session ends, the server closes the WebSocket. The server keeps no session after a disconnect, and it does not replay output. A user who wants a session that continues after a disconnect runs `tmux` in the guest, as with SSH. The page does not reconnect automatically. It shows the close reason and a Reconnect button.
+**Lifetime.** One WebSocket is one SSH session. The server checks the session and the read access again every 30 seconds, and closes the WebSocket with code 1008 when a check fails. When the WebSocket closes, the server closes the guest session. When the guest session ends, the server closes the WebSocket. The server keeps no session after a disconnect, and it does not replay output. A user who wants a session that continues after a disconnect runs `tmux` in the guest, as with SSH. The page does not reconnect automatically. It shows the close reason and a Reconnect button.
 
 **Records.** Update `last_seen_at` when the guest session opens (section 12). Log the user, the instance UUID, the open time, and the close time. Do not log the terminal bytes.
 

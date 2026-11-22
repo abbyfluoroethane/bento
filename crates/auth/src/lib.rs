@@ -33,7 +33,7 @@ pub use middleware::{UserId, user_id_from_parts};
 pub use oidc::{
     Claims, Exchanger, NewAccount, ProviderClient, ProviderError, Provisioner, Verifier,
 };
-pub use pairing::{LINK_PATH_PREFIX, PairingStore, new_link_token};
+pub use pairing::{LINK_PATH_PREFIX, LinkOutcome, PairingStore, new_link_token};
 pub use session::{MemorySessionStore, SESSION_COOKIE_NAME, Session, SessionStore};
 pub use token::{TOKEN_PREFIX, TokenLookup, bearer_token, hash_token};
 

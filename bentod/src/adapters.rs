@@ -1089,12 +1089,19 @@ impl bento_auth::PairingStore for AuthPairings {
         }
     }
 
-    async fn link_pairing(&self, id: i64, user_id: i64) -> Result<bool, AuthError> {
+    async fn link_pairing(
+        &self,
+        id: i64,
+        user_id: i64,
+    ) -> Result<bento_auth::LinkOutcome, AuthError> {
+        use bento_auth::LinkOutcome;
         match self.0.link_pairing(id, user_id).await {
-            Ok(_) => Ok(true),
+            Ok(_) => Ok(LinkOutcome::Linked),
             // The store's conditional claim reports every lost race, expiry,
-            // and missing row the same way, which is what `false` means here.
-            Err(StoreError::NotFound) => Ok(false),
+            // and missing row the same way, which is what `Gone` means here.
+            Err(StoreError::NotFound) => Ok(LinkOutcome::Gone),
+            // The key was registered after this pairing began (SPEC 13).
+            Err(StoreError::SshKeyTaken) => Ok(LinkOutcome::KeyTaken),
             Err(error) => Err(Box::new(error)),
         }
     }
@@ -1150,12 +1157,15 @@ pub(crate) struct Authenticator {
 #[async_trait]
 impl bento_api::Authenticator for Authenticator {
     async fn user_from_headers(&self, headers: &http::HeaderMap) -> Result<User, ApiError> {
-        if let Some(session) = self.service.session_from_headers(headers).await {
-            return Ok(self.store.user_by_id(session.user_id).await?);
-        }
+        // An explicit bearer token is the more specific credential, and a
+        // bad one is refused rather than replaced by a cookie. This is the
+        // order of `require_session_or_token` (SPEC 13).
         if let Some(plaintext) = bento_auth::bearer_token(headers) {
             let token = self.service.authenticate_token(plaintext).await?;
             return Ok(self.store.user_by_id(token.user_id).await?);
+        }
+        if let Some(session) = self.service.session_from_headers(headers).await {
+            return Ok(self.store.user_by_id(session.user_id).await?);
         }
         Err(Box::new(bento_auth::Error::Unauthenticated))
     }
@@ -1166,13 +1176,16 @@ pub(crate) async fn access_status(
     headers: &http::HeaderMap,
     uuid: &str,
 ) -> StatusCode {
-    let mut result = service.authorize_request(headers, uuid).await.map(|_| ());
-    if matches!(result, Err(bento_auth::Error::Unauthenticated))
-        && let Some(plaintext) = bento_auth::bearer_token(headers)
-        && let Ok(token) = service.authenticate_token(plaintext).await
-    {
-        result = service.authorize_user(token.user_id, uuid).await;
-    }
+    // The token goes first, as in `user_from_headers`; a bad token does not
+    // fall back to a cookie.
+    let result = if let Some(plaintext) = bento_auth::bearer_token(headers) {
+        match service.authenticate_token(plaintext).await {
+            Ok(token) => service.authorize_user(token.user_id, uuid).await,
+            Err(_) => Err(bento_auth::Error::Unauthenticated),
+        }
+    } else {
+        service.authorize_request(headers, uuid).await.map(|_| ())
+    };
     match result {
         Ok(()) => StatusCode::NO_CONTENT,
         Err(bento_auth::Error::Forbidden) => StatusCode::FORBIDDEN,

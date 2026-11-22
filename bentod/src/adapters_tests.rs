@@ -22,8 +22,8 @@ use bento_types::{DesiredState, Image, ImageVersion, State, Visibility};
 use time::OffsetDateTime;
 
 use crate::adapters::{
-    AccountProvisioner, ApiBackend, AuthAccess, AuthPairings, AuthTokens, AuthUsers, Backend,
-    CliBackend, LifecycleStore, Linker, NetworkEnsurer, ProxySource, access_status,
+    AccountProvisioner, ApiBackend, AuthAccess, AuthPairings, AuthTokens, AuthUsers, Authenticator,
+    Backend, CliBackend, LifecycleStore, Linker, NetworkEnsurer, ProxySource, access_status,
     api_lifecycle_error,
 };
 use crate::firewall::Firewall;
@@ -1280,5 +1280,100 @@ fn the_error_chain_helper_joins_each_layer_once() {
     assert_eq!(
         bento_types::error_chain(&error),
         "read the socket: disk full"
+    );
+}
+
+/// Two `ssh` runs with one new key leave two pairings. After the first
+/// is linked, the second must answer "key taken" and not an opaque error,
+/// and must stay unclaimed (SPEC 13).
+#[tokio::test]
+async fn a_second_pairing_for_a_linked_key_reports_key_taken() {
+    use bento_auth::{LinkOutcome, PairingStore};
+
+    let env = Env::new().await;
+    let user = env.add_user("amber").await;
+    let expires = OffsetDateTime::now_utc() + time::Duration::minutes(3);
+    let mut ids = Vec::new();
+    for hash in ["hash-one", "hash-two"] {
+        let pairing = env
+            .store
+            .create_pairing(hash, OWNER_KEY, "SHA256:dup", "owner@laptop", expires)
+            .await
+            .unwrap();
+        ids.push(pairing.id);
+    }
+    let pairings = AuthPairings(env.store.clone());
+    assert_eq!(
+        pairings.link_pairing(ids[0], user.id).await.unwrap(),
+        LinkOutcome::Linked
+    );
+    assert_eq!(
+        pairings.link_pairing(ids[1], user.id).await.unwrap(),
+        LinkOutcome::KeyTaken
+    );
+    // The rollback left the second pairing pending.
+    let second = env.store.pairing_by_token_hash("hash-two").await.unwrap();
+    assert!(second.linked_user_id.is_none());
+}
+
+/// A request with a session cookie of one user and a bearer token of
+/// another must resolve to the token's user on every path, as
+/// `require_session_or_token` does (SPEC 13).
+#[tokio::test]
+async fn a_bearer_token_wins_over_a_session_cookie_everywhere() {
+    use bento_api::Authenticator as _;
+
+    let env = Env::new().await;
+    let owner = env.add_user("amber").await;
+    let other = env.add_user("blair").await;
+    env.add_image().await;
+    let instance = env.create(&env.backend(""), &owner, "web").await;
+    let sessions = Arc::new(bento_auth::MemorySessionStore::new());
+    let service = Arc::new(
+        bento_auth::Service::new(
+            "bento.example.org",
+            Arc::new(AuthUsers(env.store.clone())),
+            Arc::new(AuthAccess(env.store.clone())),
+            Arc::new(AuthTokens(env.store.clone())),
+        )
+        .with_session_store(sessions.clone()),
+    );
+    // The owner has a live session; the token belongs to another user.
+    let session = bento_auth::Session {
+        id: "session-of-owner".into(),
+        user_id: owner.id,
+        created_at: OffsetDateTime::now_utc(),
+        expires_at: OffsetDateTime::now_utc() + time::Duration::hours(1),
+    };
+    bento_auth::SessionStore::put(&*sessions, session.clone())
+        .await
+        .unwrap();
+    let (other_plaintext, _) = service
+        .mint_token(other.id, time::Duration::ZERO)
+        .await
+        .unwrap();
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        http::header::COOKIE,
+        format!("{}={}", bento_auth::SESSION_COOKIE_NAME, session.id)
+            .parse()
+            .unwrap(),
+    );
+    headers.insert(
+        http::header::AUTHORIZATION,
+        format!("Bearer {other_plaintext}").parse().unwrap(),
+    );
+    let authenticator = Authenticator {
+        service: service.clone(),
+        store: env.store.clone(),
+    };
+    assert_eq!(
+        authenticator.user_from_headers(&headers).await.unwrap().id,
+        other.id
+    );
+    // The token's user has no access to the owner's instance.
+    assert_eq!(
+        access_status(&service, &headers, &instance.uuid).await,
+        http::StatusCode::FORBIDDEN
     );
 }

@@ -361,6 +361,11 @@ express a port range, so publishing them through Caddy means either one
 site block per port (narrow the range first) or giving Bento a
 public bind and its own certificate.
 
+The front proxy must pass the `Origin` header with no change, and users
+must open the dashboard at `https://<base_domain>`. Bento compares the
+`Origin` of each request that changes state with that value (SPEC 13),
+so a second domain for the dashboard cannot send such a request.
+
 ### Reaching instances under a second domain
 
 A front proxy can also publish instances under a domain that is not

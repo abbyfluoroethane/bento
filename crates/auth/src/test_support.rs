@@ -7,8 +7,8 @@ use bento_types::{Pairing, Token, User};
 use time::{Duration, OffsetDateTime, macros::datetime};
 
 use crate::{
-    AccessStore, BoxError, Claims, Exchanger, InstanceNames, NewAccount, PairingStore, Provisioner,
-    Service, TokenLookup, TokenStore, UserStore, Verifier,
+    AccessStore, BoxError, Claims, Exchanger, InstanceNames, LinkOutcome, NewAccount, PairingStore,
+    Provisioner, Service, TokenLookup, TokenStore, UserStore, Verifier,
 };
 
 pub(crate) const TEST_EPOCH: OffsetDateTime = datetime!(2026-08-10 12:00 UTC);
@@ -132,6 +132,7 @@ impl Provisioner for FakeProvisioner {
 pub(crate) struct FakePairingStore {
     pairings: Mutex<HashMap<String, Pairing>>,
     linked: Mutex<Vec<(i64, i64)>>,
+    keys: Mutex<Vec<String>>,
 }
 
 impl FakePairingStore {
@@ -141,12 +142,23 @@ impl FakePairingStore {
 
     /// Adds a live pairing whose link token is `token`.
     pub(crate) fn insert(&self, token: &str, expires_at: OffsetDateTime) -> Pairing {
+        self.insert_for(token, &format!("SHA256:fingerprint-of-{token}"), expires_at)
+    }
+
+    /// Adds a live pairing for a given fingerprint, as a second `ssh` run
+    /// with the same key does.
+    pub(crate) fn insert_for(
+        &self,
+        token: &str,
+        fingerprint: &str,
+        expires_at: OffsetDateTime,
+    ) -> Pairing {
         let mut pairings = self.pairings.lock().unwrap();
         let pairing = Pairing {
             id: pairings.len() as i64 + 1,
             token_hash: crate::hash_token(token),
             public_key: "ssh-ed25519 AAAAC3Nz key".into(),
-            fingerprint: format!("SHA256:fingerprint-of-{token}"),
+            fingerprint: fingerprint.to_string(),
             comment: "riley@laptop".into(),
             created_at: TEST_EPOCH,
             expires_at,
@@ -170,17 +182,28 @@ impl PairingStore for FakePairingStore {
         Ok(self.pairings.lock().unwrap().get(token_hash).cloned())
     }
 
-    async fn link_pairing(&self, id: i64, user_id: i64) -> std::result::Result<bool, BoxError> {
+    async fn link_pairing(
+        &self,
+        id: i64,
+        user_id: i64,
+    ) -> std::result::Result<LinkOutcome, BoxError> {
         let mut pairings = self.pairings.lock().unwrap();
         let Some(pairing) = pairings.values_mut().find(|pairing| pairing.id == id) else {
-            return Ok(false);
+            return Ok(LinkOutcome::Gone);
         };
         if pairing.linked_user_id.is_some() {
-            return Ok(false);
+            return Ok(LinkOutcome::Gone);
         }
+        // Like the store, a fingerprint links once across all accounts.
+        let fingerprint = pairing.fingerprint.clone();
+        let mut keys = self.keys.lock().unwrap();
+        if keys.contains(&fingerprint) {
+            return Ok(LinkOutcome::KeyTaken);
+        }
+        keys.push(fingerprint);
         pairing.linked_user_id = Some(user_id);
         self.linked.lock().unwrap().push((id, user_id));
-        Ok(true)
+        Ok(LinkOutcome::Linked)
     }
 }
 
