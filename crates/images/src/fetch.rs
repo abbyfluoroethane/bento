@@ -200,13 +200,21 @@ impl Store {
             .map_err(|error| dependency("check existing version", error))?;
         if exists {
             let path = self.path_normalized(&checksum);
-            if matches!(tokio::fs::metadata(&path).await, Err(error) if error.kind() == std::io::ErrorKind::NotFound)
-            {
+            // The checksum names the content, so the stored file must be
+            // exactly as long as the download that was just hashed. A
+            // shorter file is what a power loss leaves when the data was
+            // never synced; trusting it would boot instances from damage.
+            let usable = match tokio::fs::metadata(&path).await {
+                Ok(metadata) => metadata.len() == size,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(io_error(format!("stat {}", path.display()), error)),
+            };
+            if !usable {
                 tracing::warn!(
                     image = %image.name,
                     checksum,
                     path = %path.display(),
-                    "image version row exists but the stored file is missing"
+                    "image version row exists but the stored file is missing or has the wrong size"
                 );
                 let mut rollback = persist_temp_path(temporary_path, &path)?;
                 self.db
@@ -241,6 +249,10 @@ impl Store {
             })
             .await
             .map_err(|error| dependency("insert image version", error))?;
+        // The row and the file now both exist. A later failure must not
+        // remove the file and leave a row with no file; the version is not
+        // current yet, so `collect` removes both later.
+        rollback.disarm();
 
         // An unpinned image is trusted on first use. A content change is not
         // an error, but the warning must name both checksums (SPEC 5.1).
@@ -261,7 +273,6 @@ impl Store {
             .set_current_checksum(&image.name, &checksum)
             .await
             .map_err(|error| dependency("mark current", error))?;
-        rollback.disarm();
         Ok(())
     }
 
@@ -402,7 +413,9 @@ impl Store {
             .await
             .map_err(|error| dependency("check existing generated version", error))?;
         let path = self.path_normalized(&checksum);
-        let file_exists = std::fs::metadata(&path).is_ok();
+        // A file of the wrong length is a torn write (see
+        // `commit_download`); replace it as if it were missing.
+        let file_exists = std::fs::metadata(&path).is_ok_and(|metadata| metadata.len() == size);
         if !exists && file_exists {
             let (stored_checksum, _) = hash_file(&path).await?;
             if stored_checksum != checksum {
@@ -430,6 +443,10 @@ impl Store {
                 })
                 .await
                 .map_err(|error| dependency("insert generated image version", error))?;
+            // See `commit_download`: keep the file once the row exists.
+            if let Some(rollback) = &mut rollback {
+                rollback.disarm();
+            }
         }
         self.db
             .record_image_source(&image.name, &source_digest, &checksum)
@@ -664,12 +681,30 @@ impl Drop for FileRollback {
     }
 }
 
+fn sync_file(path: &Path) -> Result<()> {
+    std::fs::File::open(path)
+        .and_then(|file| file.sync_all())
+        .map_err(|error| io_error(format!("sync {}", path.display()), error))
+}
+
+/// Syncs the directory that holds `path`, so the rename survives a crash.
+fn sync_parent(path: &Path) -> Result<()> {
+    match path.parent() {
+        Some(parent) => sync_file(parent),
+        None => Ok(()),
+    }
+}
+
 fn persist_temp_path(temporary_path: TempPath, path: &Path) -> Result<FileRollback> {
     std::fs::set_permissions(&temporary_path, std::fs::Permissions::from_mode(0o444))
         .map_err(|error| io_error("chmod image", error))?;
+    // Flush the data before the rename makes the name durable: after a
+    // power loss a durable row must not point at an empty file.
+    sync_file(&temporary_path)?;
     temporary_path
         .persist(path)
         .map_err(|error| io_error(format!("store at {}", path.display()), error.error))?;
+    sync_parent(path)?;
     Ok(FileRollback {
         path: path.to_owned(),
         armed: true,
@@ -679,8 +714,10 @@ fn persist_temp_path(temporary_path: TempPath, path: &Path) -> Result<FileRollba
 fn rename_generated_disk(disk: &Path, path: &Path) -> Result<FileRollback> {
     std::fs::set_permissions(disk, std::fs::Permissions::from_mode(0o444))
         .map_err(|error| io_error("chmod generated image", error))?;
+    sync_file(disk)?;
     std::fs::rename(disk, path)
         .map_err(|error| io_error(format!("store at {}", path.display()), error))?;
+    sync_parent(path)?;
     Ok(FileRollback {
         path: path.to_owned(),
         armed: true,
@@ -1239,6 +1276,92 @@ mod tests {
 
         assert_eq!(
             std::fs::read(store.path(&checksum).unwrap()).expect("repaired file"),
+            content.as_bytes()
+        );
+        assert_eq!(db.images_snapshot()[0].current_checksum, Some(checksum));
+    }
+
+    fn unpinned(name: &str, url: &str) -> Image {
+        Image {
+            name: name.into(),
+            url: url.into(),
+            kind: ImageKind::Qcow2,
+            pinned_checksum: None,
+            current_checksum: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failure_after_the_row_insert_keeps_the_file_with_its_row() {
+        let content = "rollback-content";
+        let checksum = sha256_hex(content);
+        let db = FakeDb::new();
+        db.set_images(vec![unpinned("r", "https://img.example/r.qcow2")]);
+        db.fail_set_current();
+        let (store, _temp) = new_test_store(
+            db.clone(),
+            FakeClient::with_response("https://img.example/r.qcow2", FakeResponse::ok(content)),
+        );
+
+        store.fetch_named("r").await.expect_err("set current fails");
+
+        // A row with no file would break every instance created from it.
+        let file = store.path(&checksum).expect("path").exists();
+        assert_eq!(file, db.has_version(&checksum), "file and row must agree");
+    }
+
+    #[tokio::test]
+    async fn a_failure_after_a_generated_row_insert_keeps_the_file_with_its_row() {
+        let db = FakeDb::new();
+        db.fail_record_source();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = Store::new(temp.path(), db.clone())
+            .with_runner(OciRunner::default())
+            .with_podman("test-podman")
+            .with_builder_image(builder_reference())
+            .with_bootc_rootfs("xfs")
+            .with_container_storage("/test/containers");
+
+        store
+            .add_oci_image("fedora-bootc", "quay.io/fedora/fedora-bootc:latest")
+            .await
+            .expect_err("record source fails");
+
+        let inserted = db.inserted();
+        assert_eq!(inserted.len(), 1, "the row was written before the failure");
+        assert!(
+            Path::new(&inserted[0].path).exists(),
+            "the row must keep its file"
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_images_replaces_a_truncated_file_for_an_existing_version() {
+        let content = "complete-content";
+        let checksum = sha256_hex(content);
+        let db = FakeDb::new();
+        db.set_images(vec![unpinned("t", "https://img.example/t.qcow2")]);
+        db.add_version(ImageVersion {
+            checksum: checksum.clone(),
+            image_name: "t".into(),
+            path: String::new(),
+            size: u64::try_from(content.len()).unwrap(),
+            kind: ImageKind::Qcow2,
+            source_digest: None,
+            fetched_at: OffsetDateTime::UNIX_EPOCH,
+        });
+        let (store, _temp) = new_test_store(
+            db.clone(),
+            FakeClient::with_response("https://img.example/t.qcow2", FakeResponse::ok(content)),
+        );
+        std::fs::create_dir_all(store.dir()).expect("create dir");
+        // What a power loss leaves: the name is durable, the data is not.
+        std::fs::write(store.path(&checksum).expect("path"), "compl").expect("write torn file");
+
+        store.fetch_named("t").await.expect("repair torn file");
+
+        assert_eq!(
+            std::fs::read(store.path(&checksum).unwrap()).expect("stored file"),
             content.as_bytes()
         );
         assert_eq!(db.images_snapshot()[0].current_checksum, Some(checksum));

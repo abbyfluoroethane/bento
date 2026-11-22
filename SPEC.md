@@ -149,6 +149,8 @@ One cross-process lock covers the complete OCI pull, validation, and build pipel
 
 The `images` command shows each image name and its current checksum. The command also shows the number of instances that hold an older version.
 
+**Durability.** Sync a stored image file to disk before it gets its final name. When a file for a known checksum has a size that is different from the download, replace it. After the version row is written, keep the file, also when a later step fails.
+
 ### 5.2 First boot
 
 Create the root volume as a copy-on-write overlay:
@@ -185,6 +187,10 @@ Before Linux 6.17, the module drops its own scheme when it starts, so it reclaim
 A bootc OCI image must contain a kernel, `cloud-init` with the NoCloud data source, and `qemu-guest-agent`. Bento checks the required files before the privileged build. This is a useful preflight, not proof that the resulting guest boots. Bento uses the same cloud-init seed and instance lifecycle after conversion; there is no separate boot path. The source kind is stored on each immutable image version, and instance creation and copy use the kind of the exact backing checksum rather than the mutable allowlist row.
 
 Detach and delete the ISO after the first successful boot. The ISO holds the public keys of the owner. The ISO does not need to stay attached.
+
+**Seed build.** Build the seed ISO under a temporary name and rename it when the build ends. A file at the final path is always complete.
+
+**Settle time.** Detach and delete the seed ISO only after the instance was `running` on each poll for two minutes with no break. A stop, or a poll that does not list the domain, starts the time again. The time is kept in memory. After a restart of `bentod` it starts again, which only delays the cleanup.
 
 ### 5.3 Memory
 

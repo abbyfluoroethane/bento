@@ -189,11 +189,33 @@ impl Builder {
         write_seed_file(&directory, "user-data", &user)?;
         write_seed_file(&directory, "network-config", &network)?;
 
+        // Build beside the final name and rename when xorriso is done. The
+        // lifecycle treats "the ISO exists" as "the seed is complete"
+        // (SPEC 5.2), so a failed or cancelled build must never leave a
+        // partial file at the final path.
+        let iso_path = iso_path.as_ref();
+        let mut partial_name = iso_path
+            .file_name()
+            .ok_or_else(|| Error::invalid("seed ISO path has no file name"))?
+            .to_owned();
+        partial_name.push(".partial");
+        let partial_path = iso_path.with_file_name(partial_name);
+        // A stale partial file can remain after a crash.
+        match std::fs::remove_file(&partial_path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(Error::Delete(error)),
+        }
+        let mut partial = PartialFile {
+            path: partial_path,
+            keep: false,
+        };
+
         let args = vec![
             OsString::from("-as"),
             OsString::from("mkisofs"),
             OsString::from("-output"),
-            iso_path.as_ref().as_os_str().to_owned(),
+            partial.path.as_os_str().to_owned(),
             OsString::from("-volid"),
             OsString::from("cidata"),
             OsString::from("-joliet"),
@@ -207,7 +229,26 @@ impl Builder {
                 let output = String::from_utf8_lossy(source.output()).into_owned();
                 Error::Xorriso { source, output }
             })?;
+        std::fs::rename(&partial.path, iso_path).map_err(|source| Error::Write {
+            name: "seed ISO",
+            source,
+        })?;
+        partial.keep = true;
         Ok(())
+    }
+}
+
+/// Removes the half-built ISO when `build` fails or its future is dropped.
+struct PartialFile {
+    path: PathBuf,
+    keep: bool,
+}
+
+impl Drop for PartialFile {
+    fn drop(&mut self) {
+        if !self.keep {
+            let _ = std::fs::remove_file(&self.path);
+        }
     }
 }
 
@@ -252,26 +293,37 @@ mod tests {
     struct FakeRunner {
         state: Arc<Mutex<FakeState>>,
         fail: bool,
+        hang: bool,
     }
 
     #[async_trait]
     impl Runner for FakeRunner {
         async fn run(&self, name: &OsStr, args: &[OsString]) -> Result<Vec<u8>, CommandError> {
-            let mut state = self.state.lock().unwrap();
-            let mut call = vec![name.to_owned()];
-            call.extend_from_slice(args);
-            state.calls.push(call);
-            if let Some(directory) = args.last() {
-                state.staged.clear();
-                if let Ok(entries) = std::fs::read_dir(directory) {
-                    for entry in entries.flatten() {
-                        if let Ok(contents) = std::fs::read_to_string(entry.path()) {
-                            state
-                                .staged
-                                .insert(entry.file_name().to_string_lossy().into_owned(), contents);
+            {
+                let mut state = self.state.lock().unwrap();
+                let mut call = vec![name.to_owned()];
+                call.extend_from_slice(args);
+                state.calls.push(call);
+                if let Some(directory) = args.last() {
+                    state.staged.clear();
+                    if let Ok(entries) = std::fs::read_dir(directory) {
+                        for entry in entries.flatten() {
+                            if let Ok(contents) = std::fs::read_to_string(entry.path()) {
+                                state.staged.insert(
+                                    entry.file_name().to_string_lossy().into_owned(),
+                                    contents,
+                                );
+                            }
                         }
                     }
                 }
+            }
+            // Like xorriso, write the output file before the command ends.
+            if let Some(position) = args.iter().position(|arg| arg == "-output") {
+                std::fs::write(&args[position + 1], b"iso").unwrap();
+            }
+            if self.hang {
+                std::future::pending::<()>().await;
             }
             if self.fail {
                 return Err(CommandError::new(FakeFailure, b"xorriso says no".to_vec()));
@@ -309,7 +361,7 @@ mod tests {
             .join(" ");
         for expected in [
             "-as mkisofs".to_string(),
-            format!("-output {}", iso_path.display()),
+            format!("-output {}.partial", iso_path.display()),
             "-volid cidata".to_string(),
         ] {
             assert!(
@@ -323,6 +375,9 @@ mod tests {
                 Some(&golden(&format!("{name}.golden")))
             );
         }
+
+        assert_eq!(std::fs::read(&iso_path).unwrap(), b"iso");
+        assert!(!temp.path().join("seed.iso.partial").exists());
 
         let staging_directory = Path::new(state.calls[0].last().unwrap());
         assert!(
@@ -362,6 +417,44 @@ mod tests {
             .expect_err("build succeeded");
         assert!(error.to_string().contains("xorriso says no"));
         assert_eq!(state.lock().unwrap().calls[0][0], "/opt/xorriso");
+        // The fake wrote output before it failed; none may remain.
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_build_leaves_no_file() {
+        let runner = FakeRunner {
+            hang: true,
+            ..FakeRunner::default()
+        };
+        let builder = Builder::new().with_runner(runner);
+        let temp = tempfile::tempdir().unwrap();
+        let iso_path = temp.path().join("seed.iso");
+
+        tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            builder.build(&test_seed(), &iso_path),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_rebuild_keeps_the_previous_iso() {
+        let runner = FakeRunner {
+            fail: true,
+            ..FakeRunner::default()
+        };
+        let builder = Builder::new().with_runner(runner);
+        let temp = tempfile::tempdir().unwrap();
+        let iso_path = temp.path().join("seed.iso");
+        std::fs::write(&iso_path, b"old").unwrap();
+
+        builder.build(&test_seed(), &iso_path).await.unwrap_err();
+
+        assert_eq!(std::fs::read(&iso_path).unwrap(), b"old");
     }
 
     #[test]

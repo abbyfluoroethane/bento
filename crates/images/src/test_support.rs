@@ -30,6 +30,8 @@ struct FakeDbState {
     inserted: Vec<ImageVersion>,
     deleted: Vec<String>,
     source_versions: HashMap<(String, String), String>,
+    fail_set_current: bool,
+    fail_record_source: bool,
 }
 
 impl FakeDb {
@@ -67,6 +69,17 @@ impl FakeDb {
 
     pub(crate) fn deleted(&self) -> Vec<String> {
         self.0.lock().expect("db").deleted.clone()
+    }
+
+    /// Makes `set_current_checksum` fail, as a database error after the
+    /// version row was already written.
+    pub(crate) fn fail_set_current(&self) {
+        self.0.lock().expect("db").fail_set_current = true;
+    }
+
+    /// Makes `record_image_source` fail.
+    pub(crate) fn fail_record_source(&self) {
+        self.0.lock().expect("db").fail_record_source = true;
     }
 
     pub(crate) fn has_version(&self, checksum: &str) -> bool {
@@ -142,6 +155,9 @@ impl DB for FakeDb {
         checksum: &str,
     ) -> std::result::Result<(), DynError> {
         let mut state = self.0.lock().expect("db");
+        if state.fail_set_current {
+            return Err(io::Error::other("injected set_current_checksum failure").into());
+        }
         let image = state
             .images
             .iter_mut()
@@ -181,7 +197,11 @@ impl DB for FakeDb {
         source_digest: &str,
         checksum: &str,
     ) -> std::result::Result<(), DynError> {
-        self.0.lock().expect("db").source_versions.insert(
+        let mut state = self.0.lock().expect("db");
+        if state.fail_record_source {
+            return Err(io::Error::other("injected record_image_source failure").into());
+        }
+        state.source_versions.insert(
             (image_name.to_owned(), source_digest.to_owned()),
             checksum.to_owned(),
         );
