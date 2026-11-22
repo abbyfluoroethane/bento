@@ -496,8 +496,18 @@ impl Proxy {
             guard,
             |request| {
                 *request.uri_mut() = uri;
-                // Forwarding headers are trust-boundary data. Discard anything the
-                // client supplied before writing the values observed by this proxy.
+                // Forwarding headers are trust-boundary data. Only the TLS
+                // terminator on this machine, which reaches the proxy from
+                // loopback, may say what the client used (SPEC 8, 9). From
+                // any other peer they are client data and are replaced.
+                let trusted = forwarded_by_terminator(remote_addr.ip());
+                let proto = trusted
+                    .then(|| forwarded_proto(request.headers()))
+                    .flatten()
+                    .unwrap_or(if tls { "https" } else { "http" });
+                let chain = trusted
+                    .then(|| forwarded_for_chain(request.headers()))
+                    .flatten();
                 for name in [
                     HeaderName::from_static("forwarded"),
                     HeaderName::from_static("x-forwarded-for"),
@@ -514,9 +524,9 @@ impl Proxy {
                 }
                 request.headers_mut().insert(
                     HeaderName::from_static("x-forwarded-proto"),
-                    HeaderValue::from_static(if tls { "https" } else { "http" }),
+                    HeaderValue::from_static(proto),
                 );
-                set_forwarded_for(request.headers_mut(), remote_addr.ip());
+                set_forwarded_for(request.headers_mut(), chain, remote_addr.ip());
                 // Only the forwarded copy loses the credentials. The session
                 // check and the tunnel revalidation hold the originals.
                 strip_bento_credentials(request.headers_mut());
@@ -902,9 +912,59 @@ fn format_authority(address: &str, port: u16) -> String {
     }
 }
 
-fn set_forwarded_for(headers: &mut http::HeaderMap, remote: IpAddr) {
+/// Whether `peer` is the TLS terminator in front of the proxy. The
+/// terminator runs on this machine and forwards to a loopback listener
+/// (SPEC 8), so only a loopback peer may supply forwarding headers.
+fn forwarded_by_terminator(peer: IpAddr) -> bool {
+    match peer {
+        IpAddr::V4(v4) => v4.is_loopback(),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or(v6.is_loopback(), |v4| v4.is_loopback()),
+    }
+}
+
+/// The scheme the client used, as the terminator reports it. The first
+/// entry is the hop nearest the client. Any value other than `http` or
+/// `https` counts as no report.
+fn forwarded_proto(headers: &http::HeaderMap) -> Option<&'static str> {
+    let first = headers
+        .get("x-forwarded-proto")?
+        .to_str()
+        .ok()?
+        .split(',')
+        .next()?
+        .trim();
+    if first.eq_ignore_ascii_case("https") {
+        Some("https")
+    } else if first.eq_ignore_ascii_case("http") {
+        Some("http")
+    } else {
+        None
+    }
+}
+
+/// The `X-Forwarded-For` chain that the terminator sent, as one list.
+fn forwarded_for_chain(headers: &http::HeaderMap) -> Option<String> {
+    let entries: Vec<&str> = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    (!entries.is_empty()).then(|| entries.join(", "))
+}
+
+/// Writes `X-Forwarded-For`: the trusted `chain` with the peer appended,
+/// or the peer alone.
+fn set_forwarded_for(headers: &mut http::HeaderMap, chain: Option<String>, remote: IpAddr) {
     let name = HeaderName::from_static("x-forwarded-for");
-    let value = remote.to_string();
+    let value = match chain {
+        Some(chain) => format!("{chain}, {remote}"),
+        None => remote.to_string(),
+    };
     if let Ok(value) = HeaderValue::from_str(&value) {
         headers.insert(name, value);
     }

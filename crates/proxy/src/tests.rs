@@ -552,6 +552,91 @@ async fn forwarded_headers_are_set() {
     assert_eq!(headers[header::HOST], format!("box.{TEST_BASE}"));
 }
 
+/// What the guest receives for these request headers from `remote`.
+async fn forwarded_from(remote: SocketAddr, headers: &[(&str, &str)]) -> http::HeaderMap {
+    let (transport, seen) = ok_transport();
+    let proxy = builder(FakeSource::with(running_instance(
+        "box",
+        Visibility::Public,
+    )))
+    .with_transport(transport)
+    .build()
+    .unwrap();
+    let mut request = Request::builder()
+        .method(Method::GET)
+        .uri(format!("http://box.{TEST_BASE}/"))
+        .header(header::HOST, format!("box.{TEST_BASE}"))
+        .body(full_body(Bytes::new()))
+        .unwrap();
+    for (name, value) in headers {
+        request.headers_mut().append(
+            HeaderName::from_bytes(name.as_bytes()).unwrap(),
+            HeaderValue::from_str(value).unwrap(),
+        );
+    }
+    proxy.handle(request, DEFAULT_PORT, remote).await;
+    let seen = seen.lock().unwrap();
+    seen[0].headers.clone()
+}
+
+/// The TLS terminator on this machine reaches the proxy from loopback. Its
+/// report of the client reaches the guest, so an app that requires HTTPS
+/// sees HTTPS and the client address (SPEC 8, 9).
+#[tokio::test]
+async fn the_terminator_reports_the_client_scheme_and_address() {
+    for peer in ["127.0.0.1:40000", "[::1]:40000", "[::ffff:127.0.0.1]:40000"] {
+        let headers = forwarded_from(
+            peer.parse().unwrap(),
+            &[
+                ("x-forwarded-proto", "https"),
+                ("x-forwarded-for", "203.0.113.9"),
+            ],
+        )
+        .await;
+        let ip = peer.parse::<SocketAddr>().unwrap().ip();
+        assert_eq!(headers["x-forwarded-proto"], "https", "{peer}");
+        assert_eq!(headers["x-forwarded-for"], format!("203.0.113.9, {ip}"));
+    }
+    // Several headers join into one chain, and a value that is not a
+    // scheme falls back to what the proxy saw.
+    let headers = forwarded_from(
+        "127.0.0.1:40000".parse().unwrap(),
+        &[
+            ("x-forwarded-proto", "gopher"),
+            ("x-forwarded-for", "198.51.100.1, 203.0.113.9"),
+            ("x-forwarded-for", "192.0.2.4"),
+        ],
+    )
+    .await;
+    assert_eq!(headers["x-forwarded-proto"], "http");
+    assert_eq!(
+        headers["x-forwarded-for"],
+        "198.51.100.1, 203.0.113.9, 192.0.2.4, 127.0.0.1"
+    );
+    // No report: the proxy says what it saw.
+    let headers = forwarded_from("127.0.0.1:40000".parse().unwrap(), &[]).await;
+    assert_eq!(headers["x-forwarded-proto"], "http");
+    assert_eq!(headers["x-forwarded-for"], "127.0.0.1");
+}
+
+/// Any other peer can write any header, so its forwarding headers are
+/// replaced and never reach the guest.
+#[tokio::test]
+async fn forwarding_headers_from_another_peer_are_replaced() {
+    let headers = forwarded_from(
+        "192.0.2.7:55555".parse().unwrap(),
+        &[
+            ("x-forwarded-proto", "https"),
+            ("x-forwarded-for", "203.0.113.99"),
+            ("forwarded", "for=203.0.113.99;proto=https"),
+        ],
+    )
+    .await;
+    assert_eq!(headers["x-forwarded-proto"], "http");
+    assert_eq!(headers["x-forwarded-for"], "192.0.2.7");
+    assert!(!headers.contains_key("forwarded"));
+}
+
 /// What the guest receives for these request headers.
 async fn forwarded_with(headers: &[(&str, &str)]) -> http::HeaderMap {
     let (transport, seen) = ok_transport();

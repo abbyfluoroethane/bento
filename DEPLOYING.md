@@ -328,7 +328,11 @@ https = "127.0.0.1:10443"   # private: these listeners have no TLS
 ```
 
 The proxy routes on the `Host` header, which is what a forwarded request
-carries. The proxy logs a warning at startup when `listen.https` is not
+carries. From a loopback peer it keeps the terminator's
+`X-Forwarded-Proto` and adds to its `X-Forwarded-For`, so a guest sees
+`https` and the client address. From any other peer it replaces both
+(SPEC 9). A terminator on another machine therefore cannot report the
+client, and guests see `http`. The proxy logs a warning at startup when `listen.https` is not
 a loopback address, because the internet must not reach plain HTTP
 listeners directly.
 

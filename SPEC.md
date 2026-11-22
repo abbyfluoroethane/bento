@@ -404,6 +404,8 @@ Set these headers on each forwarded request:
 - `X-Forwarded-Host`
 - `X-Forwarded-For`
 
+**Trusted hop.** The TLS terminator runs on the same machine and connects from a loopback address (section 8). From a loopback peer, the HTTP proxy keeps the `X-Forwarded-Proto` value of the terminator when it is `http` or `https`, and adds the peer address to the end of its `X-Forwarded-For` list. From any other peer, the HTTP proxy removes the `Forwarded`, `X-Forwarded-For`, `X-Forwarded-Proto`, and `X-Forwarded-Host` headers of the request and writes its own values: the scheme of its listener and the peer address. A client can write any header, so only the terminator can report the client.
+
 **Credentials.** The proxy does not forward Bento credentials to a guest. It removes each cookie whose name starts with `bento_` (the session cookie and the OIDC flow cookies) and an `Authorization: Bearer bento_...` token. The cookies and the `Authorization` values of the guest application pass.
 
 ### 9.1 Port selection
