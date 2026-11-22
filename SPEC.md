@@ -75,6 +75,8 @@ Check the current state of both Go libraries before you commit. The official bin
 
 Bento generates domain XML from a Go template. Keep one template. Do not build a general XML object model. Bento uses a small and fixed subset of the schema.
 
+**Deadline.** Each libvirt call has a deadline of 120 seconds. When a call exceeds the deadline, or its caller goes away before the reply is read, the client closes the socket. The next call opens a new socket with the full handshake. The client does not read a reply on a socket that has an unanswered request.
+
 ### 4.2 Host requirements
 
 1. Check for `/dev/kvm` at startup. Refuse to start without it.

@@ -6,7 +6,9 @@ use async_trait::async_trait;
 use bento_types::State;
 
 use crate::DEFAULT_SOCKET_PATH;
-use crate::error::{ApiError, ERR_NO_DOMAIN, ERR_NO_NETWORK, Error, operation_error};
+use crate::error::{
+    ApiError, ERR_NO_DOMAIN, ERR_NO_NETWORK, ERR_OPERATION_INVALID, Error, operation_error,
+};
 use crate::rpc::RpcApi;
 
 const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(60);
@@ -271,6 +273,22 @@ impl Client {
         }
     }
 
+    /// Destroys a domain. A domain that stopped on its own since the last
+    /// state read answers `VIR_ERR_OPERATION_INVALID`; the goal state
+    /// holds then, so that answer is success.
+    async fn destroy(&self, domain: &Domain, operation: String) -> Result<(), Error> {
+        match self.api.domain_destroy(domain).await {
+            Ok(()) => Ok(()),
+            Err(ApiError::Libvirt(error))
+                if error.code == ERR_OPERATION_INVALID
+                    && self.domain_state(domain).await? == State::Stopped =>
+            {
+                Ok(())
+            }
+            Err(error) => Err(operation_error(operation, error)),
+        }
+    }
+
     async fn domain_state(&self, domain: &Domain) -> Result<State, Error> {
         let (state, _) = self
             .api
@@ -305,14 +323,38 @@ impl Hypervisor for Client {
             ));
         }
         if let Err(error) = self.api.domain_create(&domain).await {
-            let _ = self
+            // A lost reply (an I/O error) does not mean the start failed:
+            // libvirt can already have spawned QEMU. Undefining an active
+            // domain only makes it transient and leaves it running, and the
+            // caller then deletes its disks. Stop it first (SPEC 11.1).
+            let mut cleanup = Vec::new();
+            if matches!(error, ApiError::Io(_)) {
+                match self.domain_state(&domain).await {
+                    Ok(State::Stopped) => {}
+                    Ok(_) => {
+                        if let Err(error) = self.api.domain_destroy(&domain).await {
+                            cleanup.push(format!("destroy: {error}"));
+                        }
+                    }
+                    Err(error) => cleanup.push(format!("read state: {error}")),
+                }
+            }
+            if let Err(error) = self
                 .api
                 .domain_undefine_flags(&domain, DOMAIN_UNDEFINE_NVRAM)
-                .await;
-            return Err(operation_error(
-                format!("start domain {}", domain.name),
-                error,
-            ));
+                .await
+            {
+                cleanup.push(format!("undefine: {error}"));
+            }
+            let start_error = operation_error(format!("start domain {}", domain.name), error);
+            if cleanup.is_empty() {
+                return Err(start_error);
+            }
+            // The caller must know the domain can still exist.
+            return Err(Error::Operation(format!(
+                "{start_error}; cleanup failed ({})",
+                cleanup.join("; ")
+            )));
         }
         Ok(())
     }
@@ -330,10 +372,20 @@ impl Hypervisor for Client {
         if self.domain_state(&domain).await? == State::Stopped {
             return Ok(StopResult::AlreadyStopped);
         }
-        self.api
-            .domain_shutdown(&domain)
-            .await
-            .map_err(|error| operation_error(format!("shutdown domain {name}"), error))?;
+        match self.api.domain_shutdown(&domain).await {
+            Ok(()) => {}
+            // The guest powered off between the state read and the call.
+            // The goal state holds, so this is not a failure.
+            Err(ApiError::Libvirt(error))
+                if error.code == ERR_OPERATION_INVALID
+                    && self.domain_state(&domain).await? == State::Stopped =>
+            {
+                return Ok(StopResult::AlreadyStopped);
+            }
+            Err(error) => {
+                return Err(operation_error(format!("shutdown domain {name}"), error));
+            }
+        }
 
         let mut elapsed = Duration::ZERO;
         loop {
@@ -346,12 +398,11 @@ impl Hypervisor for Client {
             self.sleeper.sleep(self.poll_interval).await;
             elapsed += self.poll_interval;
         }
-        self.api.domain_destroy(&domain).await.map_err(|error| {
-            operation_error(
-                format!("destroy domain {name} after shutdown timeout"),
-                error,
-            )
-        })?;
+        self.destroy(
+            &domain,
+            format!("destroy domain {name} after shutdown timeout"),
+        )
+        .await?;
         Ok(StopResult::Forced)
     }
 
@@ -366,10 +417,8 @@ impl Hypervisor for Client {
     async fn remove(&self, name: &str) -> Result<(), Error> {
         let domain = self.lookup(name).await?;
         if self.domain_state(&domain).await? != State::Stopped {
-            self.api
-                .domain_destroy(&domain)
-                .await
-                .map_err(|error| operation_error(format!("destroy domain {name}"), error))?;
+            self.destroy(&domain, format!("destroy domain {name}"))
+                .await?;
         }
         self.api
             .domain_undefine_flags(&domain, DOMAIN_UNDEFINE_NVRAM)
@@ -385,10 +434,17 @@ impl Hypervisor for Client {
             .map_err(|error| operation_error("list domains", error))?;
         let mut infos = Vec::with_capacity(domains.len());
         for domain in domains {
+            let state = match self.domain_state(&domain).await {
+                Ok(state) => state,
+                // The domain was removed after the list call. One vanished
+                // entry must not fail the whole poll (SPEC 12).
+                Err(error) if error.is_libvirt_code(ERR_NO_DOMAIN) => continue,
+                Err(error) => return Err(error),
+            };
             infos.push(DomainInfo {
                 name: domain.name.clone(),
                 uuid: format_uuid(domain.uuid),
-                state: self.domain_state(&domain).await?,
+                state,
             });
         }
         Ok(infos)
@@ -502,7 +558,11 @@ fn state_from_libvirt(state: i32) -> State {
         // live QEMU process. Only its absence counts as stopped (SPEC 11.1).
         1 | 2 | 3 | 4 | 7 => State::Running,
         // nostate, shutoff, and crashed.
-        _ => State::Stopped,
+        0 | 5 | 6 => State::Stopped,
+        // A number this build does not know is a newer libvirt state.
+        // Assume a live process: `remove` and `stop` then still destroy
+        // the domain, where a wrong Stopped would undefine a running one.
+        _ => State::Running,
     }
 }
 
@@ -525,7 +585,7 @@ fn format_uuid(uuid: [u8; 16]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::future::pending;
     use std::sync::{Mutex, MutexGuard};
 
@@ -554,6 +614,8 @@ mod tests {
     enum InjectedError {
         Message(String),
         Libvirt(LibvirtError),
+        /// The reply was lost; the daemon may have done the work.
+        Io,
     }
 
     impl InjectedError {
@@ -561,6 +623,10 @@ mod tests {
             match self {
                 Self::Message(message) => ApiError::Protocol(message.clone()),
                 Self::Libvirt(error) => ApiError::Libvirt(error.clone()),
+                Self::Io => ApiError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "reply lost",
+                )),
             }
         }
     }
@@ -574,6 +640,11 @@ mod tests {
         polls_since_shutdown: i32,
         shutting_down: String,
         undefine_flags: Vec<u32>,
+        /// Operations that apply their effect and then return the
+        /// injected error, as a call whose reply was lost.
+        fail_after_effect: HashSet<String>,
+        /// Domains that disappear before their state is read.
+        vanished: HashSet<String>,
         networks: HashMap<String, ApiNetwork>,
         net_calls: Vec<String>,
         net_err_on: HashMap<String, InjectedError>,
@@ -594,6 +665,8 @@ mod tests {
                 polls_since_shutdown: 0,
                 shutting_down: String::new(),
                 undefine_flags: Vec::new(),
+                fail_after_effect: HashSet::new(),
+                vanished: HashSet::new(),
                 networks: HashMap::new(),
                 net_calls: Vec::new(),
                 net_err_on: HashMap::new(),
@@ -653,6 +726,23 @@ mod tests {
             Ok(())
         }
 
+        /// Like `call`, but an operation in `fail_after_effect` returns its
+        /// error only after the caller has applied its effect.
+        fn call_with_effect(
+            inner: &mut FakeApiInner,
+            operation: &str,
+            name: &str,
+            state: i32,
+        ) -> Result<(), ApiError> {
+            let result = Self::call(inner, operation);
+            if (result.is_ok() || inner.fail_after_effect.contains(operation))
+                && let Some(entry) = inner.domains.get_mut(name)
+            {
+                entry.state = state;
+            }
+            result
+        }
+
         fn net_call(inner: &mut FakeApiInner, operation: &str) -> Result<(), ApiError> {
             inner.net_calls.push(operation.to_string());
             if let Some(error) = inner.net_err_on.get(operation) {
@@ -686,18 +776,21 @@ mod tests {
 
         async fn domain_create(&self, domain: &Domain) -> Result<(), ApiError> {
             let mut inner = self.lock();
-            Self::call(&mut inner, "create")?;
-            inner
-                .domains
-                .get_mut(&domain.name)
-                .ok_or_else(|| ApiError::Protocol(format!("no such domain {:?}", domain.name)))?
-                .state = DOMAIN_RUNNING;
-            Ok(())
+            Self::call_with_effect(&mut inner, "create", &domain.name, DOMAIN_RUNNING)
         }
 
         async fn domain_shutdown(&self, domain: &Domain) -> Result<(), ApiError> {
             let mut inner = self.lock();
-            Self::call(&mut inner, "shutdown")?;
+            // A guest that powers off during the call fails it with
+            // "not running"; on success the state changes later, by polls.
+            let result = Self::call(&mut inner, "shutdown");
+            if result.is_err()
+                && inner.fail_after_effect.contains("shutdown")
+                && let Some(entry) = inner.domains.get_mut(&domain.name)
+            {
+                entry.state = DOMAIN_SHUTOFF;
+            }
+            result?;
             if !inner.domains.contains_key(&domain.name) {
                 return Err(ApiError::Protocol(format!(
                     "no such domain {:?}",
@@ -724,13 +817,7 @@ mod tests {
 
         async fn domain_destroy(&self, domain: &Domain) -> Result<(), ApiError> {
             let mut inner = self.lock();
-            Self::call(&mut inner, "destroy")?;
-            inner
-                .domains
-                .get_mut(&domain.name)
-                .ok_or_else(|| ApiError::Protocol(format!("no such domain {:?}", domain.name)))?
-                .state = DOMAIN_SHUTOFF;
-            Ok(())
+            Self::call_with_effect(&mut inner, "destroy", &domain.name, DOMAIN_SHUTOFF)
         }
 
         async fn domain_undefine_flags(&self, domain: &Domain, flags: u32) -> Result<(), ApiError> {
@@ -742,6 +829,10 @@ mod tests {
                     "cannot undefine domain {}: it owns an NVRAM file",
                     domain.name
                 )));
+            }
+            // Real libvirt keeps an active domain as a transient one.
+            if inner.domains.get(&domain.name).map(|entry| entry.state) == Some(DOMAIN_RUNNING) {
+                return Ok(());
             }
             inner
                 .domains
@@ -778,6 +869,12 @@ mod tests {
         ) -> Result<(i32, i32), ApiError> {
             let mut inner = self.lock();
             Self::call(&mut inner, "state")?;
+            if inner.vanished.contains(&domain.name) {
+                return Err(ApiError::Libvirt(LibvirtError {
+                    code: ERR_NO_DOMAIN,
+                    message: "no domain".to_string(),
+                }));
+            }
             if inner.shutting_down == domain.name && inner.shutdown_after_polls >= 0 {
                 inner.polls_since_shutdown += 1;
                 if inner.polls_since_shutdown > inner.shutdown_after_polls {
@@ -1131,6 +1228,11 @@ mod tests {
         for state in [0, 5, 6] {
             assert_eq!(state_from_libvirt(state), State::Stopped);
         }
+        // An unknown number must not read as stopped: `remove` would skip
+        // the destroy and undefine a live domain.
+        for state in [-1, 8, 99] {
+            assert_eq!(state_from_libvirt(state), State::Running);
+        }
     }
 
     #[test]
@@ -1239,5 +1341,116 @@ mod tests {
             client.state("ghost").await,
             Err(Error::DomainNotFound(_))
         ));
+    }
+
+    fn invalid(message: &str) -> InjectedError {
+        InjectedError::Libvirt(LibvirtError {
+            code: ERR_OPERATION_INVALID,
+            message: message.to_string(),
+        })
+    }
+
+    #[tokio::test]
+    async fn a_start_with_a_lost_reply_leaves_no_running_domain() {
+        let api = Arc::new(FakeApi::default());
+        {
+            let mut inner = api.lock();
+            inner.err_on.insert("create".to_string(), InjectedError::Io);
+            inner.fail_after_effect.insert("create".to_string());
+        }
+        let (client, _) = test_client(api.clone());
+        assert!(client.create("<domain/>").await.is_err());
+        let inner = api.lock();
+        assert!(
+            inner
+                .domains
+                .values()
+                .all(|entry| entry.state != DOMAIN_RUNNING),
+            "a domain is still running: {:?}",
+            inner.domains
+        );
+        assert!(inner.domains.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_start_that_failed_cleanly_is_not_destroyed() {
+        let api = Arc::new(FakeApi::default());
+        api.fail("create", "no memory");
+        let (client, _) = test_client(api.clone());
+        assert!(client.create("<domain/>").await.is_err());
+        assert!(!api.lock().calls.iter().any(|call| call == "destroy"));
+    }
+
+    #[tokio::test]
+    async fn a_failed_cleanup_after_a_lost_reply_is_reported() {
+        let api = Arc::new(FakeApi::default());
+        {
+            let mut inner = api.lock();
+            inner.err_on.insert("create".to_string(), InjectedError::Io);
+            inner.fail_after_effect.insert("create".to_string());
+        }
+        api.lock()
+            .err_on
+            .insert("destroy".to_string(), InjectedError::Io);
+        let (client, _) = test_client(api.clone());
+        let error = client.create("<domain/>").await.unwrap_err();
+        assert!(error.to_string().contains("cleanup failed"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn stop_treats_a_guest_that_powered_off_meanwhile_as_stopped() {
+        let api = Arc::new(FakeApi::default());
+        api.add("web", DOMAIN_RUNNING);
+        {
+            let mut inner = api.lock();
+            inner
+                .err_on
+                .insert("shutdown".to_string(), invalid("domain is not running"));
+            inner.fail_after_effect.insert("shutdown".to_string());
+        }
+        let (client, _) = test_client(api);
+        assert_eq!(
+            client.stop("web").await.unwrap(),
+            StopResult::AlreadyStopped
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_still_fails_on_an_invalid_operation_while_the_domain_runs() {
+        let api = Arc::new(FakeApi::default());
+        api.add("web", DOMAIN_RUNNING);
+        api.lock()
+            .err_on
+            .insert("shutdown".to_string(), invalid("busy"));
+        let (client, _) = test_client(api);
+        assert!(client.stop("web").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn remove_treats_a_guest_that_powered_off_meanwhile_as_stopped() {
+        let api = Arc::new(FakeApi::default());
+        api.add("web", DOMAIN_RUNNING);
+        {
+            let mut inner = api.lock();
+            inner
+                .err_on
+                .insert("destroy".to_string(), invalid("domain is not running"));
+            inner.fail_after_effect.insert("destroy".to_string());
+        }
+        let (client, _) = test_client(api.clone());
+        client.remove("web").await.unwrap();
+        assert!(api.lock().domains.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_skips_a_domain_that_vanished_after_the_list_call() {
+        let api = Arc::new(FakeApi::default());
+        api.add("kept", DOMAIN_RUNNING);
+        api.add("gone", DOMAIN_RUNNING);
+        api.lock().vanished.insert("gone".to_string());
+        let (client, _) = test_client(api);
+        let domains = client.list().await.unwrap();
+        assert_eq!(domains.len(), 1);
+        assert_eq!(domains[0].name, "kept");
     }
 }

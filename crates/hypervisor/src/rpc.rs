@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -44,6 +45,16 @@ const PROC_NETWORK_IS_ACTIVE: u32 = 152;
 const PROC_DOMAIN_GET_STATE: u32 = 212;
 const PROC_DOMAIN_UNDEFINE_FLAGS: u32 = 231;
 const PROC_CONNECT_LIST_ALL_DOMAINS: u32 = 273;
+
+/// The longest one libvirt exchange, or one handshake, may take.
+///
+/// The slowest calls are a domain start (QEMU must spawn) and a destroy
+/// (libvirt waits for QEMU to exit before it answers). Both finish in
+/// seconds on a healthy host; a busy one can take tens of seconds. Two
+/// minutes is far above that, so only a hung daemon reaches it. Without
+/// a limit a hung daemon blocks every caller, because all calls share
+/// one socket (SPEC 4.1).
+const CALL_DEADLINE: Duration = Duration::from_secs(120);
 
 const AUTH_NONE: i32 = 0;
 const AUTH_POLKIT: i32 = 2;
@@ -176,6 +187,12 @@ fn process_reply(packet: Packet, serial: i32, procedure: u32) -> Result<Vec<u8>,
 struct Transport {
     stream: Mutex<UnixStream>,
     serial: AtomicI32,
+    /// True from the moment a request starts to be written until its
+    /// reply is read in full. A caller can drop the future in between
+    /// (a timeout, a client that left), and `read_exact` is not cancel
+    /// safe, so the next reply on the socket could be stale or half
+    /// read. A poisoned transport is never used again.
+    poisoned: AtomicBool,
 }
 
 impl Transport {
@@ -183,6 +200,7 @@ impl Transport {
         Ok(Self {
             stream: Mutex::new(UnixStream::connect(path).await?),
             serial: AtomicI32::new(0),
+            poisoned: AtomicBool::new(false),
         })
     }
 
@@ -198,6 +216,13 @@ impl Transport {
         };
         let bytes = encode_packet(&header, &payload)?;
         let mut stream = self.stream.lock().await;
+        if self.poisoned.load(Ordering::SeqCst) {
+            return Err(ApiError::Io(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "libvirt connection is out of step after an interrupted call",
+            )));
+        }
+        self.poisoned.store(true, Ordering::SeqCst);
         stream.write_all(&bytes).await?;
         stream.flush().await?;
         loop {
@@ -208,7 +233,14 @@ impl Transport {
             if packet.header.packet_type == PACKET_MESSAGE {
                 continue;
             }
-            return process_reply(packet, serial, procedure);
+            let result = process_reply(packet, serial, procedure);
+            // A full, valid reply leaves the socket in step. That holds
+            // for a libvirt error reply too. Any framing or header
+            // fault keeps the transport poisoned.
+            if matches!(result, Ok(_) | Err(ApiError::Libvirt(_))) {
+                self.poisoned.store(false, Ordering::SeqCst);
+            }
+            return result;
         }
     }
 }
@@ -231,15 +263,25 @@ pub(crate) struct RpcApi {
     flags: u32,
     /// `None` after an I/O error, until the next call opens a new socket.
     current: Mutex<Option<Arc<Transport>>>,
+    deadline: Duration,
 }
 
 impl RpcApi {
     pub(crate) async fn connect(path: &Path, flags: u32) -> Result<Self, ApiError> {
-        let transport = open(path, flags).await?;
+        Self::connect_with_deadline(path, flags, CALL_DEADLINE).await
+    }
+
+    async fn connect_with_deadline(
+        path: &Path,
+        flags: u32,
+        deadline: Duration,
+    ) -> Result<Self, ApiError> {
+        let transport = within(deadline, open(path, flags)).await?;
         Ok(Self {
             path: path.to_path_buf(),
             flags,
             current: Mutex::new(Some(Arc::new(transport))),
+            deadline,
         })
     }
 
@@ -247,19 +289,23 @@ impl RpcApi {
         let transport = {
             let mut current = self.current.lock().await;
             match current.as_ref() {
-                Some(transport) => Arc::clone(transport),
-                None => {
-                    let transport = Arc::new(open(&self.path, self.flags).await?);
+                Some(transport) if !transport.poisoned.load(Ordering::SeqCst) => {
+                    Arc::clone(transport)
+                }
+                _ => {
+                    let transport =
+                        Arc::new(within(self.deadline, open(&self.path, self.flags)).await?);
                     *current = Some(Arc::clone(&transport));
                     transport
                 }
             }
         };
-        let result = transport.request(procedure, payload).await;
-        if let Err(ApiError::Io(_)) = &result {
-            // The socket is gone, or it stopped mid-packet and the next
-            // reply would be read out of step. Either way it is unusable.
-            // Another call may already have opened a new socket; keep it.
+        let result = within(self.deadline, transport.request(procedure, payload)).await;
+        if transport.poisoned.load(Ordering::SeqCst) || matches!(&result, Err(ApiError::Io(_))) {
+            // The socket is gone, or a call was cut short (an I/O error,
+            // a timeout, a bad frame) and the next reply would be read
+            // out of step. Either way it is unusable. Another call may
+            // already have opened a new socket; keep it.
             let mut current = self.current.lock().await;
             if current
                 .as_ref()
@@ -292,6 +338,21 @@ impl RpcApi {
         let capabilities = reader.string()?;
         reader.finish()?;
         Ok(capabilities)
+    }
+}
+
+/// Runs `future` with a time limit. The caller of a call that timed out
+/// sees an I/O error; the transport stays poisoned, so it is replaced.
+async fn within<T>(
+    deadline: Duration,
+    future: impl std::future::Future<Output = Result<T, ApiError>>,
+) -> Result<T, ApiError> {
+    match tokio::time::timeout(deadline, future).await {
+        Ok(result) => result,
+        Err(_) => Err(ApiError::Io(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "libvirt did not answer in time",
+        ))),
     }
 }
 
@@ -886,6 +947,140 @@ mod tests {
 
         // The next call opens a new socket with the full handshake.
         assert_eq!(api.capabilities().await.unwrap(), "socket 2");
+        assert_eq!(api.capabilities().await.unwrap(), "socket 2");
+        assert_eq!(sockets.load(Ordering::SeqCst), 2);
+    }
+
+    /// How a scripted socket treats its first capabilities call.
+    #[derive(Clone)]
+    enum Fault {
+        /// Wait for the notification, then answer in full.
+        Stall(Arc<tokio::sync::Notify>),
+        /// Write half of the reply, wait, then write the rest.
+        Partial(Arc<tokio::sync::Notify>),
+        /// Answer with a packet length of zero.
+        ZeroLength,
+    }
+
+    /// A fake daemon like `fake_daemon`, but socket `n` applies
+    /// `faults[n - 1]` to its first capabilities call. The handshake is
+    /// always answered, and a socket past the list answers every call.
+    fn faulty_daemon(
+        faults: Vec<Fault>,
+    ) -> (
+        tempfile::TempDir,
+        PathBuf,
+        Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("virtqemud-sock");
+        let listener = tokio::net::UnixListener::bind(&path).unwrap();
+        let sockets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = Arc::clone(&sockets);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let number = counter.fetch_add(1, Ordering::SeqCst) + 1;
+                let mut fault = faults.get(number - 1).cloned();
+                tokio::spawn(async move {
+                    loop {
+                        let Ok(call) = read_packet(&mut stream).await else {
+                            return;
+                        };
+                        let mut writer = Writer::new();
+                        let mut applied = None;
+                        match call.header.procedure {
+                            PROC_AUTH_LIST => writer.u32(0),
+                            PROC_CONNECT_GET_CAPABILITIES => {
+                                writer.string(&format!("socket {number}")).unwrap();
+                                applied = fault.take();
+                            }
+                            _ => {}
+                        }
+                        let header = Header {
+                            packet_type: PACKET_REPLY,
+                            status: STATUS_OK,
+                            ..call.header
+                        };
+                        let bytes = encode_packet(&header, &writer.into_inner()).unwrap();
+                        let result = match applied {
+                            None => stream.write_all(&bytes).await,
+                            Some(Fault::Stall(release)) => {
+                                release.notified().await;
+                                stream.write_all(&bytes).await
+                            }
+                            Some(Fault::Partial(release)) => {
+                                let half = bytes.len() / 2;
+                                let _ = stream.write_all(&bytes[..half]).await;
+                                release.notified().await;
+                                stream.write_all(&bytes[half..]).await
+                            }
+                            Some(Fault::ZeroLength) => stream.write_all(&[0, 0, 0, 0]).await,
+                        };
+                        if result.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (directory, path, sockets)
+    }
+
+    const SHORT: Duration = Duration::from_millis(100);
+
+    #[tokio::test]
+    async fn a_cancelled_call_does_not_leave_a_stale_reply_for_the_next_call() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (_directory, path, sockets) = faulty_daemon(vec![Fault::Stall(Arc::clone(&release))]);
+        let api = RpcApi::connect(&path, 0).await.unwrap();
+        // The caller gives up while the daemon stalls.
+        tokio::time::timeout(SHORT, api.capabilities())
+            .await
+            .unwrap_err();
+        // The daemon now sends the reply nobody waits for.
+        release.notify_one();
+        assert_eq!(api.capabilities().await.unwrap(), "socket 2");
+        assert_eq!(sockets.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_call_cancelled_mid_reply_does_not_desynchronise_the_next_call() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (_directory, path, sockets) = faulty_daemon(vec![Fault::Partial(Arc::clone(&release))]);
+        let api = RpcApi::connect(&path, 0).await.unwrap();
+        tokio::time::timeout(SHORT, api.capabilities())
+            .await
+            .unwrap_err();
+        release.notify_one();
+        assert_eq!(api.capabilities().await.unwrap(), "socket 2");
+        assert_eq!(sockets.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_framing_error_makes_the_next_call_reconnect() {
+        let (_directory, path, sockets) = faulty_daemon(vec![Fault::ZeroLength]);
+        let api = RpcApi::connect(&path, 0).await.unwrap();
+        let error = api.capabilities().await.unwrap_err();
+        assert!(matches!(error, ApiError::Protocol(_)), "{error:?}");
+        assert_eq!(api.capabilities().await.unwrap(), "socket 2");
+        assert_eq!(sockets.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_hung_daemon_ends_the_call_with_a_timeout_and_the_next_call_reconnects() {
+        let release = Arc::new(tokio::sync::Notify::new());
+        let (_directory, path, sockets) = faulty_daemon(vec![Fault::Stall(Arc::clone(&release))]);
+        let api = RpcApi::connect_with_deadline(&path, 0, SHORT)
+            .await
+            .unwrap();
+        let error = api.capabilities().await.unwrap_err();
+        match error {
+            ApiError::Io(error) => assert_eq!(error.kind(), std::io::ErrorKind::TimedOut),
+            other => panic!("{other:?}"),
+        }
         assert_eq!(api.capabilities().await.unwrap(), "socket 2");
         assert_eq!(sockets.load(Ordering::SeqCst), 2);
     }

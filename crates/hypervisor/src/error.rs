@@ -4,6 +4,9 @@ use std::io;
 pub const ERR_NO_DOMAIN: i32 = 42;
 /// libvirt's numeric `VIR_ERR_NO_NETWORK` value.
 pub const ERR_NO_NETWORK: i32 = 43;
+/// libvirt's numeric `VIR_ERR_OPERATION_INVALID` value. A shutdown or
+/// destroy of a domain that is already off answers with it.
+pub const ERR_OPERATION_INVALID: i32 = 55;
 
 /// An error returned in a libvirt RPC reply.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
