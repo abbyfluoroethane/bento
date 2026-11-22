@@ -6,7 +6,7 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Result;
-use bento_network::{NftApplier, PortRange};
+use bento_network::NftApplier;
 
 use crate::adapters::{Backend, CliBackend, CliRunner, Linker, RuntimeImages, Starter};
 use crate::firewall::Firewall;
@@ -18,6 +18,15 @@ pub(crate) async fn run_sshd(config: &Path, _args: &[OsString]) -> Result<()> {
     let result = sshd_inner(&app).await;
     app.close().await;
     result
+}
+
+/// Applies the table once and fails when it cannot, as `serve` does at
+/// startup (SPEC 6.3).
+async fn prepare_firewall(firewall: &Firewall) -> Result<()> {
+    firewall
+        .reload()
+        .await
+        .map_err(|error| anyhow::anyhow!("nftables: {error}"))
 }
 
 async fn sshd_inner(app: &App) -> Result<()> {
@@ -53,13 +62,17 @@ async fn sshd_inner(app: &App) -> Result<()> {
 
     // CLI mutations reload the whole table immediately (SPEC 6.3), rather
     // than waiting for the control-plane convergence tick.
-    let firewall = Arc::new(Firewall::new(
+    let firewall = Arc::new(Firewall::for_config(
         app.store.clone(),
         app.plan,
+        &app.cfg,
         Arc::new(NftApplier::default()),
-        PortRange { from: 0, to: 0 },
         host.id,
     ));
+    // The table does not survive a host restart. A connection can start a
+    // stopped VM (SPEC 10 step 7), so the rules of SPEC 6.3 and 11.2 are in
+    // place before the listener binds, whatever state `serve` is in.
+    prepare_firewall(&firewall).await?;
     let lifecycle = Arc::new(CliBackend(Backend {
         manager: manager.clone(),
         store: app.store.clone(),
@@ -120,4 +133,30 @@ async fn sshd_inner(app: &App) -> Result<()> {
     drop(firewall);
     hypervisor.close().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use bento_network::{Plan, PortRange};
+
+    use super::*;
+    use crate::firewall::tests::RecordingApplier;
+
+    #[tokio::test]
+    async fn startup_applies_the_table_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = bento_store::Store::open(dir.path().join("bento.db"))
+            .await
+            .unwrap();
+        let applier = Arc::new(RecordingApplier::default());
+        let firewall = Firewall::new(
+            store,
+            Plan::new("10.100.0.0/16").unwrap(),
+            applier.clone(),
+            PortRange { from: 0, to: 0 },
+            1,
+        );
+        prepare_firewall(&firewall).await.unwrap();
+        assert_eq!(applier.0.lock().unwrap().len(), 1);
+    }
 }

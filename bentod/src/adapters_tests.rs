@@ -987,8 +987,10 @@ async fn api_and_cli_changes_reload_firewall() {
         .unwrap();
     {
         let applied = applier.0.lock().unwrap();
-        assert_eq!(applied.len(), 2);
-        assert!(applied[1].contains("8080"));
+        // Every reload applies (SPEC 6.3): the create, the port, the
+        // visibility. The port shows only when the instance is public.
+        assert_eq!(applied.len(), 3);
+        assert!(applied[2].contains("8080"));
     }
 
     let api = ApiBackend(Backend {

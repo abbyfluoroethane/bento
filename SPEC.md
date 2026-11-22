@@ -307,6 +307,8 @@ Rule 4 is a decision, not an oversight. A user who runs a database instance and 
 
 Reload the whole table on every change. A partial rule update leaves a period with the wrong policy.
 
+**Apply.** Each reload applies the table, and the convergence task applies it every 30 seconds. No apply is skipped because the text did not change: `serve` and `sshd` write the same kernel table, and another program can flush it. `serve` and `sshd` build the table from the same configuration values. `sshd` applies the table before it accepts a connection.
+
 ## 7. Names and DNS
 
 ### 7.1 DNS records

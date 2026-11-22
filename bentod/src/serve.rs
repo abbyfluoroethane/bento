@@ -208,14 +208,11 @@ async fn serve_inner(
     }
 
     // Per-user networks and one whole-table nftables reload (SPEC 6.2, 6.3).
-    let firewall = Arc::new(Firewall::new(
+    let firewall = Arc::new(Firewall::for_config(
         app.store.clone(),
         app.plan,
+        &app.cfg,
         Arc::new(NftApplier::default()),
-        PortRange {
-            from: app.cfg.listen.proxy_port_min,
-            to: app.cfg.listen.proxy_port_max,
-        },
         host.id,
     ));
     ensure_user_networks(app, hypervisor.as_ref()).await?;
