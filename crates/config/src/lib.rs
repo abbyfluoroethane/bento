@@ -766,8 +766,27 @@ impl Config {
         if self.listen.proxy_port_min == 0 {
             return Err(invalid("proxy_port_min must be at least 1"));
         }
-        for (field, value) in [("http", &self.listen.http), ("ssh", &self.listen.ssh)] {
-            resolve_listen_addr(value).map_err(|e| invalid(format!("listen {field}: {e}")))?;
+        let mut bound = Vec::new();
+        for (field, value) in [
+            ("http", &self.listen.http),
+            ("https", &self.listen.https),
+            ("ssh", &self.listen.ssh),
+        ] {
+            let address =
+                resolve_listen_addr(value).map_err(|e| invalid(format!("listen {field}: {e}")))?;
+            // Each of the three is its own process (SPEC 4). Two that
+            // bind one port of one address cannot both start.
+            if let Some((other, _)) = bound
+                .iter()
+                .find(|(_, taken)| listeners_overlap(*taken, address))
+            {
+                return Err(invalid(format!(
+                    "listen {other} and listen {field} use the same port {} on \
+                     overlapping addresses, so one process could not bind it",
+                    address.port()
+                )));
+            }
+            bound.push((field, address));
         }
         if self.listen.proxy_port_min > self.listen.proxy_port_max {
             return Err(invalid(format!(
@@ -805,6 +824,15 @@ impl Config {
             if !seen.insert(img.name.as_str()) {
                 return Err(invalid(format!("images: duplicate entry {:?}", img.name)));
             }
+        }
+        // A default that names no allowlist entry fails at the first
+        // `new` without `--image`, long after startup (SPEC 15).
+        if let Some(name) = &self.defaults.image
+            && !self.images.iter().any(|image| image.name == *name)
+        {
+            return Err(invalid(format!(
+                "defaults: image {name:?} is not the name of an [[images]] entry"
+            )));
         }
         let has_oci = self.images.iter().any(|image| image.source.is_oci());
         match &self.bootc.builder_image {
@@ -860,6 +888,17 @@ fn pinned_oci_reference(reference: &str) -> bool {
                 && digest.len() == 64
                 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
         })
+}
+
+/// Whether two listeners would contend for one socket. Port 0 asks the
+/// kernel for a free port, so it never collides. A wildcard covers every
+/// address of its own family.
+fn listeners_overlap(a: SocketAddr, b: SocketAddr) -> bool {
+    if a.port() != b.port() || a.port() == 0 {
+        return false;
+    }
+    a.ip() == b.ip()
+        || (a.is_ipv4() == b.is_ipv4() && (a.ip().is_unspecified() || b.ip().is_unspecified()))
 }
 
 /// Resolves a listen address for binding. A leading `:` means every
@@ -989,6 +1028,66 @@ pinned_checksum = "sha256-deadbeef"
             cause = layer.source();
         }
         assert!(err.contains(want), "error {err:?} should contain {want:?}");
+    }
+
+    #[test]
+    fn the_https_listener_is_checked_like_the_other_two() {
+        parse_err(
+            "base_domain = \"b.example\"\n[listen]\nhttps = \"not-an-address\"",
+            "listen https",
+        );
+    }
+
+    #[test]
+    fn a_default_image_must_name_an_allowlist_entry() {
+        let images = "[[images]]\nname = \"debian-13\"\nurl = \"https://example.org/a\"\n";
+        parse_err(
+            &format!("base_domain = \"b.example\"\n[defaults]\nimage = \"debian-12\"\n{images}"),
+            "defaults: image",
+        );
+        // With an empty allowlist nothing can match either.
+        parse_err(
+            "base_domain = \"b.example\"\n[defaults]\nimage = \"debian-13\"",
+            "defaults: image",
+        );
+        let cfg = Config::parse(&format!(
+            "base_domain = \"b.example\"\n[defaults]\nimage = \"debian-13\"\n{images}"
+        ))
+        .unwrap();
+        assert_eq!(cfg.default_image(), Some("debian-13"));
+    }
+
+    #[test]
+    fn two_listeners_on_one_port_of_one_address_are_refused() {
+        for (http, https, ssh) in [
+            ("127.0.0.1:10090", ":443", "127.0.0.1:10090"),
+            (":10090", ":10090", ":22"),
+            // A wildcard covers every address of its family.
+            ("127.0.0.1:10090", ":10090", ":22"),
+            ("127.0.0.1:10080", "10.0.0.5:2222", ":2222"),
+        ] {
+            parse_err(
+                &format!(
+                    "base_domain = \"b.example\"\n[listen]\nhttp = \"{http}\"\nhttps = \"{https}\"\nssh = \"{ssh}\"\ntls = \"off\""
+                ),
+                "same port",
+            );
+        }
+    }
+
+    #[test]
+    fn listeners_on_different_addresses_or_ephemeral_ports_are_fine() {
+        // Port 0 asks the kernel for a free port, so two of them never meet.
+        for (http, https, ssh) in [
+            ("127.0.0.1:10090", "127.0.0.1:0", "127.0.0.1:0"),
+            ("127.0.0.1:10090", "10.0.0.5:10090", "10.0.0.6:10090"),
+            ("127.0.0.1:10080", ":443", ":22"),
+        ] {
+            Config::parse(&format!(
+                "base_domain = \"b.example\"\n[listen]\nhttp = \"{http}\"\nhttps = \"{https}\"\nssh = \"{ssh}\"\ntls = \"off\""
+            ))
+            .unwrap_or_else(|e| panic!("{http} {https} {ssh}: {e}"));
+        }
     }
 
     #[test]
