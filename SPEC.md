@@ -466,6 +466,8 @@ The SSH frontend also answers `ssh bento.foid.space` with no user name. This ses
 
 The web terminal of section 14.6 does steps 5 to 10 for a browser. Steps 1 to 4 do not apply: the dashboard session identifies the user, and the URL identifies the instance. Put steps 7 to 10 in one function that both transports call. Do not write the join twice.
 
+**Limits and recovery.** After the wait for sshd, the frontend reads the instance again by name. If the UUID or the address changed, or the user no longer has access, the session fails with `bento: NAME was not found` and exit status 1. A client close or a lost connection ends the guest session. A client EOF ends only the input. The frontend sends a keepalive after 30 seconds of silence and drops a client that does not answer three of them. A connection with an unknown key gets one link offer, and more session channels are refused. A known user can hold a maximum of 10 session channels on one connection. A subsystem request, and a second shell or exec request on one channel, get a failure reply. Input of more than 64 KiB before the shell or exec request closes the channel. A start for a connection succeeds when the domain already runs.
+
 ## 11. Instance lifecycle
 
 ### 11.1 States and actions

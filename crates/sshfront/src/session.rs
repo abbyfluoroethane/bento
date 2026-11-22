@@ -10,7 +10,7 @@ use russh::keys::PrivateKeyWithHashAlg;
 use russh::server::{Handle, Msg};
 use russh::{Channel, ChannelId, ChannelMsg, Disconnect, Pty};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{oneshot, watch};
 
 use tokio::time::Instant;
 
@@ -168,7 +168,16 @@ pub(crate) struct SessionParts {
     pub(crate) raw_command: Vec<u8>,
     pub(crate) command: Vec<String>,
     pub(crate) pty: Option<PtyRequest>,
-    pub(crate) windows: mpsc::Receiver<Window>,
+    /// The latest window size. Only the last size matters, so a sender never
+    /// waits for a reader: a session that does not read sizes (the CLI, the
+    /// link offer, the start wait) must not stall the forwarder (SPEC 10).
+    pub(crate) windows: watch::Receiver<Option<Window>>,
+    /// Fires when the client has gone: Close, or the end of its connection.
+    /// A plain EOF does not fire it, because `ssh host cmd < file` sends EOF
+    /// and still waits for the output. `None` means no such signal exists,
+    /// as with the web terminal, which drops the whole session instead
+    /// (SPEC 14.6).
+    pub(crate) client_gone: Option<oneshot::Receiver<()>>,
     pub(crate) stdin: SessionInput,
     pub(crate) stdout: SessionOutput,
     pub(crate) stderr: SessionOutput,
@@ -204,6 +213,10 @@ impl SessionExit for RusshExit {
     }
 }
 
+/// Largest amount of input kept for a channel that has not yet asked for a
+/// shell or a command. A client that sends more is closed, not buffered.
+pub(crate) const MAX_PENDING_INPUT: usize = 64 * 1024;
+
 pub(crate) async fn process_channel(
     server: Server,
     authenticated: Authenticated,
@@ -211,8 +224,10 @@ pub(crate) async fn process_channel(
     mut channel: Channel<Msg>,
     handle: Handle,
 ) {
+    let channel_id = channel.id();
     let mut pty = None;
     let mut pending_data = Vec::new();
+    let mut pending_len = 0_usize;
 
     let raw_command = loop {
         match channel.wait().await {
@@ -236,17 +251,29 @@ pub(crate) async fn process_channel(
             }
             Some(ChannelMsg::RequestShell { .. }) => break Vec::new(),
             Some(ChannelMsg::Exec { command, .. }) => break command,
-            Some(ChannelMsg::Data { data }) => pending_data.push(data),
-            Some(ChannelMsg::Eof | ChannelMsg::Close) | None => return,
+            Some(ChannelMsg::Data { data }) => {
+                pending_len = pending_len.saturating_add(data.len());
+                if pending_len > MAX_PENDING_INPUT {
+                    let _ = handle.close(channel_id).await;
+                    return;
+                }
+                pending_data.push(data);
+            }
+            // The client ended the channel before it asked for anything.
+            // Close our side too, or the channel stays open for good.
+            Some(ChannelMsg::Eof | ChannelMsg::Close) | None => {
+                let _ = handle.close(channel_id).await;
+                return;
+            }
             _ => {}
         }
     };
 
-    let channel_id = channel.id();
     let stdout: SessionOutput = Box::pin(channel.make_writer());
     let stderr: SessionOutput = Box::pin(channel.make_writer_ext(Some(1)));
     let (mut input_writer, input_reader) = tokio::io::duplex(64 * 1024);
-    let (window_sender, window_receiver) = mpsc::channel(16);
+    let (window_sender, window_receiver) = watch::channel(None);
+    let (gone_sender, gone_receiver) = oneshot::channel();
 
     tokio::spawn(async move {
         for data in pending_data {
@@ -254,10 +281,11 @@ pub(crate) async fn process_channel(
                 return;
             }
         }
+        let mut input_open = true;
         while let Some(message) = channel.wait().await {
             match message {
                 ChannelMsg::Data { data } => {
-                    if input_writer.write_all(&data).await.is_err() {
+                    if input_open && input_writer.write_all(&data).await.is_err() {
                         return;
                     }
                 }
@@ -267,20 +295,28 @@ pub(crate) async fn process_channel(
                     pix_width,
                     pix_height,
                 } => {
-                    let _ = window_sender
-                        .send(Window {
-                            col_width,
-                            row_height,
-                            pix_width,
-                            pix_height,
-                        })
-                        .await;
+                    // Never waits: the newest size replaces the older one.
+                    window_sender.send_replace(Some(Window {
+                        col_width,
+                        row_height,
+                        pix_width,
+                        pix_height,
+                    }));
                 }
-                ChannelMsg::Eof | ChannelMsg::Close => break,
+                // EOF ends the input only. The loop goes on so that a later
+                // Close, or the end of the connection, still reaches the
+                // session as "client gone".
+                ChannelMsg::Eof => {
+                    if input_open {
+                        input_open = false;
+                        let _ = input_writer.shutdown().await;
+                    }
+                }
+                ChannelMsg::Close => break,
                 _ => {}
             }
         }
-        let _ = input_writer.shutdown().await;
+        let _ = gone_sender.send(());
     });
 
     let term = RusshTermSession(SessionParts {
@@ -289,6 +325,7 @@ pub(crate) async fn process_channel(
         raw_command,
         pty,
         windows: window_receiver,
+        client_gone: Some(gone_receiver),
         stdin: Box::pin(input_reader),
         stdout,
         stderr,
@@ -310,7 +347,7 @@ async fn dispatch(server: &Server, authenticated: Authenticated, session: Box<dy
     match authenticated {
         Authenticated::User(user) => {
             if let Some(instance) = resolve_instance(server, &parts.user, user.id).await {
-                proxy(server, instance, parts).await;
+                proxy(server, instance, Some(user.id), parts).await;
             } else {
                 let SessionParts {
                     command,
@@ -356,7 +393,18 @@ async fn resolve_instance(server: &Server, name: &str, user_id: i64) -> Option<I
 }
 
 /// Implements SPEC 10 steps 7-10 for one resolved connection.
-pub(crate) async fn proxy(server: &Server, instance: Instance, mut session: SessionParts) {
+///
+/// `user_id` is the user whose access is checked again after the wait for
+/// sshd. The wait can last minutes, and in that time the instance can be
+/// removed or unshared, and its address can pass to another instance (SPEC 10
+/// steps 5-6). The web terminal has no user id here: its caller checked the
+/// access, so only the identity is compared.
+pub(crate) async fn proxy(
+    server: &Server,
+    instance: Instance,
+    user_id: Option<i64>,
+    mut session: SessionParts,
+) {
     // Step 7 starts a stopped instance without changing desired state. The
     // Starter interface has no operation that could change it (SPEC 11.2).
     if instance.state == State::Stopped {
@@ -400,11 +448,42 @@ pub(crate) async fn proxy(server: &Server, instance: Instance, mut session: Sess
         }
     };
 
+    // The snapshot is old now. Read the instance again and require the same
+    // UUID and address, and the same access, before any byte goes to the
+    // guest. Otherwise a reused address could join this user to another
+    // instance. The message is the same for every cause, so it reveals
+    // nothing (SPEC 10 steps 5-6).
+    if !still_the_same(server, &instance, user_id).await {
+        let message = format!("bento: {} was not found", instance.name);
+        let _ = session
+            .stderr
+            .write_all(format!("{message}\r\n").as_bytes())
+            .await;
+        session.exit.fail(&message).await;
+        return;
+    }
+
     // SPEC 12: last_seen_at records the last SSH connection.
     let _ = server.instances.touch_last_seen(&instance.uuid).await;
 
     // Steps 9 and 10 open the guest session and join both directions.
     join(server, &instance, connection, &address, session).await;
+}
+
+async fn still_the_same(server: &Server, snapshot: &Instance, user_id: Option<i64>) -> bool {
+    let Ok(current) = server.instances.instance_by_name(&snapshot.name).await else {
+        return false;
+    };
+    if current.uuid != snapshot.uuid || current.address != snapshot.address {
+        return false;
+    }
+    match user_id {
+        Some(user_id) => matches!(
+            server.instances.has_access(&current.uuid, user_id).await,
+            Ok(true)
+        ),
+        None => true,
+    }
 }
 
 fn guest_address(address: &str) -> String {
@@ -567,6 +646,7 @@ async fn join(
     let (mut guest_read, guest_write) = channel.split();
     let mut stdin_open = true;
     let mut windows_open = session.pty.is_some();
+    let mut client_gone = session.client_gone.take();
     let mut input_buffer = vec![0_u8; 32 * 1024];
     let mut code = 0;
 
@@ -590,25 +670,41 @@ async fn join(
                     }
                 }
             }
-            window = session.windows.recv(), if windows_open => {
-                if let Some(window) = window {
-                    let _ = guest_write.window_change(
-                        window.col_width,
-                        window.row_height,
-                        window.pix_width,
-                        window.pix_height,
-                    ).await;
-                } else {
+            changed = session.windows.changed(), if windows_open => {
+                if changed.is_err() {
                     windows_open = false;
+                } else {
+                    // Copy out first: the borrow guard must not live across the await.
+                    let latest = session.windows.borrow_and_update().clone();
+                    if let Some(window) = latest {
+                        let _ = guest_write.window_change(
+                            window.col_width,
+                            window.row_height,
+                            window.pix_width,
+                            window.pix_height,
+                        ).await;
+                    }
                 }
+            }
+            // The client closed or vanished. Without this arm a command such
+            // as `tail -f` keeps the guest session until the guest ends it.
+            () = wait_client_gone(&mut client_gone) => {
+                code = 1;
+                break;
             }
             message = guest_read.wait() => {
                 match message {
                     Some(ChannelMsg::Data { data }) => {
-                        let _ = session.stdout.write_all(&data).await;
+                        if session.stdout.write_all(&data).await.is_err() {
+                            code = 1;
+                            break;
+                        }
                     }
                     Some(ChannelMsg::ExtendedData { ext: 1, data }) => {
-                        let _ = session.stderr.write_all(&data).await;
+                        if session.stderr.write_all(&data).await.is_err() {
+                            code = 1;
+                            break;
+                        }
                     }
                     Some(ChannelMsg::ExitStatus { exit_status }) => {
                         code = exit_status;
@@ -629,6 +725,17 @@ async fn join(
         .disconnect(Disconnect::ByApplication, "", "English")
         .await;
     session.exit.exit(code).await;
+}
+
+/// Resolves when the client is gone, and never when there is no signal.
+async fn wait_client_gone(signal: &mut Option<oneshot::Receiver<()>>) {
+    match signal {
+        Some(receiver) => {
+            // A dropped sender means the same as a sent one.
+            let _ = receiver.await;
+        }
+        None => std::future::pending().await,
+    }
 }
 
 async fn wait_request_reply(channel: &mut Channel<russh::client::Msg>) -> Result<(), ()> {
@@ -867,7 +974,7 @@ mod tests {
     use russh::keys::{Algorithm, PrivateKey};
     use time::OffsetDateTime;
     use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-    use tokio::sync::mpsc;
+    use tokio::sync::{oneshot, watch};
 
     use super::{
         Authenticated, PtyRequest, SessionExit, SessionParts, TermSession, Window, dispatch,
@@ -1101,7 +1208,7 @@ mod tests {
         let stdout = SharedWriter::default();
         let stderr = SharedWriter::default();
         let exit = Arc::new(FakeExit::default());
-        let (_window_tx, window_rx) = mpsc::channel(1);
+        let (_window_tx, window_rx) = watch::channel(None);
         let parts = SessionParts {
             user: user.to_owned(),
             raw_command: Vec::new(),
@@ -1116,6 +1223,7 @@ mod tests {
                 },
             }),
             windows: window_rx,
+            client_gone: None,
             stdin: Box::pin(input_reader),
             stdout: Box::pin(stdout.clone()),
             stderr: Box::pin(stderr.clone()),
@@ -1533,5 +1641,251 @@ mod tests {
         writer.write_all(b"\n").await.unwrap();
         writer.flush().await.unwrap();
         assert_eq!(sink.text(), "row\r\n\r\n");
+    }
+
+    /// A guest sshd that runs on one in-memory stream. A shell request gets
+    /// a success, one line of output and then silence, like `tail -f`.
+    struct QuietGuest;
+
+    impl russh::server::Handler for QuietGuest {
+        type Error = russh::Error;
+
+        async fn auth_publickey(
+            &mut self,
+            _user: &str,
+            _key: &russh::keys::PublicKey,
+        ) -> Result<russh::server::Auth, Self::Error> {
+            Ok(russh::server::Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            _channel: russh::Channel<russh::server::Msg>,
+            reply: russh::server::ChannelOpenHandle,
+            _session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            reply.accept().await;
+            Ok(())
+        }
+
+        async fn shell_request(
+            &mut self,
+            channel: russh::ChannelId,
+            session: &mut russh::server::Session,
+        ) -> Result<(), Self::Error> {
+            session.channel_success(channel)?;
+            session.data(channel, bytes::Bytes::from_static(b"output\n"))?;
+            Ok(())
+        }
+    }
+
+    fn spawn_quiet_guest() -> BoxedIo {
+        let (near, far) = tokio::io::duplex(64 * 1024);
+        let config = Arc::new(russh::server::Config {
+            keys: vec![test_key().as_ref().clone()],
+            ..russh::server::Config::default()
+        });
+        tokio::spawn(async move {
+            if let Ok(running) = russh::server::run_stream(config, far, QuietGuest).await {
+                let _ = running.await;
+            }
+        });
+        Box::pin(near)
+    }
+
+    struct BrokenWriter;
+
+    impl AsyncWrite for BrokenWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _context: &mut Context<'_>,
+            _data: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Poll::Ready(Err(io::ErrorKind::BrokenPipe.into()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn running_server_with_guest(instances: Arc<FakeInstances>) -> Server {
+        instances
+            .by_name
+            .lock()
+            .unwrap()
+            .insert("web".to_owned(), web_instance(State::Running));
+        instances
+            .access
+            .lock()
+            .unwrap()
+            .insert("uuid-web".to_owned(), vec![1]);
+        let mut server = test_server(
+            instances,
+            Arc::new(FakeStarter::default()),
+            Arc::new(FakeCli::default()),
+        );
+        server.dialer = Arc::new(RefusingDialer {
+            attempts: AtomicUsize::new(0),
+            succeed_on: 1,
+            stream: Mutex::new(Some(spawn_quiet_guest())),
+        });
+        server
+    }
+
+    /// A client whose connection no longer takes output must end the guest
+    /// session. Before, the write error was dropped and a quiet command kept
+    /// the guest channel for ever.
+    #[tokio::test]
+    async fn a_failed_write_to_the_client_ends_the_guest_session() {
+        let server = running_server_with_guest(Arc::new(FakeInstances::default()));
+        let (_keyboard, stdin) = tokio::io::duplex(64);
+        let (_window_tx, windows) = watch::channel(None);
+        let exit = Arc::new(FakeExit::default());
+        let parts = SessionParts {
+            user: "web".to_owned(),
+            raw_command: Vec::new(),
+            command: Vec::new(),
+            pty: None,
+            windows,
+            client_gone: None,
+            stdin: Box::pin(stdin),
+            stdout: Box::pin(BrokenWriter),
+            stderr: Box::pin(BrokenWriter),
+            exit: exit.clone(),
+        };
+        let instance = web_instance(State::Running);
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            super::proxy(&server, instance, Some(1), parts),
+        )
+        .await
+        .expect("the session did not end after a failed write");
+        assert_eq!(*exit.0.lock().unwrap(), Some(1));
+    }
+
+    /// The client-gone signal ends a session that has no output to fail on.
+    #[tokio::test]
+    async fn the_client_gone_signal_ends_the_guest_session() {
+        let server = running_server_with_guest(Arc::new(FakeInstances::default()));
+        let (_keyboard, stdin) = tokio::io::duplex(64);
+        let (_window_tx, windows) = watch::channel(None);
+        let (gone, client_gone) = oneshot::channel();
+        let exit = Arc::new(FakeExit::default());
+        let stdout = SharedWriter::default();
+        let parts = SessionParts {
+            user: "web".to_owned(),
+            raw_command: Vec::new(),
+            command: Vec::new(),
+            pty: None,
+            windows,
+            client_gone: Some(client_gone),
+            stdin: Box::pin(stdin),
+            stdout: Box::pin(stdout.clone()),
+            stderr: Box::pin(SharedWriter::default()),
+            exit: exit.clone(),
+        };
+        let session = tokio::spawn({
+            let instance = web_instance(State::Running);
+            async move { super::proxy(&server, instance, Some(1), parts).await }
+        });
+        // Wait until the guest output arrives: the session is joined.
+        for _ in 0..100 {
+            if stdout.text().contains("output") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(stdout.text().contains("output"), "the guest never answered");
+        assert!(exit.0.lock().unwrap().is_none());
+        gone.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), session)
+            .await
+            .expect("the session did not end when the client left")
+            .unwrap();
+        assert_eq!(*exit.0.lock().unwrap(), Some(1));
+    }
+
+    /// Changes the instance table while the dialer runs, as an owner can
+    /// during the wait for sshd.
+    struct SwappingDialer {
+        instances: Arc<FakeInstances>,
+        swap: Box<dyn Fn(&FakeInstances) + Send + Sync>,
+    }
+
+    #[async_trait]
+    impl Dialer for SwappingDialer {
+        async fn dial(&self, _address: &str) -> io::Result<BoxedIo> {
+            (self.swap)(&self.instances);
+            let (near, _far) = tokio::io::duplex(64);
+            Ok(Box::pin(near))
+        }
+    }
+
+    /// SPEC 10 steps 5-6: the access check and the address both belong to
+    /// the instance the user named, so a change during the wait ends the
+    /// session before any dial result is used.
+    #[tokio::test]
+    async fn the_instance_is_checked_again_after_the_wait_for_sshd() {
+        type Swap = Box<dyn Fn(&FakeInstances) + Send + Sync>;
+        let swaps: Vec<(&str, Swap)> = vec![
+            (
+                "removed and replaced at the same address",
+                Box::new(|instances: &FakeInstances| {
+                    let mut other = web_instance(State::Running);
+                    other.uuid = "uuid-other".to_owned();
+                    instances
+                        .by_name
+                        .lock()
+                        .unwrap()
+                        .insert("web".to_owned(), other);
+                }),
+            ),
+            (
+                "moved to another address",
+                Box::new(|instances: &FakeInstances| {
+                    let mut moved = web_instance(State::Running);
+                    moved.address = "10.100.0.9".to_owned();
+                    instances
+                        .by_name
+                        .lock()
+                        .unwrap()
+                        .insert("web".to_owned(), moved);
+                }),
+            ),
+            (
+                "share removed",
+                Box::new(|instances: &FakeInstances| {
+                    instances.access.lock().unwrap().clear();
+                }),
+            ),
+            (
+                "removed",
+                Box::new(|instances: &FakeInstances| {
+                    instances.by_name.lock().unwrap().clear();
+                }),
+            ),
+        ];
+        for (label, swap) in swaps {
+            let instances = Arc::new(FakeInstances::default());
+            let mut server = running_server_with_guest(instances.clone());
+            server.dialer = Arc::new(SwappingDialer {
+                instances: instances.clone(),
+                swap,
+            });
+            let fake = fake_session("web", "", false).await;
+            dispatch(&server, Authenticated::User(user("frank")), fake.term).await;
+            assert!(
+                fake.stderr.text().contains("bento: web was not found"),
+                "{label}: {}",
+                fake.stderr.text()
+            );
+            assert_eq!(*fake.exit.0.lock().unwrap(), Some(1), "{label}");
+            assert!(instances.touched.lock().unwrap().is_empty(), "{label}");
+        }
     }
 }

@@ -14,7 +14,7 @@ use std::task::{Context, Poll};
 use async_trait::async_trait;
 use bento_types::{Instance, State};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::server::{CliRunner, InstanceStore, KeyStore, Server, Starter};
 use crate::session::{self, PtyRequest, SessionExit, SessionOutput, SessionParts, Window};
@@ -93,10 +93,11 @@ impl Server {
             ..
         } = terminal;
 
-        let (window_sender, windows) = mpsc::channel(16);
+        // Latest size wins and the sender never waits (SPEC 14.6).
+        let (window_sender, windows) = watch::channel(None);
         tokio::spawn(async move {
             while let Some(size) = resizes.recv().await {
-                if window_sender.send(window(size)).await.is_err() {
+                if window_sender.send(Some(window(size))).is_err() {
                     return;
                 }
             }
@@ -113,12 +114,15 @@ impl Server {
                 window: window(size),
             }),
             windows,
+            // Closing the page drops this future, which drops the guest
+            // connection, so no separate signal is needed (SPEC 14.6).
+            client_gone: None,
             stdin: input,
             stdout: Box::pin(output.clone()),
             stderr: Box::pin(output),
             exit: Arc::new(Outcome(Mutex::new(Some(sender)))),
         };
-        session::proxy(self, instance, parts).await;
+        session::proxy(self, instance, None, parts).await;
         outcome
             .await
             .unwrap_or_else(|_| Attached::Failed("bento: the session ended".to_owned()))

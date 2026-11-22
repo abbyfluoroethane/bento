@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -8,12 +10,21 @@ use bento_store::Error as StoreError;
 use bento_types::{Instance, SshKey, User};
 use russh::keys::{HashAlg, PrivateKey, PrivateKeyWithHashAlg, PublicKey};
 use russh::server::{self, Auth, Msg, Session};
-use russh::{Channel, ChannelId};
+use russh::{Channel, ChannelId, ChannelOpenFailure};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
 
 use crate::session::{Authenticated, process_channel};
 use crate::{DEFAULT_DIAL_INTERVAL, DEFAULT_GUEST_USER, DEFAULT_START_TIMEOUT};
+
+/// Most session channels one known user may hold open on one connection.
+/// This is the OpenSSH `MaxSessions` default, so normal multiplexing works.
+const MAX_SESSION_CHANNELS: usize = 10;
+
+/// How often a silent client is asked to prove that it is there. With the
+/// russh default of three missed replies, a client that vanished without a
+/// FIN is dropped after about two minutes, and its guest sessions with it.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// An error returned by a consumer-side operation.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -223,6 +234,7 @@ impl Server {
         // design, not a defect: the authorization check protects the instance.
         Arc::new(server::Config {
             keys: vec![self.host_key.as_ref().clone()],
+            keepalive_interval: Some(KEEPALIVE_INTERVAL),
             ..server::Config::default()
         })
     }
@@ -303,6 +315,9 @@ impl server::Server for Server {
             server: self.clone(),
             authenticated: None,
             user_name: String::new(),
+            started: HashSet::new(),
+            link_offered: false,
+            open_sessions: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
@@ -312,6 +327,34 @@ pub struct ConnectionHandler {
     server: Server,
     authenticated: Option<Authenticated>,
     user_name: String,
+    /// Channels that already got a shell or a command. A second request on
+    /// one of them is refused.
+    started: HashSet<ChannelId>,
+    /// An unknown key gets one link offer per connection (SPEC 13). Each
+    /// offer is a `pairings` row and a polling task.
+    link_offered: bool,
+    open_sessions: Arc<AtomicUsize>,
+}
+
+/// One counted session channel of a known user. The count falls when the
+/// channel task ends, however it ends.
+struct SessionSlot(Arc<AtomicUsize>);
+
+impl SessionSlot {
+    fn take(count: &Arc<AtomicUsize>) -> Option<Self> {
+        count
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |open| {
+                (open < MAX_SESSION_CHANNELS).then_some(open + 1)
+            })
+            .ok()
+            .map(|_| Self(Arc::clone(count)))
+    }
+}
+
+impl Drop for SessionSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -348,11 +391,29 @@ impl server::Handler for ConnectionHandler {
             drop(reply);
             return Ok(());
         };
+        let slot = match &authenticated {
+            Authenticated::Unlinked(_) if self.link_offered => {
+                reply.reject(ChannelOpenFailure::ResourceShortage).await;
+                return Ok(());
+            }
+            Authenticated::Unlinked(_) => {
+                self.link_offered = true;
+                None
+            }
+            Authenticated::User(_) => {
+                let Some(slot) = SessionSlot::take(&self.open_sessions) else {
+                    reply.reject(ChannelOpenFailure::ResourceShortage).await;
+                    return Ok(());
+                };
+                Some(slot)
+            }
+        };
         let server = self.server.clone();
         let user_name = self.user_name.clone();
         let handle = session.handle();
         reply.accept().await;
         tokio::spawn(async move {
+            let _slot = slot;
             process_channel(server, authenticated, user_name, channel, handle).await;
         });
         Ok(())
@@ -378,8 +439,7 @@ impl server::Handler for ConnectionHandler {
         channel: ChannelId,
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        session.channel_success(channel)?;
-        Ok(())
+        self.answer_start(channel, session)
     }
 
     async fn exec_request(
@@ -388,7 +448,44 @@ impl server::Handler for ConnectionHandler {
         _data: &[u8],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
-        session.channel_success(channel)?;
+        self.answer_start(channel, session)
+    }
+
+    /// Subsystems (`ssh -s sftp`) are not offered. russh sends no reply by
+    /// default, so the client would wait for ever.
+    async fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        _name: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        session.channel_failure(channel)?;
+        Ok(())
+    }
+
+    async fn channel_close(
+        &mut self,
+        channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        self.started.remove(&channel);
+        Ok(())
+    }
+}
+
+impl ConnectionHandler {
+    /// Only the first shell or command of a channel starts a session; the
+    /// channel task ignores any later one, so the client must be told.
+    fn answer_start(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), HandlerError> {
+        if self.started.insert(channel) {
+            session.channel_success(channel)?;
+        } else {
+            session.channel_failure(channel)?;
+        }
         Ok(())
     }
 }
@@ -692,18 +789,31 @@ mod tests {
         );
     }
 
-    #[derive(Clone)]
-    struct GuestFactory;
+    #[derive(Clone, Default)]
+    struct GuestFactory {
+        /// Set when a guest connection or channel is closed or dropped.
+        closed: Arc<std::sync::atomic::AtomicBool>,
+    }
 
     impl server::Server for GuestFactory {
         type Handler = GuestHandler;
 
         fn new_client(&mut self, _peer_addr: Option<std::net::SocketAddr>) -> Self::Handler {
-            GuestHandler
+            GuestHandler {
+                closed: self.closed.clone(),
+            }
         }
     }
 
-    struct GuestHandler;
+    struct GuestHandler {
+        closed: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for GuestHandler {
+        fn drop(&mut self) {
+            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
 
     impl server::Handler for GuestHandler {
         type Error = russh::Error;
@@ -733,11 +843,24 @@ mod tests {
             session: &mut Session,
         ) -> Result<(), Self::Error> {
             session.channel_success(channel)?;
+            // A command that never ends, like `tail -f`.
+            if data == b"hang" {
+                return Ok(());
+            }
             session.data(
                 channel,
                 Bytes::from(format!("guest ran: {}\n", String::from_utf8_lossy(data))),
             )?;
             session.exit_status_request(channel, 7)?;
+            Ok(())
+        }
+
+        async fn channel_close(
+            &mut self,
+            _channel: ChannelId,
+            _session: &mut Session,
+        ) -> Result<(), Self::Error> {
+            self.closed.store(true, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
     }
@@ -761,6 +884,13 @@ mod tests {
     }
 
     async fn start_guest(host_key: Arc<PrivateKey>) -> (String, tokio::task::JoinHandle<()>) {
+        start_guest_with(host_key, GuestFactory::default()).await
+    }
+
+    async fn start_guest_with(
+        host_key: Arc<PrivateKey>,
+        factory: GuestFactory,
+    ) -> (String, tokio::task::JoinHandle<()>) {
         use russh::server::Server as _;
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -770,7 +900,7 @@ mod tests {
             ..server::Config::default()
         });
         let task = tokio::spawn(async move {
-            let mut guest = GuestFactory;
+            let mut guest = factory;
             let _ = guest.run_on_socket(config, &listener).await;
         });
         (address, task)
@@ -1160,6 +1290,12 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let (guest_address, guest_task) = start_pty_guest(events.clone()).await;
         let instances = Arc::new(FakeInstances::default());
+        // The frontend reads the instance again after the wait for sshd.
+        instances
+            .by_name
+            .lock()
+            .unwrap()
+            .insert("web".to_owned(), instance());
         let mut frontend =
             Server::for_guests(instances.clone(), Arc::new(FakeStarter), private_key());
         frontend.dialer = Arc::new(RewriteDialer(guest_address));
@@ -1261,5 +1397,278 @@ mod tests {
             "{message}"
         );
         assert_eq!(output, format!("{message}\r\n"));
+    }
+
+    /// Echoes one line of input, so a test can tell that stdin still flows.
+    struct EchoCli;
+
+    #[async_trait]
+    impl CliRunner for EchoCli {
+        async fn run(
+            &self,
+            _user: User,
+            _args: Vec<String>,
+            stdin: Pin<Box<dyn AsyncRead + Send>>,
+            mut stdout: Pin<Box<dyn AsyncWrite + Send>>,
+            _stderr: Pin<Box<dyn AsyncWrite + Send>>,
+        ) -> i32 {
+            use tokio::io::AsyncBufReadExt as _;
+            let mut line = String::new();
+            let _ = tokio::io::BufReader::new(stdin).read_line(&mut line).await;
+            let _ = stdout.write_all(format!("got:{line}").as_bytes()).await;
+            0
+        }
+    }
+
+    /// Starts a frontend for the known key with `cli`, and connects to it.
+    async fn cli_frontend(
+        cli: Arc<dyn CliRunner>,
+        linker: Option<Arc<dyn KeyLinker>>,
+        use_known_key: bool,
+    ) -> (client::Handle<ClientHandler>, tokio::task::JoinHandle<()>) {
+        let known = private_key();
+        let mut server = frontend(
+            &known,
+            private_key(),
+            private_key(),
+            Arc::new(FakeInstances::default()),
+            Arc::new(FakeCli::default()),
+        );
+        server.cli = cli;
+        server.linker = linker;
+        let (address, task) = start_frontend(server).await;
+        let key = if use_known_key { known } else { private_key() };
+        let (client, authenticated) = connect_client(&address, "shaun", key, None).await;
+        assert!(authenticated);
+        (client, task)
+    }
+
+    async fn next_message_within(
+        channel: &mut Channel<client::Msg>,
+        what: &str,
+    ) -> Option<ChannelMsg> {
+        tokio::time::timeout(Duration::from_secs(2), channel.wait())
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+    }
+
+    /// Window changes go to a session that never reads them (the command
+    /// line). Before the fix the forwarder blocked after about 17 of them and
+    /// the input behind them never arrived.
+    #[tokio::test]
+    async fn end_to_end_window_changes_do_not_freeze_a_cli_session() {
+        for pty in [true, false] {
+            let (client, task) = cli_frontend(Arc::new(EchoCli), None, true).await;
+            let mut channel = client.channel_open_session().await.unwrap();
+            if pty {
+                channel
+                    .request_pty(false, "xterm", 80, 24, 0, 0, &[])
+                    .await
+                    .unwrap();
+            }
+            channel.exec(false, "echo").await.unwrap();
+            for width in 0..40 {
+                channel.window_change(100 + width, 30, 0, 0).await.unwrap();
+            }
+            channel.data(&b"hello\n"[..]).await.unwrap();
+            let mut output = Vec::new();
+            loop {
+                match next_message_within(&mut channel, "the CLI output").await {
+                    Some(ChannelMsg::Data { data }) => {
+                        output.extend_from_slice(&data);
+                        break;
+                    }
+                    Some(_) => {}
+                    None => panic!("channel ended without output (pty={pty})"),
+                }
+            }
+            assert!(String::from_utf8_lossy(&output).contains("got:hello"));
+            task.abort();
+        }
+    }
+
+    /// Dropping the client must close the guest side too. A guest command
+    /// that never ends used to keep its guest connection for ever.
+    #[tokio::test]
+    async fn end_to_end_a_vanished_client_closes_the_guest_session() {
+        let client_key = private_key();
+        let frontend_key = private_key();
+        let factory = GuestFactory::default();
+        let closed = factory.closed.clone();
+        let (guest_address, guest_task) = start_guest_with(private_key(), factory).await;
+        let instances = Arc::new(FakeInstances::default());
+        instances
+            .by_name
+            .lock()
+            .unwrap()
+            .insert("web".to_owned(), instance());
+        instances
+            .access
+            .lock()
+            .unwrap()
+            .insert("uuid-web".to_owned(), vec![1]);
+        let mut frontend = frontend(
+            &client_key,
+            frontend_key,
+            private_key(),
+            instances,
+            Arc::new(FakeCli::default()),
+        );
+        frontend.dialer = Arc::new(RewriteDialer(guest_address));
+        let (address, frontend_task) = start_frontend(frontend).await;
+        let (client, authenticated) = connect_client(&address, "web", client_key, None).await;
+        assert!(authenticated);
+        let mut channel = client.channel_open_session().await.unwrap();
+        channel.exec(true, "hang").await.unwrap();
+        loop {
+            if let Some(ChannelMsg::Success) = next_message_within(&mut channel, "the reply").await
+            {
+                break;
+            }
+        }
+        // Let the frontend finish the join before the client leaves.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!closed.load(std::sync::atomic::Ordering::SeqCst));
+        drop(channel);
+        client
+            .disconnect(russh::Disconnect::ByApplication, "", "en")
+            .await
+            .unwrap();
+        drop(client);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !closed.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the guest side never saw the session end");
+        frontend_task.abort();
+        guest_task.abort();
+    }
+
+    struct CountingLinker {
+        begins: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl KeyLinker for CountingLinker {
+        async fn begin(&self, _request: PairingRequest) -> Result<PendingLink, BoxError> {
+            self.begins
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(PendingLink {
+                id: 1,
+                url: "https://bento.example.org/link/tok".to_owned(),
+                valid_for: Duration::from_secs(180),
+            })
+        }
+
+        async fn linked_user(&self, _id: i64) -> Result<Option<User>, BoxError> {
+            Ok(None)
+        }
+    }
+
+    /// SPEC 13: an unknown key gets one link. More channels on the same
+    /// connection must not mint more `pairings` rows.
+    #[tokio::test]
+    async fn end_to_end_an_unknown_key_gets_one_link_offer_per_connection() {
+        let linker = Arc::new(CountingLinker {
+            begins: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let (client, task) = cli_frontend(Arc::new(EchoCli), Some(linker.clone()), false).await;
+        let mut channels = Vec::new();
+        let mut opened = 0;
+        for _ in 0..10 {
+            if let Ok(channel) = client.channel_open_session().await {
+                opened += 1;
+                channel.exec(false, "x").await.unwrap();
+                channels.push(channel);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(opened, 1);
+        assert_eq!(linker.begins.load(std::sync::atomic::Ordering::SeqCst), 1);
+        task.abort();
+    }
+
+    /// A known user may multiplex, but not without limit.
+    #[tokio::test]
+    async fn end_to_end_session_channels_are_capped_per_connection() {
+        let (client, task) = cli_frontend(Arc::new(EchoCli), None, true).await;
+        let mut channels = Vec::new();
+        for _ in 0..super::MAX_SESSION_CHANNELS {
+            let channel = client.channel_open_session().await.unwrap();
+            channel.exec(false, "x").await.unwrap();
+            channels.push(channel);
+        }
+        assert!(client.channel_open_session().await.is_err());
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn end_to_end_a_subsystem_request_is_refused() {
+        let (client, task) = cli_frontend(Arc::new(EchoCli), None, true).await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        channel.request_subsystem(true, "sftp").await.unwrap();
+        loop {
+            match next_message_within(&mut channel, "the subsystem reply").await {
+                Some(ChannelMsg::Failure) => break,
+                Some(ChannelMsg::Success) => panic!("subsystem accepted"),
+                Some(_) => {}
+                None => panic!("channel ended without a reply"),
+            }
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn end_to_end_a_second_exec_on_one_channel_is_refused() {
+        let (client, task) = cli_frontend(Arc::new(EchoCli), None, true).await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        channel.exec(true, "one").await.unwrap();
+        channel.exec(true, "two").await.unwrap();
+        let mut replies = Vec::new();
+        while replies.len() < 2 {
+            match next_message_within(&mut channel, "the replies").await {
+                Some(ChannelMsg::Success) => replies.push(true),
+                Some(ChannelMsg::Failure) => replies.push(false),
+                Some(_) => {}
+                None => panic!("channel ended early: {replies:?}"),
+            }
+        }
+        assert_eq!(replies, [true, false]);
+        task.abort();
+    }
+
+    async fn expect_close(channel: &mut Channel<client::Msg>, what: &str) {
+        loop {
+            match next_message_within(channel, what).await {
+                Some(ChannelMsg::Close) | None => return,
+                Some(_) => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn end_to_end_eof_before_a_request_closes_the_channel() {
+        let (client, task) = cli_frontend(Arc::new(EchoCli), None, true).await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        channel.eof().await.unwrap();
+        expect_close(&mut channel, "the close").await;
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn end_to_end_unbounded_input_before_a_request_closes_the_channel() {
+        let (client, task) = cli_frontend(Arc::new(EchoCli), None, true).await;
+        let mut channel = client.channel_open_session().await.unwrap();
+        let chunk = vec![0_u8; 16 * 1024];
+        for _ in 0..(super::super::session::MAX_PENDING_INPUT / chunk.len() + 2) {
+            if channel.data(&chunk[..]).await.is_err() {
+                break;
+            }
+        }
+        expect_close(&mut channel, "the close").await;
+        task.abort();
     }
 }
